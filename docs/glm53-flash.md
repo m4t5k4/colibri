@@ -97,8 +97,9 @@ touches 42 sparse layers × 8 experts × 14.2 MB = 4.8 GB. Measured with
 token** on this hardware: what the disk takes to deliver the bytes, with any CPU
 and any GPU. Faster silicon does not move it; fewer bytes would.
 
-That is also why the Vulkan path is offered for machines with enough VRAM to
-hold experts rather than as an accelerator here.
+GPU acceleration does not remove that disk floor. The Metal/Vulkan paths and
+the optional CUDA expert tier below accelerate computation; CUDA resident
+expert hits additionally avoid rereading those experts from disk.
 
 ## Optional single-GPU CUDA expert tier
 
@@ -114,6 +115,13 @@ The default build/run is unchanged. Explicit CUDA requests require a CUDA
 build, a working device, and the streaming int4-gs64 container. `COLI_GPUS`
 is rejected: this implementation supports exactly one `COLI_GPU` ordinal.
 The existing Windows DLL build convention remains `CUDA_DLL=1`, not `CUDA=1`.
+
+Only the normal full-model CLI and SERVE loader enables this tier. Segment,
+Edge, and range-only model instances never initialize it, even when a Segment
+covers every layer or `COLI_CUDA=1` is inherited. Their inactive tier cannot
+shut down the process-global CUDA backend owned by another model, and their
+CPU capabilities and `numeric_class` remain unchanged. The CPU-only adapter
+build also ignores this CUDA opt-in instead of rejecting it.
 
 The RAM cache (`GLM53_EXPERT_GB`) stays intact. On-demand promotion begins
 after an expert has been selected for at least two rows; a full device tier
@@ -148,8 +156,19 @@ make glm53-cuda-check CUDA=1 CUDA_ARCH=sm_86        # real CUDA tensor numerics
 python3 tests/glm53_cuda_harness.py --binary ./glm53 --fixture ~/glm53_stream-i4
 ```
 
+The portable target also destroys Segment/Edge instances while a full-model
+owner has a resident expert, verifies that expert still executes, and checks
+that shutdown happens exactly once when the owner is released. Source tests
+pin initialization to the full-model loader and preserve adapter CPU metadata.
+
 The numerical test uses asymmetric matrices, distinct per-group scales and
-clamp-saturating inputs, and overwrites host weights after upload. The model
+clamp-saturating inputs, and overwrites host weights after upload. It compares
+gate, up, and clamped-down projection outputs with CPU dequantization, reports
+measured maximum absolute, relative and tolerance-scaled errors, and rejects
+nonfinite results. The fixed envelope is `abs(error) <= 0.002 + 0.002*abs(cpu)`;
+this is a provisional acceptance bound, not a measured NVIDIA accuracy claim.
+Run the real-device target and retain its reported errors before validating
+the target GPU. Fake-backend agreement is not CUDA numerical validation. The model
 harness uses the streaming fixture described below, requires nonzero resident
 bytes, executions and fallbacks, compares CPU/CUDA teacher-forcing and greedy
 tokens, and checks zero-budget and injected-error fallback. Token equality is
@@ -157,6 +176,35 @@ a fixture regression check; near ties in real models may differ with floating
 point accumulation order. GPU detection or `nvidia-smi` alone proves no tensor
 execution. CUDA kernel and full-model results must be measured on the target
 hardware before claiming performance.
+
+### Relationship to Qwen3.8 streaming placement
+
+`qwen36_tier.c` already has a Qwen3.8 FP8 streaming mode (`qt_init_fp8`), in
+addition to Qwen3.6's full-RAM mode. The `cap == n_experts` requirement applies
+only outside that streaming mode. Qwen3.8 temporarily points at the current
+RAM slot in `qt_note`, copies weights/scales into owned staging buffers in
+`enqueue_locked`, and calls `stream_forget` before returning. The uploader
+then creates owned device tensors. It therefore supports recycled RAM slots.
+
+GLM53 deliberately duplicates these placement/residency concepts: per-expert
+heat and resident state; a VRAM budget accounting for allocation footprint;
+promotion while streamed bytes are in hand; replacement of a colder resident;
+owned device copies independent of RAM eviction; resident dispatch with host
+fallback; and rollback/freeing of device tensors. GLM53 completes upload
+synchronously while the slot is live, so it needs no staging queue or retained
+host pointers. It is a separate minimal implementation, not a new residency idea.
+
+The policies differ: Qwen uses per-device placement, a background upload queue,
+in-flight protection and grouped issue/take; admission uses
+`hot > cold + (cold >> 2) + 4`, with heat decay every 1024 issue ticks and an
+optional persisted heat file. GLM53 uses one device, cumulative selected-row
+counts, admission after two selections, and strictly `hot > cold` replacement.
+Qwen's numeric budget is GiB and its automatic allowance reserves 1 GiB;
+GLM53 uses decimal GB, clamps numeric caps to free memory, and reserves 2 GB.
+GLM53 does not duplicate Qwen's trunk placement, warmstart planner or FP8 LUT
+handling. Reusing the whole Qwen tier would need an int4 streaming entry point
+and a clamped-activation execution path: its generic fused/grouped expert
+execution uses plain SiLU. No such refactor or kernel change is included here.
 
 ## Vision
 

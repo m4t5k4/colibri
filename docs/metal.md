@@ -1,7 +1,7 @@
 # Metal backend (Apple Silicon, experimental)
 
 On Apple Silicon the decode profile is matmul-bound, and unified memory removes
-the PCIe copy tax that keeps CUDA's streaming experts on the CPU — so colibrì
+the PCIe weight-transfer cost for nonresident CUDA experts — so colibrì
 has an opt-in Metal backend that runs the **routed-expert SwiGLU (batched,
 zero-copy from the RAM slabs)**, the **fused decode attention** (full MLA layer
 in one command buffer, S≤4), and **prefill's large GEMMs** on the GPU.

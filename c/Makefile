@@ -1319,9 +1319,13 @@ glm53$(EXE): glm53.c sse41_kernels.h decode_batch.h pin_pool.h cli_args.h st.h j
 	$(CC) $(CFLAGS) glm53.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
 .PHONY: glm53-cuda-tier-check glm53-cuda-check
-glm53-cuda-tier-check:
+glm53-cuda-tier-check: tests/test_glm53_cuda_adapters$(EXE)
 	$(CC) $(NOCUDA_CFLAGS) tests/test_glm53_cuda.c -o tests/test_glm53_cuda$(EXE) $(NOCUDA_LDFLAGS)
 	COLI_CUDA=1 COLI_GPU=0 COLI_GPUS= CUDA_EXPERT_GB=auto ./tests/test_glm53_cuda$(EXE)
+	./tests/test_glm53_cuda_adapters$(EXE)
+
+tests/test_glm53_cuda_adapters$(EXE): tests/test_glm53_cuda_adapters.c tests/test_glm53_cuda.c glm53.c glm53_cuda.h backend_cuda.h segment_runtime.c edge_runtime.c
+	$(CC) $(filter-out -DCOLI_METAL -DCOLI_VULKAN,$(NOCUDA_CFLAGS)) -DCOLI_CUDA $< segment_runtime.c edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
 
 glm53-cuda-check: $(CUDA_OBJ)
 	@test -n "$(CUDA_OBJ)" || { echo "requires CUDA=1" >&2; exit 1; }

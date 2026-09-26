@@ -2186,9 +2186,8 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
     }
     vision_load(m);
 #ifdef COLI_METAL
-    /* Metal is runtime opt-in. Failure is non-fatal: the existing CPU path
-     * remains authoritative and streamed routed experts are deliberately
-     * excluded from this first integration step. */
+    /* Metal is runtime opt-in. Failure is non-fatal: the CPU path remains
+     * authoritative. Streamed experts use the clamped MoE block path above. */
     if (getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))) {
         g_metal_ready = coli_metal_init() && coli_metal_available();
         fprintf(stderr, g_metal_ready
@@ -2219,14 +2218,6 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
      * da quanto hanno gia' preso i pesi, e prima del ciclo sui layer non
      * l'avevano ancora preso. */
     if (m->streaming) expert_cache_init(m);
-#ifdef COLI_CUDA
-    g53_cuda_init(&m->cuda, m->c.n_layers, m->c.n_experts,
-                  m->c.hidden, m->c.moe_inter, m->streaming);
-#else
-    if (getenv("COLI_CUDA") && !strcmp(getenv("COLI_CUDA"), "1")) {
-        fprintf(stderr, "GLM53: COLI_CUDA=1 requires a CUDA build\n"); exit(1);
-    }
-#endif
 }
 
 /* ---------- vision ----------
@@ -2525,6 +2516,18 @@ static void model_release(GModel *m) {
 /* Il caso pieno: tutti i layer, embedding e testa comprese. */
 static void model_load(GModel *m, const char *dir) {
     model_load_range(m, dir, 0, -1, 1);
+    /* Only CLI/SERVE own the process-global CUDA backend. Segment and Edge
+     * call model_load_range directly, even for a complete layer range; their
+     * zero-initialized tier stays inactive and cannot shut down another owner.
+     * Keep this out of the range loader, including the CPU-build opt-in error. */
+#ifdef COLI_CUDA
+    g53_cuda_init(&m->cuda, m->c.n_layers, m->c.n_experts,
+                  m->c.hidden, m->c.moe_inter, m->streaming);
+#else
+    if (getenv("COLI_CUDA") && !strcmp(getenv("COLI_CUDA"), "1")) {
+        fprintf(stderr, "GLM53: COLI_CUDA=1 requires a CUDA build\n"); exit(1);
+    }
+#endif
 }
 
 /* ---------- il passaggio completo ----------

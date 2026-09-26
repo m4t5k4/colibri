@@ -1,5 +1,11 @@
 /* Single-device, synchronous hot-expert tier. No host pointers survive upload.
- * Caller serializes placement/execution; disk workers never call this API. */
+ * Caller serializes placement/execution; disk workers never call this API.
+ * Only the full-model CLI/SERVE loader may init this process-global backend;
+ * Segment/Edge/range loaders leave G53Cuda zero-initialized and inactive.
+ * Like qwen36_tier.c's Qwen3.8 streaming mode, promotion occurs while streamed
+ * bytes are live and owns copies independent of RAM slots. Here the copy is
+ * synchronous (no staging queue) and execution keeps GLM53's host clamp.
+ * See docs/glm53-flash.md for the placement/residency comparison. */
 #ifndef GLM53_CUDA_H
 #define GLM53_CUDA_H
 #include "backend_cuda.h"

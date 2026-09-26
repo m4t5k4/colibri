@@ -3,7 +3,8 @@
 tests/glm53_*_harness.py are argparse programs, not unittest modules. Under
 their old test_*.py names `make test-python` imported them, found no TestCase
 and counted nothing, so the suite stayed green while the chat template, serve,
-streaming, vision and Vulkan paths were never exercised (#1700).
+streaming, vision and Vulkan paths were never exercised (#1700). CUDA also
+participates in the missing-fixture skip contract below.
 
 Two things are checked here. Everywhere, with the standard library only: a
 harness that cannot find what it needs exits 2, never 0, so a skip cannot pass
@@ -38,6 +39,7 @@ class Glm53HarnessSkipTest(unittest.TestCase):
             missing = str(Path(empty, "missing"))
             cases = {
                 "chat_template": ["--template", missing],
+                "cuda": ["--binary", "glm53", "--fixture", missing],
                 "tiny": ["--binary", "glm53", "--fixture", missing],
                 "multimodal_tiny": ["--binary", "glm53", "--fixture", missing],
                 "pin_branch": ["--binary", "glm53", "--fixture", missing],

@@ -323,8 +323,9 @@ These are for testing, benchmarking, or internal use — not part of the everyda
 ## GLM-5.3-Flash engine (`glm53`)
 
 Read **only** by `c/glm53.c`. Like the other siblings it has its own loader,
-cache and precision selection and shares none of the `colibri` knobs above.
-See `docs/glm53-flash.md`.
+cache and precision selection. Its optional single-GPU expert tier also reads
+`COLI_CUDA`, `COLI_GPU`, and `CUDA_EXPERT_GB`; Segment/Edge adapters ignore that
+tier and retain their CPU numeric contract. See `docs/glm53-flash.md`.
 
 | Variable | Default | Effect |
 |---|---|---|

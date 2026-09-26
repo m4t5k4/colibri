@@ -1,9 +1,10 @@
 # CUDA backend (Linux)
 
-colibrì includes an opt-in CUDA backend for model-resident tensors. Streaming
-experts deliberately remain on the original CPU path: copying an expert from
-NVMe to the GPU on every use would only replace the disk bottleneck with a PCIe
-bottleneck. Resident quantized tensors are uploaded lazily once and reused.
+colibrì includes an opt-in CUDA backend for resident tensors. Streaming expert
+misses retain the host path; hot experts can be promoted into persistent VRAM
+and executed on CUDA without uploading their weights on every use. Promotion
+and placement policies differ by engine; GLM53's single-GPU tier is described
+below. Disk-to-RAM streaming remains necessary for nonresident experts.
 
 ```bash
 cd c
