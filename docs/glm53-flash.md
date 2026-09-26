@@ -177,6 +177,91 @@ point accumulation order. GPU detection or `nvidia-smi` alone proves no tensor
 execution. CUDA kernel and full-model results must be measured on the target
 hardware before claiming performance.
 
+### Hardware validation
+
+Validated on Linux with an NVIDIA GeForce RTX 3070 (Ampere `sm_86`,
+8 GB-class VRAM) and CUDA Toolkit 12.4. Build used:
+
+```bash
+make -B glm53 CUDA=1 CUDA_ARCH=sm_86 CUDA_HOME=/usr \
+  EXTRA_LDFLAGS="-L/usr/lib/x86_64-linux-gnu"
+```
+
+**Real-device tensor validation.** `make glm53-cuda-check ...` executed real
+CUDA int4-gs64 matmuls. Measured CPU-vs-CUDA projection differences were:
+
+| Projection | max_abs | max_rel |
+|---|---:|---:|
+| gate | 1.52587891e-05 | 5.32183816e-06 |
+| up | 1.52587891e-05 | 4.44259501e-06 |
+| clamped-down | 1.13248825e-06 | 0.000106291905 |
+
+The test used the provisional tolerance `atol = 0.002`, `rtol = 0.002`:
+
+```text
+PASS GLM53 CUDA tier: gs64 numerics, owned tensors, heat eviction, cleanup
+```
+
+**Tiny streaming-model validation.** `tests/glm53_cuda_harness.py` passed on
+the same NVIDIA GPU:
+
+```text
+PASS GLM53 model CUDA: executed tensors, residency, zero-budget and injected-failure fallback
+```
+
+This verifies actual model CUDA execution, VRAM residency, host fallback with
+CUDA disabled by budget, and injected GPU failure fallback. GPU detection
+alone cannot satisfy this test.
+
+**Real checkpoint validation.** The converted GLM-5.3-Flash int4-gs64 container
+had 45 layers (42 sparse), hidden size 4096, and 288 routed experts with top-8
+routing. Routed expert storage was reported as 175 GB int4-g64. Command:
+
+```bash
+COLI_CUDA=1 \
+COLI_GPU=0 \
+CUDA_EXPERT_GB=4 \
+GLM53_VERBOSE=1 \
+GLM53_MAXT=1024 \
+DRAFT=0 \
+./glm53 \
+  --model /srv/models-fast/colibri/glm53-flash-i4 \
+  --prompt "Answer only with the word OK." \
+  --greedy 8
+```
+
+| Observed metric | Value |
+|---|---:|
+| CUDA expert budget | 4,000,000,000 bytes |
+| Final resident experts | 282 |
+| Final allocated expert VRAM | 3,991,928,832 bytes |
+| Successful CUDA expert rows | 434 |
+| Host fallback rows | 1,582 |
+| Uploads | 323 |
+| CUDA errors | 0 |
+| RAM expert-cache hits | 241 |
+| RAM expert-cache misses | 1,084 |
+| Expert bytes read | 15,344,861,184 |
+| Load time | 63.4 s |
+| Prefill | 7 tokens in 11.9 s |
+| Decode | 8 tokens in 10.8 s = 0.743 tok/s |
+
+The full-model run demonstrates dynamic promotion from the existing RAM
+streaming cache into device-owned VRAM, CUDA execution of resident routed
+experts, continued host execution for misses, and eviction/replacement after
+the 4 GB tier filled, completing with zero CUDA errors. GLM53 clamped SwiGLU
+remains on the host; the generic fused plain-SiLU CUDA expert path is not used.
+Multi-GPU remains unsupported and out of scope.
+
+The 0.743 tok/s observation is neither a speedup claim nor representative
+performance: this was a short cold/adaptive validation run with synchronous
+promotion and host-side clamped SwiGLU activation transfers. It is not a
+comparison with unrelated CPU or Vulkan runs. Generated text was repeated
+`!`, so this prompt does not establish semantic correctness of the full 321B
+checkpoint. The tiny CPU-vs-CUDA harness supplies correctness evidence for the
+CUDA path; the full checkpoint run supplies execution/residency/fallback
+evidence.
+
 ### Relationship to Qwen3.8 streaming placement
 
 `qwen36_tier.c` already has a Qwen3.8 FP8 streaming mode (`qt_init_fp8`), in
