@@ -73,6 +73,9 @@
 #include "quant.h"
 #include "tok.h"
 #include "omp_tune.h"
+#ifdef COLI_CUDA
+#include "glm53_cuda.h"
+#endif
 #ifdef COLI_METAL
 #include "backend_metal.h"
 static int g_metal_ready = 0;
@@ -707,6 +710,9 @@ typedef struct {
     int has_io;                           /* embedding e testa: solo agli estremi */
     /* esperti: o residenti (checkpoint f32) o in streaming (container int4) */
     int streaming;
+#ifdef COLI_CUDA
+    G53Cuda cuda;
+#endif
     struct ERef *eref;
     struct LCache *ecache;
     int64_t e_len[6], e_at[6], e_slot;
@@ -1861,6 +1867,39 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         if (!seen) union_ids[n_union++] = chosen[i];
     }
 
+#ifdef COLI_CUDA
+    if (m->cuda.active) {
+        /* Resolve VRAM hits before touching the RAM cache or disk. Commit an
+         * expert's rows together so a late CUDA error cannot double-scatter. */
+        float *cy = malloc((size_t)tokens * c->hidden * sizeof(float));
+        int pending = 0;
+        for (int i = 0; i < n_union; i++) {
+            int eid = union_ids[i], rows = 0, ok = cy != NULL;
+            for (int t = 0; t < tokens; t++)
+                for (int k = 0; k < topk; k++)
+                    if (chosen[(size_t)t * topk + k] == eid && weight[(size_t)t * topk + k] != 0) rows++;
+            g53_cuda_heat(&m->cuda, index, eid, rows);
+            for (int t = 0; t < tokens && ok; t++)
+                for (int k = 0; k < topk && ok; k++)
+                    if (chosen[(size_t)t * topk + k] == eid && weight[(size_t)t * topk + k] != 0)
+                        ok = g53_cuda_run(&m->cuda, index, eid, cy + (size_t)t * c->hidden,
+                            x + (size_t)t * c->hidden, sg, su, c->swiglu_limit, swiglu_clamped);
+            if (ok) {
+                ehit_mark(m, index, eid);
+                for (int t = 0; t < tokens; t++)
+                    for (int k = 0; k < topk; k++)
+                        if (chosen[(size_t)t * topk + k] == eid && weight[(size_t)t * topk + k] != 0)
+                            for (int d = 0; d < c->hidden; d++)
+                                out[(size_t)t * c->hidden + d] += weight[(size_t)t * topk + k] * cy[(size_t)t * c->hidden + d];
+            } else {
+                m->cuda.fallback += (uint64_t)rows;
+                union_ids[pending++] = eid;
+            }
+        }
+        n_union = pending;
+        free(cy);
+    }
+#endif
     LCache *cache = &m->ecache[index];
     const int block = cache->cap;
     int *slot_of = malloc((size_t)block * sizeof(int));
@@ -1899,6 +1938,10 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             expert_read(m, index, union_ids[base + i], &cache->s[slot_of[i]]);
         }
         m->t_disk += now_s() - t_batch0;  /* fuori dalla regione omp: e' il muro del batch */
+#ifdef COLI_CUDA
+        for (int i = 0; i < here; i++)
+            g53_cuda_promote(&m->cuda, index, union_ids[base + i], cache->s[slot_of[i]].piece);
+#endif
 
         /* Try all experts in this cache-sized block as one Metal command buffer.
          * xg is grouped by expert; rows/rw preserve the exact CPU scatter weights.
@@ -1983,6 +2026,9 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         }
     }
     free(to_read); free(slot_of); free(union_ids);
+#ifdef COLI_CUDA
+    if (index == m->layer_end - 1) g53_cuda_stats(&m->cuda);
+#endif
     free(tmp); free(su); free(sg); free(weight); free(chosen);
 }
 
@@ -2173,6 +2219,14 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
      * da quanto hanno gia' preso i pesi, e prima del ciclo sui layer non
      * l'avevano ancora preso. */
     if (m->streaming) expert_cache_init(m);
+#ifdef COLI_CUDA
+    g53_cuda_init(&m->cuda, m->c.n_layers, m->c.n_experts,
+                  m->c.hidden, m->c.moe_inter, m->streaming);
+#else
+    if (getenv("COLI_CUDA") && !strcmp(getenv("COLI_CUDA"), "1")) {
+        fprintf(stderr, "GLM53: COLI_CUDA=1 requires a CUDA build\n"); exit(1);
+    }
+#endif
 }
 
 /* ---------- vision ----------
@@ -2398,6 +2452,9 @@ static void mat_release(Mat *mat) {
 
 static void model_release(GModel *m) {
     if (!m) return;
+#ifdef COLI_CUDA
+    g53_cuda_close(&m->cuda);
+#endif
     if (m->layer) {
         for (int i = m->layer_begin; i < m->layer_end; i++) {
             GLayer *l = &m->layer[i];
@@ -3566,6 +3623,9 @@ int main(int argc, char **argv) {
         arm_stops(snap, &serve_tok, batch && atoi(batch));
         coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
         serve_loop(&served, &serve_tok);
+#ifdef COLI_CUDA
+        g53_cuda_close(&served.cuda);
+#endif
         glm53_telemetry_save();
         rt_destroy();
         tok_free(&serve_tok);
@@ -3721,6 +3781,9 @@ int main(int argc, char **argv) {
 #endif
     free(logits);
     session_close(&model, session);
+#ifdef COLI_CUDA
+    g53_cuda_close(&model.cuda);
+#endif
     glm53_telemetry_save();
     rt_destroy();
     free(vision);

@@ -100,6 +100,64 @@ and any GPU. Faster silicon does not move it; fewer bytes would.
 That is also why the Vulkan path is offered for machines with enough VRAM to
 hold experts rather than as an accelerator here.
 
+## Optional single-GPU CUDA expert tier
+
+On Linux (including a configured WSL CUDA toolkit), build for an RTX 3070:
+
+```bash
+cd c
+make glm53 CUDA=1 CUDA_ARCH=sm_86
+COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=auto ./glm53 --model /path/glm53_i4 --prompt "Hello" --greedy 32
+```
+
+The default build/run is unchanged. Explicit CUDA requests require a CUDA
+build, a working device, and the streaming int4-gs64 container. `COLI_GPUS`
+is rejected: this implementation supports exactly one `COLI_GPU` ordinal.
+The existing Windows DLL build convention remains `CUDA_DLL=1`, not `CUDA=1`.
+
+The RAM cache (`GLM53_EXPERT_GB`) stays intact. On-demand promotion begins
+after an expert has been selected for at least two rows; a full device tier
+replaces its least frequently selected resident only for a hotter candidate.
+Heat is cumulative for this model lifetime. Uploads are synchronous, after
+the normal disk-to-RAM read, and own their device memory independently of
+RAM-slot eviction. Resident hits bypass disk and RAM reads. Cold misses use
+the existing host path and become eligible for subsequent CUDA execution.
+
+`CUDA_EXPERT_GB` is a decimal-GB cap, or `auto` (default): free VRAM minus
+2 GB of runtime headroom. A numeric cap is also clamped to that allowance;
+zero forces host execution. This tier does not upload attention, dense or
+shared-expert weights. Gate/up/down run through existing CUDA resident
+matmuls, with GLM53's exact clamped SwiGLU on the host between projections.
+The generic fused CUDA expert API uses plain SiLU and is unsuitable here.
+Extra activation transfers and synchronous promotion mean speedup is not
+guaranteed. The model/container format is unchanged.
+
+`[glm53-cuda]` diagnostics report resident expert count, allocated expert
+VRAM bytes (excluding runtime scratch), successfully executed expert rows,
+host fallback rows, uploads, and errors. They appear at startup, after each
+forward through the final sparse layer, and at teardown. A CUDA upload or
+execution failure disables further CUDA work for this model lifetime; the
+existing host MLP recomputes the affected expert before any result is scattered.
+Initialization/configuration failures are explicit startup errors.
+
+Validation (a skip is not a pass):
+
+```bash
+make glm53-cuda-tier-check                         # fake backend, no GPU
+make glm53-cuda-check CUDA=1 CUDA_ARCH=sm_86        # real CUDA tensor numerics
+python3 tests/glm53_cuda_harness.py --binary ./glm53 --fixture ~/glm53_stream-i4
+```
+
+The numerical test uses asymmetric matrices, distinct per-group scales and
+clamp-saturating inputs, and overwrites host weights after upload. The model
+harness uses the streaming fixture described below, requires nonzero resident
+bytes, executions and fallbacks, compares CPU/CUDA teacher-forcing and greedy
+tokens, and checks zero-budget and injected-error fallback. Token equality is
+a fixture regression check; near ties in real models may differ with floating
+point accumulation order. GPU detection or `nvidia-smi` alone proves no tensor
+execution. CUDA kernel and full-model results must be measured on the target
+hardware before claiming performance.
+
 ## Vision
 
 Reachable from every surface: a path pasted in `coli chat` (read by the client,

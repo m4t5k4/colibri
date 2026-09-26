@@ -22,6 +22,15 @@ startup instead of silently falling back. For Windows, see
 
 ## The VRAM expert tier
 
+GLM-5.3-Flash has a separate, minimal single-GPU tier:
+`make glm53 CUDA=1 CUDA_ARCH=sm_86`, then
+`COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=auto ./glm53 ...`.
+It preserves disk-to-RAM streaming, promotes repeatedly selected int4-gs64
+experts into owned VRAM tensors, and retains the host clamped SwiGLU between
+CUDA projections. It does not use the multi-GPU placement, host release, or
+resident forward pipeline described below. See [GLM53 CUDA usage and execution
+tests](glm53-flash.md#optional-single-gpu-cuda-expert-tier).
+
 A measured `PIN` profile promotes its hottest experts into a persistent VRAM
 tier while keeping the rest in RAM:
 
