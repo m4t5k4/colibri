@@ -41,26 +41,44 @@ static void project(float *y, const float *x, const unsigned char *w,
     }
 }
 #ifndef G53_REAL_CUDA
-struct ColiCudaTensor { unsigned char *w; float *s; int I, O; };
+struct ColiCudaTensor { unsigned char *w; float *s; int I, O, device; };
 static int live, upload_calls, fail_upload, mat_calls, fail_mat, init_calls, shutdown_calls;
-int coli_cuda_init(const int *d, int n) { init_calls++; return n == 1 && *d == 0; }
+static int fake_ndev, fake_devices[COLI_CUDA_MAX_DEVICES], live_device[COLI_CUDA_MAX_DEVICES];
+static size_t fake_free[COLI_CUDA_MAX_DEVICES];
+static int fail_mem_device = -1;
+int coli_cuda_init(const int *d, int n) {
+    init_calls++; fake_ndev = n;
+    memcpy(fake_devices, d, (size_t)n * sizeof(*d)); return 1;
+}
+int coli_cuda_device_count(void) { return fake_ndev; }
+int coli_cuda_available_device_count(void) { return 2; }
 void coli_cuda_shutdown(void) { assert(live == 0); shutdown_calls++; }
-int coli_cuda_mem_info(int d, size_t *f, size_t *t) { (void)d; *f = *t = 8000000000ULL; return 1; }
+int coli_cuda_mem_info(int d, size_t *f, size_t *t) {
+    if (d == fail_mem_device) return 0;
+    *f = *t = fake_free[d] ? fake_free[d] : 8000000000ULL; return 1;
+}
 size_t coli_cuda_alloc_footprint(size_t b) { return b; }
 size_t coli_cuda_tensor_vram(const ColiCudaTensor *t) { return (size_t)t->I * t->O * 9 / 16; }
-void coli_cuda_tensor_free(ColiCudaTensor *t) { if (t) { free(t->w); free(t->s); free(t); live--; } }
+void coli_cuda_tensor_free(ColiCudaTensor *t) {
+    if (t) { assert(live_device[t->device] > 0); live_device[t->device]--;
+        free(t->w); free(t->s); free(t); live--; }
+}
 int coli_cuda_tensor_upload_g(ColiCudaTensor **t, const void *w, const float *s,
                              int fmt, int I, int O, int d, int gs) {
-    assert(fmt == 4 && gs == 64 && d == 0);
+    assert(fmt == 4 && gs == 64);
+    int found = 0;
+    for (int i = 0; i < fake_ndev; i++) if (fake_devices[i] == d) found = 1;
+    assert(found);
     if (++upload_calls == fail_upload) return 0;
-    *t = calloc(1, sizeof(**t)); (*t)->I = I; (*t)->O = O;
+    *t = calloc(1, sizeof(**t)); (*t)->I = I; (*t)->O = O; (*t)->device = d;
     (*t)->w = malloc((size_t)I * O / 2); (*t)->s = malloc((size_t)I * O / 16);
     memcpy((*t)->w, w, (size_t)I * O / 2); memcpy((*t)->s, s, (size_t)I * O / 16);
-    live++; return 1;
+    live++; live_device[d]++; return 1;
 }
 int coli_cuda_matmul(ColiCudaTensor **t, float *y, const float *x, const void *w,
                      const float *s, int fmt, int S, int I, int O, int d, int gs) {
-    (void)w; (void)s; assert(fmt == 4 && S == 1 && d == 0 && gs == 64);
+    (void)w; (void)s; assert(fmt == 4 && S == 1 && gs == 64);
+    assert((*t)->device == d);
     assert(*t && (*t)->I == I && (*t)->O == O);
     if (++mat_calls == fail_mat) { y[0] = 12345; return 0; }
     project(y, x, (*t)->w, (*t)->s, I, O); return 1;

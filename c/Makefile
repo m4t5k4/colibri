@@ -1318,12 +1318,24 @@ NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
 glm53$(EXE): glm53.c sse41_kernels.h decode_batch.h pin_pool.h cli_args.h st.h json.h stop_ids.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h serve_poll.h route_trace.h quant.h fp8_format.h idot.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h backend_metal.h backend_vulkan.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h glm53_cuda.h backend_cuda.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) glm53.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
-.PHONY: glm53-cuda-tier-check glm53-cuda-check
-glm53-cuda-tier-check: tests/test_glm53_cuda_adapters$(EXE) tests/test_glm53_cuda_profile$(EXE)
+.PHONY: glm53-cuda-tier-check glm53-cuda-check glm53-cuda-multidev-check
+glm53-cuda-tier-check: tests/test_glm53_cuda_adapters$(EXE) tests/test_glm53_cuda_profile$(EXE) tests/test_glm53_cuda_multidev$(EXE) tests/test_glm53_cuda_multidev_oracle$(EXE) tests/test_glm53_cuda_scatter$(EXE)
 	$(CC) $(NOCUDA_CFLAGS) tests/test_glm53_cuda.c -o tests/test_glm53_cuda$(EXE) $(NOCUDA_LDFLAGS)
 	COLI_CUDA=1 COLI_GPU=0 COLI_GPUS= CUDA_EXPERT_GB=auto ./tests/test_glm53_cuda$(EXE)
 	./tests/test_glm53_cuda_adapters$(EXE)
 	./tests/test_glm53_cuda_profile$(EXE)
+	./tests/test_glm53_cuda_multidev$(EXE)
+	./tests/test_glm53_cuda_multidev_oracle$(EXE)
+	./tests/test_glm53_cuda_scatter$(EXE)
+
+tests/test_glm53_cuda_multidev_oracle$(EXE): tests/test_glm53_cuda_multidev_oracle.c tests/test_glm53_cuda.c glm53_cuda.h backend_cuda.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_glm53_cuda_scatter$(EXE): tests/test_glm53_cuda_scatter.c tests/test_glm53_cuda_multidev_oracle.c glm53.c glm53_cuda.h backend_cuda.h segment_runtime.c edge_runtime.c
+	$(CC) $(filter-out -DCOLI_METAL -DCOLI_VULKAN,$(NOCUDA_CFLAGS)) -DCOLI_CUDA $< segment_runtime.c edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_glm53_cuda_multidev$(EXE): tests/test_glm53_cuda_multidev.c tests/test_glm53_cuda.c glm53_cuda.h backend_cuda.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_glm53_cuda_profile$(EXE): tests/test_glm53_cuda_profile.c tests/test_glm53_cuda.c glm53_cuda.h backend_cuda.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
@@ -1335,6 +1347,12 @@ glm53-cuda-check: $(CUDA_OBJ)
 	@test -n "$(CUDA_OBJ)" || { echo "requires CUDA=1" >&2; exit 1; }
 	$(CC) $(CFLAGS) -DG53_REAL_CUDA tests/test_glm53_cuda.c $(CUDA_OBJ) -o tests/test_glm53_cuda_real$(EXE) $(LDFLAGS)
 	COLI_CUDA=1 COLI_GPU=0 COLI_GPUS= CUDA_EXPERT_GB=auto ./tests/test_glm53_cuda_real$(EXE)
+
+# Synthetic two-device numerical oracle. Skip cleanly when CUDA reports <2 devices.
+glm53-cuda-multidev-check: $(CUDA_OBJ)
+	@test -n "$(CUDA_OBJ)" || { echo "requires CUDA=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) -DG53_REAL_CUDA tests/test_glm53_cuda_multidev_oracle.c $(CUDA_OBJ) -o tests/test_glm53_cuda_multidev_real$(EXE) $(LDFLAGS)
+	./tests/test_glm53_cuda_multidev_real$(EXE)
 
 kimi_k3$(EXE): kimi_k3.c sse41_kernels.h serve_budget.h cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h fp8_format.h idot.h omp_tune.h route_trace.h kv_prefix.h pin_pool.h serve_codec.h backend_cuda.h backend_metal.h backend_vulkan.h edge_adapters.h edge_runtime.h edge_tok_internal.h hybrid_split.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ)
 	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)

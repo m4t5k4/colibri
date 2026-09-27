@@ -8,11 +8,13 @@
 #define G53_CUDA_NO_TEST_MAIN
 #include "test_glm53_cuda.c"
 
-int main(void) {
+static void check_teardown(int ndev) {
+    init_calls = shutdown_calls = 0;
     setenv("COLI_CUDA", "1", 1);
     setenv("COLI_GPU", "0", 1);
     setenv("CUDA_EXPERT_GB", "auto", 1);
     unsetenv("COLI_GPUS");
+    if (ndev == 2) setenv("COLI_GPUS", "0,1", 1);
     GModel full = {0};
     g53_cuda_init(&full.cuda, 1, 2, 64, 64, 1);
     assert(full.cuda.active && init_calls == 1 && shutdown_calls == 0);
@@ -24,7 +26,11 @@ int main(void) {
                         weights, (uint8_t *)scales};
     g53_cuda_heat(&full.cuda, 0, 0, 2);
     g53_cuda_promote(&full.cuda, 0, 0, pieces);
-    assert(live == 3);
+    if (ndev == 2) {
+        g53_cuda_heat(&full.cuda, 0, 1, 2);
+        g53_cuda_promote(&full.cuda, 0, 1, pieces);
+    }
+    assert(live == 3 * ndev);
     for (int i = 0; i < 3; i++) {
         Glm53SegmentEngine *segment = calloc(1, sizeof(*segment));
         Glm53EdgeEngine *edge = calloc(1, sizeof(*edge));
@@ -35,13 +41,19 @@ int main(void) {
         glm53_segment_engine_destroy(segment);
         glm53_edge_engine_destroy(edge);
         assert(full.cuda.active && init_calls == 1 && shutdown_calls == 0);
-        assert(live == 3);
+        assert(live == 3 * ndev);
         assert(g53_cuda_run(&full.cuda, 0, 0, y, x, sg, su, 0.5f, clamp_ref));
+        if (ndev == 2)
+            assert(g53_cuda_run(&full.cuda, 0, 1, y, x, sg, su, 0.5f, clamp_ref));
     }
     model_release(&full);
     assert(shutdown_calls == 1 && live == 0);
     model_release(&full); /* repeat release must be inert */
     assert(shutdown_calls == 1);
+}
+int main(void) {
+    check_teardown(1);
+    check_teardown(2);
     puts("PASS GLM53 adapter teardown leaves full-model CUDA owner alive");
     return 0;
 }

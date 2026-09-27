@@ -1,4 +1,4 @@
-/* Single-device, synchronous hot-expert tier. No host pointers survive upload.
+/* Multi-device, synchronous hot-expert tier. No host pointers survive upload.
  * Caller serializes placement/execution; disk workers never call this API.
  * Only the full-model CLI/SERVE loader may init this process-global backend;
  * Segment/Edge/range loaders leave G53Cuda zero-initialized and inactive.
@@ -14,10 +14,12 @@
 #include <string.h>
 #include <math.h>
 #include <limits.h>
+#include <errno.h>
 
 typedef struct {
     ColiCudaTensor *w[3];
     uint64_t heat;
+    int owner; /* index in G53Cuda.devices; all three tensors share it */
 } G53CudaExpert;
 /* Host wall-clock envelopes, using the engine's existing monotonic clock.
  * No clock calls or environment lookups on hot paths when clock is NULL. */
@@ -33,6 +35,10 @@ typedef struct {
 typedef struct {
     G53CudaExpert *experts;
     int device, D, I, ne, count, active, failed;
+    int ndev, devices[COLI_CUDA_MAX_DEVICES];
+    size_t capacity[COLI_CUDA_MAX_DEVICES], used[COLI_CUDA_MAX_DEVICES];
+    uint64_t device_executed[COLI_CUDA_MAX_DEVICES];
+    int failure_stage;
     size_t budget, bytes, expert_bytes;
     unsigned resident;
     uint64_t executed, fallback, uploads, errors;
@@ -54,6 +60,13 @@ static void g53_cuda_profile_report(const G53Cuda *g, const char *phase) {
     if (!p->clock) return;
     int full = g->expert_bytes && g->budget >= g->expert_bytes &&
                g->bytes > g->budget - g->expert_bytes;
+    if (g->ndev > 1 && g->expert_bytes && !full) {
+        /* Aggregate free bytes can be stranded across devices. */
+        full = 1;
+        for (int i = 0; i < g->ndev; i++)
+            if (g->capacity[i] >= g->expert_bytes &&
+                g->used[i] <= g->capacity[i] - g->expert_bytes) full = 0;
+    }
     fprintf(stderr, "[glm53-cuda-profile] phase=%s tokens=%llu decode_tokens=%llu forwards=%llu"
         " cuda_rows=%llu fallback_rows=%llu fallback_compute_rows=%llu uploads=%llu evictions=%llu errors=%llu"
         " resident=%u vram_bytes=%zu budget_bytes=%zu tier_full=%d"
@@ -82,41 +95,86 @@ static void g53_cuda_stats(const G53Cuda *g) {
 static void g53_cuda_drop(G53Cuda *g, G53CudaExpert *e) {
     if (!e->w[0]) return;
     for (int k = 0; k < 3; k++) {
-        g->bytes -= coli_cuda_tensor_vram(e->w[k]);
+        size_t bytes = coli_cuda_tensor_vram(e->w[k]);
+        g->bytes -= bytes;
+        g->used[e->owner] -= bytes;
         coli_cuda_tensor_free(e->w[k]); e->w[k] = NULL;
     }
     g->resident--;
 }
+static void g53_cuda_device_stats(const G53Cuda *g);
 static void g53_cuda_close(G53Cuda *g) {
     if (!g->active) return;
     g53_cuda_stats(g);
+    g53_cuda_device_stats(g);
     g53_cuda_profile_report(g, "final"); /* before teardown, not an eviction */
     for (int i = 0; i < g->count; i++) g53_cuda_drop(g, &g->experts[i]);
     free(g->experts);
     coli_cuda_shutdown();
     memset(g, 0, sizeof(*g));
 }
+/* Nonempty plural form takes precedence, matching the existing Qwen tier.
+ * Reject duplicates/empty entries instead of silently changing list order. */
+static int g53_cuda_devices(const char *many, const char *single, int *devices) {
+    const char *p = many && *many ? many : single ? single : "0";
+    int plural = many && *many, n = 0;
+    for (;;) {
+        char *end;
+        errno = 0;
+        long d = strtol(p, &end, 10);
+        if (end == p || errno == ERANGE || d < 0 || d > INT_MAX ||
+            n == COLI_CUDA_MAX_DEVICES || (*end && (!plural || *end != ','))) return 0;
+        for (int i = 0; i < n; i++) if (devices[i] == d) return 0;
+        devices[n++] = (int)d;
+        if (!*end) return n;
+        p = end + 1;
+    }
+}
+/* Summary only at teardown; the aggregate line above keeps its existing
+ * cadence and format for dashboards and profile parsers. */
+static void g53_cuda_device_stats(const G53Cuda *g) {
+    if (g->ndev < 2) return;
+    for (int i = 0; i < g->ndev; i++) {
+        unsigned resident = 0;
+        for (int j = 0; j < g->count; j++)
+            resident += g->experts[j].w[0] && g->experts[j].owner == i;
+        fprintf(stderr,
+            "[glm53-cuda-device] device=%d ceiling_bytes=%zu resident=%u vram_bytes=%zu executed=%llu\n",
+            g->devices[i], g->capacity[i] < g->budget ? g->capacity[i] : g->budget,
+            resident, g->used[i], (unsigned long long)g->device_executed[i]);
+    }
+}
 static void g53_cuda_init(G53Cuda *g, int nl, int ne, int D, int I, int streaming) {
     const char *enabled = getenv("COLI_CUDA");
     if (!enabled || strcmp(enabled, "1")) return;
     const char *dev = getenv("COLI_GPU"), *many = getenv("COLI_GPUS");
     char *end;
-    long ordinal = dev ? strtol(dev, &end, 10) : 0;
-    if ((dev && (!*dev || *end || ordinal < 0 || ordinal > INT_MAX)) ||
-        (many && *many) || !streaming || D % 64 || I % 64) {
-        fprintf(stderr, "GLM53 CUDA requires int4-gs64 experts and one COLI_GPU ordinal (no COLI_GPUS)\n");
+    g->ndev = g53_cuda_devices(many, dev, g->devices);
+    if (!g->ndev || !streaming || D % 64 || I % 64) {
+        fprintf(stderr, "GLM53 CUDA requires int4-gs64 experts and valid COLI_GPU/COLI_GPUS ordinals\n");
         exit(1);
     }
-    g->device = (int)ordinal;
-    if (!coli_cuda_init(&g->device, 1)) {
+    g->device = g->devices[0]; /* retain the single-device form */
+    if (!coli_cuda_init(g->devices, g->ndev)) {
         fprintf(stderr, "GLM53 CUDA initialization failed\n"); exit(1);
     }
-    size_t available = 0, total = 0;
-    if (!coli_cuda_mem_info(g->device, &available, &total)) {
-        coli_cuda_shutdown(); fprintf(stderr, "GLM53 CUDA memory query failed\n"); exit(1);
+    /* Backend initialization is all-or-nothing; it unwinds its own failures. */
+    if (coli_cuda_device_count() != g->ndev) {
+        coli_cuda_shutdown(); fprintf(stderr, "GLM53 CUDA device count mismatch\n"); exit(1);
     }
-    /* Decimal GB, matching CUDA_EXPERT_GB. Reserve 2 GB for runtime/scratch. */
-    g->budget = available > 2000000000ULL ? available - 2000000000ULL : 0;
+    /* Decimal GB. Shared total cap; reserve 2 GB on EACH device for scratch.
+     * Do not rigidly divide the cap: a small device must not strand allowance. */
+    g->budget = 0;
+    for (int i = 0; i < g->ndev; i++) {
+        size_t available = 0, total = 0;
+        if (!coli_cuda_mem_info(g->devices[i], &available, &total)) {
+            fprintf(stderr, "[glm53-cuda] initialization failed device=%d stage=mem_info\n",
+                    g->devices[i]);
+            coli_cuda_shutdown(); exit(1);
+        }
+        g->capacity[i] = available > 2000000000ULL ? available - 2000000000ULL : 0;
+        g->budget += g->capacity[i];
+    }
     const char *budget = getenv("CUDA_EXPERT_GB");
     if (budget && strcmp(budget, "auto")) {
         double gb = strtod(budget, &end);
@@ -131,12 +189,25 @@ static void g53_cuda_init(G53Cuda *g, int nl, int ne, int D, int I, int streamin
     g->experts = calloc((size_t)g->count, sizeof(*g->experts));
     if (!g->experts) { coli_cuda_shutdown(); fprintf(stderr, "OOM CUDA expert table\n"); exit(1); }
     g->active = 1;
-    fprintf(stderr, "[glm53-cuda] device=%d budget_bytes=%zu gs=64 host_clamp=1\n", g->device, g->budget);
+    fprintf(stderr, "[glm53-cuda] device=%d budget_bytes=%zu gs=64 host_clamp=1 devices=", g->device, g->budget);
+    for (int i = 0; i < g->ndev; i++)
+        fprintf(stderr, "%s%d(usable_bytes=%zu,capacity=%zu)", i ? "," : "", g->devices[i],
+                g->capacity[i] < g->budget ? g->capacity[i] : g->budget,
+                (g->capacity[i] < g->budget ? g->capacity[i] : g->budget) / g->expert_bytes);
+    fputc('\n', stderr);
     g53_cuda_stats(g);
 }
 /* Called once per routed expert union, with its actual selected-row count. */
 static void g53_cuda_heat(G53Cuda *g, int layer, int eid, int rows) {
     if (g->active) g->experts[layer * g->ne + eid].heat += (uint64_t)rows;
+}
+static int g53_cuda_place(const G53Cuda *g) {
+    int owner = -1;
+    for (int i = 0; i < g->ndev; i++)
+        if (g->capacity[i] >= g->expert_bytes &&
+            g->used[i] <= g->capacity[i] - g->expert_bytes &&
+            (owner < 0 || g->used[i] < g->used[owner])) owner = i;
+    return owner;
 }
 /* A miss executes on host this time. Promote only after its host buffers are
  * available, and only once selected at least twice. No RAM cache ownership. */
@@ -144,7 +215,8 @@ static void g53_cuda_promote_impl(G53Cuda *g, int layer, int eid, uint8_t *const
     if (!g->active || g->failed || g->expert_bytes > g->budget) return;
     G53CudaExpert *e = &g->experts[layer * g->ne + eid];
     if (e->w[0] || e->heat < 2) return;
-    if (g->bytes > g->budget - g->expert_bytes) {
+    int owner = g53_cuda_place(g);
+    if (owner < 0 || g->bytes > g->budget - g->expert_bytes) {
         G53CudaExpert *victim = NULL;
         for (int j = 0; j < g->count; j++)
             if (g->experts[j].w[0] && (!victim || g->experts[j].heat < victim->heat))
@@ -152,24 +224,36 @@ static void g53_cuda_promote_impl(G53Cuda *g, int layer, int eid, uint8_t *const
         if (!victim || e->heat <= victim->heat) return;
         double evict_start = g53_cuda_profile_now(g);
         g53_cuda_drop(g, victim);
+        /* Eviction changes the least-allocated device. The freed whole slot
+         * guarantees at least one eligible owner. */
+        owner = g53_cuda_place(g);
         if (g->profile.clock) g->profile.evictions++;
         g53_cuda_profile_add(g, G53_EVICT, evict_start);
     }
     ColiCudaTensor *w[3] = {NULL, NULL, NULL};
     int ok = 1;
     double upload_start = g53_cuda_profile_now(g);
-    for (int k = 0; k < 3 && ok; k++)
+    int failed_k = -1;
+    for (int k = 0; k < 3 && ok; k++) {
         ok = coli_cuda_tensor_upload_g(&w[k], pieces[k*2], (const float *)pieces[k*2+1],
                                       4, k == 2 ? g->I : g->D,
-                                      k == 2 ? g->D : g->I, g->device, 64);
+                                      k == 2 ? g->D : g->I, g->devices[owner], 64);
+        if (!ok) failed_k = k;
+    }
     g53_cuda_profile_add(g, G53_UPLOAD, upload_start);
     if (!ok) {
         for (int k = 0; k < 3; k++) coli_cuda_tensor_free(w[k]);
         g->errors++; g->failed = 1; /* avoid repeated failed allocations */
-        fprintf(stderr, "[glm53-cuda] upload failed; host fallback enabled\n");
+        fprintf(stderr, "[glm53-cuda] upload failed device=%d stage=%s; host fallback enabled\n",
+                g->devices[owner], (const char *const[]){"gate", "up", "down"}[failed_k]);
         return;
     }
-    for (int k = 0; k < 3; k++) { e->w[k] = w[k]; g->bytes += coli_cuda_tensor_vram(w[k]); }
+    e->owner = owner;
+    for (int k = 0; k < 3; k++) {
+        e->w[k] = w[k];
+        size_t bytes = coli_cuda_tensor_vram(w[k]);
+        g->bytes += bytes; g->used[owner] += bytes;
+    }
     g->resident++; g->uploads++;
 }
 static void g53_cuda_promote(G53Cuda *g, int layer, int eid, uint8_t *const *pieces) {
@@ -183,7 +267,8 @@ static int g53_cuda_profile_matmul(G53Cuda *g, G53CudaExpert *e, int k,
                                   float *y, const float *x) {
     double start = g53_cuda_profile_now(g);
     int ok = coli_cuda_matmul(&e->w[k], y, x, NULL, NULL, 4, 1,
-                             k == 2 ? g->I : g->D, k == 2 ? g->D : g->I, g->device, 64);
+                             k == 2 ? g->I : g->D, k == 2 ? g->D : g->I, g->devices[e->owner], 64);
+    if (!ok) g->failure_stage = k;
     g53_cuda_profile_add(g, k == 0 ? G53_GATE : k == 1 ? G53_UP : G53_DOWN, start);
     return ok;
 }
@@ -204,8 +289,9 @@ static int g53_cuda_run(G53Cuda *g, int layer, int eid, float *y, const float *x
     }
     if (!ok) {
         g->errors++; g->failed = 1;
-        fprintf(stderr, "[glm53-cuda] execution failed; host fallback enabled\n");
-    } else g->executed++;
+        fprintf(stderr, "[glm53-cuda] execution failed device=%d stage=%s; host fallback enabled\n",
+                g->devices[e->owner], (const char *const[]){"gate", "up", "down"}[g->failure_stage]);
+    } else { g->executed++; g->device_executed[e->owner]++; }
     return ok;
 }
 #endif

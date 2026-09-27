@@ -101,7 +101,7 @@ GPU acceleration does not remove that disk floor. The Metal/Vulkan paths and
 the optional CUDA expert tier below accelerate computation; CUDA resident
 expert hits additionally avoid rereading those experts from disk.
 
-## Optional single-GPU CUDA expert tier
+## Optional CUDA expert tier
 
 On Linux (including a configured WSL CUDA toolkit), build for an RTX 3070:
 
@@ -112,8 +112,11 @@ COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=auto ./glm53 --model /path/glm53_i4 --prom
 ```
 
 The default build/run is unchanged. Explicit CUDA requests require a CUDA
-build, a working device, and the streaming int4-gs64 container. `COLI_GPUS`
-is rejected: this implementation supports exactly one `COLI_GPU` ordinal.
+build, working devices, and the streaming int4-gs64 container. `COLI_GPU=N`
+retains the single-device path (default device 0). A nonempty `COLI_GPUS`
+overrides it with an ordered comma-separated list, for example
+`COLI_GPUS=0,1,2,3,4,5,6,7`. IDs must be unique and valid; the shared backend
+currently supports up to 16 selected devices. An empty plural form is ignored.
 The existing Windows DLL build convention remains `CUDA_DLL=1`, not `CUDA=1`.
 
 Only the normal full-model CLI and SERVE loader enables this tier. Segment,
@@ -131,9 +134,16 @@ the normal disk-to-RAM read, and own their device memory independently of
 RAM-slot eviction. Resident hits bypass disk and RAM reads. Cold misses use
 the existing host path and become eligible for subsequent CUDA execution.
 
-`CUDA_EXPERT_GB` is a decimal-GB cap, or `auto` (default): free VRAM minus
-2 GB of runtime headroom. A numeric cap is also clamped to that allowance;
-zero forces host execution. This tier does not upload attention, dense or
+`CUDA_EXPERT_GB` is a total decimal-GB cap across all selected devices, or
+`auto` (default): the sum of free VRAM minus 2 GB of runtime headroom on each
+device, floored at zero per device. A numeric cap is clamped to that total;
+zero forces host execution. Experts are placed whole on the least-allocated
+device with enough allowance, breaking ties by list order. The cap is shared
+dynamically, not multiplied by the device count or rigidly divided; every
+device must also stay within its own allowance. The startup line shows the
+total cap and each device's usable bytes and whole-expert capacity (these
+individual maxima are subject to the shared cap). Execution remains serial
+on each expert's owning device. This tier does not upload attention, dense or
 shared-expert weights. Gate/up/down run through existing CUDA resident
 matmuls, with GLM53's exact clamped SwiGLU on the host between projections.
 The generic fused CUDA expert API uses plain SiLU and is unsuitable here.
@@ -157,9 +167,15 @@ python3 tests/glm53_cuda_harness.py --binary ./glm53 --fixture ~/glm53_stream-i4
 ```
 
 The portable target also destroys Segment/Edge instances while a full-model
-owner has a resident expert, verifies that expert still executes, and checks
+owner has resident experts on one or two devices, verifies execution, and checks
 that shutdown happens exactly once when the owner is released. Source tests
 pin initialization to the full-model loader and preserve adapter CPU metadata.
+The multi-device fake test covers ordered parsing/initialization, deterministic
+placement, shared-budget accounting, uneven headroom, partial upload rollback,
+CPU fallback signaling, and cleanup on every device and initialization errors.
+Phase 2 can group experts by owner for parallel issue/take execution once the
+GLM53 clamped SwiGLU contract is supported. Dense/KDA/MLA placement is later work;
+this phase adds no tensor parallelism, matrix sharding, or NCCL.
 
 The numerical test uses asymmetric matrices, distinct per-group scales and
 clamp-saturating inputs, and overwrites host weights after upload. It compares
@@ -179,7 +195,7 @@ hardware before claiming performance.
 
 ### Opt-in CUDA profiling
 
-Set `GLM53_CUDA_PROFILE=1` with the single-GPU CUDA tier. The profiler is off
+Set `GLM53_CUDA_PROFILE=1` with the CUDA tier. The profiler is off
 by default. It uses GLM53's monotonic host clock, adds no CUDA events or
 synchronization, and emits cumulative `[glm53-cuda-profile]` records at
 startup (`phase=start`), after each prefill chunk or decode forward, and before
