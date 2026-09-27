@@ -139,9 +139,53 @@ static void case_diagnostic_value_types(void) {
     assert(s.first_bad == 1 && isnan(s.first_value));
     assert(s.has_finite && s.min == -2.0f && s.max == 1.5f && s.max_abs == 2.0f);
 }
+static void case_scale_pread_and_scan(void) {
+    FILE *file = tmpfile();
+    assert(file);
+    GModel *m = calloc(1, sizeof(*m));
+    assert(m);
+    m->c.n_experts = 288;
+    m->eref = calloc((size_t)18 * m->c.n_experts, sizeof(*m->eref));
+    assert(m->eref);
+    m->e_len[1] = m->e_len[3] = m->e_len[5] = 4 * sizeof(float);
+    unsigned char pad[16] = {0};
+    assert(fwrite(pad, 1, sizeof(pad), file) == sizeof(pad));
+    for (int eid = 0; eid < m->c.n_experts; eid++) {
+        ERef *ref = &m->eref[17 * m->c.n_experts + eid];
+        for (int k = 0; k < 3; k++) {
+            float scales[4] = {0.01f, 0.02f, 0.03f, 0.04f};
+            if (eid == 166 && k == 0) scales[1] = INFINITY;
+            if (eid == 167 && k == 1) scales[2] = 1e7f;
+            int p = 2*k + 1;
+            ref->fd[p] = fileno(file);
+            ref->off[p] = (int64_t)sizeof(pad) +
+                          ((int64_t)eid * 3 + k) * (int64_t)sizeof(scales);
+            assert(fwrite(scales, 1, sizeof(scales), file) == sizeof(scales));
+        }
+    }
+    assert(fflush(file) == 0);
+    uint8_t raw[4 * sizeof(float)];
+    G53DiagValues s = g53_scale_pread(m, 17, 166, 0, fileno(file), raw);
+    assert(s.bad == 1 && s.pos_inf == 1 && s.first_bad == 1);
+    Slot slot = {.eid = 166};
+    Mat mats[3] = {0};
+    uint8_t mapped[3][4 * sizeof(float)];
+    for (int k = 0; k < 3; k++) {
+        g53_scale_pread(m, 17, 166, k, fileno(file), mapped[k]);
+        slot.piece[2*k + 1] = mapped[k];
+        mats[k].s = (float *)mapped[k];
+    }
+    assert(g53_scale_file_audit(m, 17, 166, &slot, mats));
+    mapped[1][0] ^= 1;
+    assert(!g53_scale_file_audit(m, 17, 166, &slot, mats));
+    assert(g53_scale_layer_scan(m, 17) == 2);
+    free(m->eref); free(m);
+    fclose(file);
+}
 int main(void) {
     fixture();
     case_diagnostic_value_types();
+    case_scale_pread_and_scan();
     case_group("0,1", 1, -1, -1, -1); /* device 1 completes first */
     case_group("1,0", 0, -1, -1, -1); /* physical device 0 completes first */
     case_group("0,1", 0, -1, 1, -1); /* second take fails after first succeeds */

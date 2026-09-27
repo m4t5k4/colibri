@@ -2301,6 +2301,141 @@ static G53DiagValues g53_diag_scales(int layer, int eid, const char *name, const
     g53_diag_values_report(layer, eid, "scale_values", name, s);
     return s;
 }
+/* ERef is the authoritative file address. Read scale pieces through pread,
+ * independently of both the shard mmap and the expert cache slot. */
+static G53DiagValues g53_scale_pread(GModel *m, int layer, int eid, int k,
+                                     int fd, uint8_t *bytes) {
+    const ERef *ref = &m->eref[(size_t)layer * m->c.n_experts + eid];
+    int p = 2*k + 1;
+    st_pread_full(fd, bytes, m->e_len[p], ref->off[p], "glm53 scale audit");
+    G53DiagValues s = {0};
+    s.first_bad = SIZE_MAX;
+    size_t count = (size_t)m->e_len[p] / sizeof(float);
+    s.min = INFINITY; s.max = -INFINITY;
+    for (size_t i = 0; i < count; i++) {
+        float v;
+        memcpy(&v, bytes + i * sizeof(v), sizeof(v));
+        if (!isfinite(v)) {
+            if (s.first_bad == SIZE_MAX) { s.first_bad = i; s.first_value = v; }
+            s.bad++;
+            if (isnan(v)) s.nan_count++;
+            else if (v > 0) s.pos_inf++;
+            else s.neg_inf++;
+        } else {
+            if (v < s.min) s.min = v;
+            if (v > s.max) s.max = v;
+            if (fabsf(v) > s.max_abs) s.max_abs = fabsf(v);
+            s.has_finite = 1;
+        }
+    }
+    if (!s.has_finite) s.min = s.max = s.max_abs = NAN;
+    return s;
+}
+static const char *g53_scale_path(const shards *s, int fd) {
+    int i = st_fidx((shards *)s, fd);
+    return i < 0 ? "(replica fd)" : s->paths[i];
+}
+static int g53_scale_file_audit(GModel *m, int layer, int eid,
+                                const Slot *slot, const Mat *mats) {
+    static const char *names[3] = {"gate", "up", "down"};
+    const ERef *ref = &m->eref[(size_t)layer * m->c.n_experts + eid];
+    int rep = glm53_expert_read_replica(m, ref, layer, eid);
+    int all_match = 1;
+    static const char *tensor_suffix[3] = {"gate_proj.weight.qs", "up_proj.weight.qs",
+                                           "down_proj.weight.qs"};
+    for (int k = 0; k < 3; k++) {
+        int p = 2*k + 1, primary_fd = ref->fd[p];
+        char tensor_name[512];
+        snprintf(tensor_name, sizeof(tensor_name), "%slayers.%d.mlp.experts.%d.%s",
+                 m->prefix, layer, eid, tensor_suffix[k]);
+        const st_tensor *tensor = st_find(&m->S, tensor_name);
+        int selected_fd = rep ? st_fd_rep(&m->S, primary_fd, rep) : primary_fd;
+        size_t len = (size_t)m->e_len[p];
+        uint8_t *raw = malloc(len), *selected = selected_fd == primary_fd ? NULL : malloc(len);
+        if (!raw || (selected_fd != primary_fd && !selected)) {
+            fprintf(stderr, "[glm53-scale-audit] allocation failed layer=%d expert=%d piece=%s\n",
+                    layer, eid, names[k]);
+            free(selected); free(raw); return 0;
+        }
+        G53DiagValues stats = g53_scale_pread(m, layer, eid, k, primary_fd, raw);
+        const uint8_t *active_raw = raw;
+        int primary_eq_selected = 1;
+        if (selected) {
+            G53DiagValues selected_stats = g53_scale_pread(m, layer, eid, k, selected_fd, selected);
+            primary_eq_selected = memcmp(raw, selected, len) == 0;
+            active_raw = selected;
+            g53_diag_values_report(layer, eid, "selected_raw_scale", names[k], selected_stats);
+        }
+        int primary_eq_slot = slot && slot->piece[p] && memcmp(raw, slot->piece[p], len) == 0;
+        int selected_eq_slot = slot && slot->piece[p] && memcmp(active_raw, slot->piece[p], len) == 0;
+        int slot_eq_mat = slot && mats && slot->piece[p] && mats[k].s &&
+                          memcmp(slot->piece[p], mats[k].s, len) == 0;
+        const uint8_t *mapped = st_map_shard_range(selected_fd, ref->off[p], m->e_len[p]);
+        int map_eq_raw = mapped && memcmp(mapped, active_raw, len) == 0;
+        int map_eq_slot = mapped && slot && slot->piece[p] &&
+                          memcmp(mapped, slot->piece[p], len) == 0;
+        const char *slot_storage = slot && slot->own &&
+            slot->piece[p] == slot->own + m->e_at[p] ? "owned" : "mapped";
+        if (!selected_eq_slot || !slot_eq_mat || (mapped && !map_eq_raw)) all_match = 0;
+        long long bad_file_off = stats.first_bad == SIZE_MAX ? -1LL :
+                                 (long long)ref->off[p] + (long long)stats.first_bad * 4;
+        fprintf(stderr, "[glm53-scale-audit] layer=%d expert=%d piece=%s shard=%s primary_fd=%d selected_replica=%d selected_fd=%d offset=%lld bytes=%zu dtype=%d first_bad_file_offset=%lld slot_storage=%s map_available=%d primary_eq_selected=%d primary_raw_eq_slot=%d selected_raw_eq_slot=%d map_eq_selected_raw=%d map_eq_slot=%d slot_eq_mat_qs=%d\n",
+                layer, eid, names[k], g53_scale_path(&m->S, primary_fd),
+                primary_fd, rep, selected_fd, (long long)ref->off[p], len,
+                tensor ? tensor->dtype : -1, bad_file_off,
+                slot_storage, !!mapped, primary_eq_selected, primary_eq_slot,
+                selected_eq_slot, map_eq_raw, map_eq_slot, slot_eq_mat);
+        g53_diag_values_report(layer, eid, "raw_scale", names[k], stats);
+        free(selected); free(raw);
+    }
+    return all_match;
+}
+static void g53_scale_adjacent_audit(GModel *m, int layer) {
+    static const char *names[3] = {"gate", "up", "down"};
+    for (int eid = 165; eid <= 167; eid++) {
+        for (int k = 0; k < 3; k++) {
+            const ERef *ref = &m->eref[(size_t)layer * m->c.n_experts + eid];
+            int p = 2*k + 1;
+            size_t len = (size_t)m->e_len[p];
+            uint8_t *raw = malloc(len);
+            if (!raw) { fprintf(stderr, "[glm53-scale-audit] allocation failed\n"); return; }
+            G53DiagValues s = g53_scale_pread(m, layer, eid, k, ref->fd[p], raw);
+            g53_diag_values_report(layer, eid, "adjacent_raw_scale", names[k], s);
+            free(raw);
+        }
+    }
+}
+static int g53_scale_layer_scan(GModel *m, int layer) {
+    size_t len = (size_t)m->e_len[1];
+    uint8_t *raw = malloc(len);
+    if (!raw) { fprintf(stderr, "[glm53-scale-audit] scan allocation failed\n"); return -1; }
+    int flagged = 0;
+    for (int eid = 0; eid < m->c.n_experts; eid++) {
+        G53DiagValues s[3];
+        int bad = 0;
+        const ERef *ref = &m->eref[(size_t)layer * m->c.n_experts + eid];
+        for (int k = 0; k < 3; k++) {
+            int p = 2*k + 1;
+            s[k] = g53_scale_pread(m, layer, eid, k, ref->fd[p], raw);
+            if (s[k].bad || s[k].max_abs > 1e6f) bad = 1;
+        }
+        if (!bad) continue;
+        flagged++;
+        fprintf(stderr, "[glm53-scale-scan] layer=%d expert=%d flagged=1\n", layer, eid);
+        static const char *names[3] = {"gate", "up", "down"};
+        for (int k = 0; k < 3; k++) {
+            int p = 2*k + 1;
+            fprintf(stderr, "[glm53-scale-scan] piece=%s shard=%s offset=%lld bytes=%lld\n",
+                    names[k], g53_scale_path(&m->S, ref->fd[p]),
+                    (long long)ref->off[p], (long long)m->e_len[p]);
+            g53_diag_values_report(layer, eid, "scan_raw_scale", names[k], s[k]);
+        }
+    }
+    fprintf(stderr, "[glm53-scale-scan] layer=%d scanned=%d flagged=%d threshold=1e6\n",
+            layer, m->c.n_experts, flagged);
+    free(raw);
+    return flagged;
+}
 /* Failure-only replay. Keep its scratch and accounting separate from the FFN
  * result; the caller has not yet marked the tier failed. */
 static void g53_diag_replay(GModel *m, int layer, int eid, const float *x,
@@ -2324,6 +2459,11 @@ static void g53_diag_replay(GModel *m, int layer, int eid, const float *x,
     Mat gate, up, down;
     expert_mats(m, slot, &gate, &up, &down);
     if (inspect_stages) {
+        if (layer == 17 && eid == 166) {
+            const Mat mats[3] = {gate, up, down};
+            g53_scale_file_audit(m, layer, eid, slot, mats);
+            g53_scale_adjacent_audit(m, layer);
+        }
         G53DiagValues gs = g53_diag_scales(layer, eid, "gate", &gate);
         G53DiagValues us = g53_diag_scales(layer, eid, "up", &up);
         G53DiagValues ds = g53_diag_scales(layer, eid, "down", &down);
@@ -2539,6 +2679,37 @@ static int g53_cuda_ffn_grouped(GModel *m, const GLayer *l, int index,
     for (int di = 0; di < g->ndev; di++) free(group[di].input);
     free(result);
     return 1;
+}
+/* Metadata-only checkpoint inspection: no CUDA init, expert inference, or
+ * weight dequantization. The optional full-layer pass reads scale pieces only. */
+static int g53_scale_audit_cli(const char *dir, int audit, int scan_all) {
+    GModel m = {0};
+    load_cfg(&m.c, dir);
+    if (m.c.n_layers <= 17 || m.c.n_experts <= 167 || m.c.first_dense > 17) {
+        fprintf(stderr, "[glm53-scale-audit] model has no layer 17 experts 165..167\n");
+        return 2;
+    }
+    st_init(&m.S, dir);
+    snprintf(m.prefix, sizeof(m.prefix), "model.language_model.");
+    char probe[256];
+    snprintf(probe, sizeof(probe), "%sembed_tokens.weight", m.prefix);
+    if (!st_find(&m.S, probe)) snprintf(m.prefix, sizeof(m.prefix), "model.");
+    m.layer_begin = 17; m.layer_end = 18;
+    expert_geometry(&m);
+    expert_table_init(&m);
+    Slot slot = {.eid = -1};
+    if (audit) {
+        expert_read(&m, 17, 166, &slot);
+        Mat mats[3];
+        expert_mats(&m, &slot, &mats[0], &mats[1], &mats[2]);
+        g53_scale_file_audit(&m, 17, 166, &slot, mats);
+        g53_scale_adjacent_audit(&m, 17);
+    }
+    if (scan_all) g53_scale_layer_scan(&m, 17);
+    free(slot.own);
+    free(m.eref);
+    st_destroy(&m.S);
+    return 0;
 }
 #endif
 
@@ -4442,12 +4613,15 @@ int main(int argc, char **argv) {
     coli_omp_tune_threads("glm53");
     const char *dir = NULL, *ids = NULL, *patch_file = NULL, *prompt_text = NULL;
     int greedy = 0, show_logits = 0, grid_h = 0, grid_w = 0;
+    int scale_audit = 0, scale_scan = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) dir = argv[++i];
         else if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids = argv[++i];
         else if (!strcmp(argv[i], "--greedy") && i + 1 < argc) greedy = coli_arg_int(argv[++i], "--greedy");
         else if (!strcmp(argv[i], "--logits")) show_logits = 1;
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
+        else if (!strcmp(argv[i], "--expert-scale-audit")) scale_audit = 1;
+        else if (!strcmp(argv[i], "--expert-scale-scan")) scale_scan = 1;
         else if (!strcmp(argv[i], "--patches") && i + 1 < argc) patch_file = argv[++i];
         else if (!strcmp(argv[i], "--grid") && i + 1 < argc &&
                  sscanf(argv[++i], "%dx%d", &grid_h, &grid_w) == 2) continue;
@@ -4487,10 +4661,20 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (scale_audit || scale_scan) {
+        if (!dir) { fprintf(stderr, "expert scale audit/scan requires --model DIR\n"); return 2; }
+#ifdef COLI_CUDA
+        return g53_scale_audit_cli(dir, scale_audit, scale_scan);
+#else
+        fprintf(stderr, "expert scale audit/scan requires a CUDA-enabled build\n");
+        return 2;
+#endif
+    }
     if (!dir || (!ids && !prompt_text)) {
         fprintf(stderr, "usage: %s --model DIR (--prompt TEXT | --ids a,b,c)\n"
-                        "         [--greedy N] [--logits] [--patches FILE.f32 --grid HxW]\n",
-                argv[0]);
+                        "         [--greedy N] [--logits] [--patches FILE.f32 --grid HxW]\n"
+                        "       %s --model DIR [--expert-scale-audit] [--expert-scale-scan]\n",
+                argv[0], argv[0]);
         return 2;
     }
     if (ids && prompt_text) {

@@ -249,6 +249,14 @@ check is included in
 `make glm53-cuda-multidev-check CUDA=1 CUDA_ARCH=sm_86` and skips if fewer than
 two CUDA devices are visible.
 
+To inspect the layer-17 expert-166 scale corruption without inference, run
+`./glm53 --model DIR --expert-scale-audit`. This uses ERef file offsets for
+direct `pread` comparison with the expert slot and `Mat` scale pointers, and
+reports direct-file controls for experts 165 and 167. Run
+`./glm53 --model DIR --expert-scale-scan` for a scale-piece-only scan of all
+layer-17 experts; it prints only experts with non-finite scales or finite
+scales above `1e6` in magnitude. Both flags can be combined.
+
 For a 64-token RTX 3070 run with the validated 4 GB tier, from `c/`:
 
 ```bash
