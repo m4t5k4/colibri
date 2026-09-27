@@ -39,6 +39,30 @@ int main(void) {
     assert(g.executed == 2 && g.errors == 1);
     g53_cuda_close(&g); /* final snapshot precedes freeing, no eviction increments */
     assert(live == 0);
+    G53Cuda cache = {0};
+    g53_cuda_init(&cache, 1, 3, 64, 64, 1);
+    g53_cuda_profile_enable(&cache, fake_clock);
+    cache.profile.decode = 1;
+    cache.budget = cache.expert_bytes;
+    g53_cuda_heat(&cache, 0, 0, 2); g53_cuda_promote(&cache, 0, 0, pieces);
+    g53_cuda_heat(&cache, 0, 0, 1); /* resident selection after upload */
+    cache.profile.decode_tokens++;
+    g53_cuda_heat(&cache, 0, 1, 4); g53_cuda_promote(&cache, 0, 1, pieces);
+    cache.profile.decode_tokens++;
+    g53_cuda_heat(&cache, 0, 0, 10); g53_cuda_promote(&cache, 0, 0, pieces);
+    assert(cache.profile.cache_layer[0].hit == 1);
+    assert(cache.profile.cache_layer[0].miss == 3);
+    assert(cache.profile.cache_layer[0].hit_rows == 1);
+    assert(cache.profile.cache_layer[0].miss_rows == 16);
+    assert(cache.profile.cache_layer[0].promotions == 3);
+    assert(cache.profile.cache_layer[0].evictions == 2);
+    assert(cache.profile.cache_layer[0].repromotions == 1);
+    assert(cache.profile.cache_layer[0].dead_on_arrival == 1);
+    assert(cache.profile.cache_expert[0].promotions == 2);
+    assert(cache.profile.repromotions == 1 && cache.profile.dead_on_arrival == 1);
+    assert(cache.profile.eviction_record_count == 2);
+    g53_cuda_close(&cache);
+    assert(live == 0);
     puts("PASS GLM53 profiler: disabled clock, unchanged output, intervals, eviction and failure accounting");
     return 0;
 }

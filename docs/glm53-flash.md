@@ -209,6 +209,24 @@ avoid clock calls when profiling is off. The normal `[glm53-cuda]` diagnostics
 remain independent of this opt-in. Startup model loading and CUDA initialization
 finish before `phase=start`; their time is outside this profile.
 
+At shutdown, profiling also prints `[glm53-cuda-cache]` totals and a
+`[glm53-cuda-cache-layer]` row for each selected sparse layer: resident
+selection hits/misses and rows, promotions, evictions, re-promotions, and
+promotions evicted without a subsequent resident selection. Victim last-use
+distance is measured in routed expert selections, not tokens. Individual
+evictions are recorded in an internal spool without per-event log lines.
+Set `GLM53_CUDA_TRACE=/path/cache.csv` alongside profiling to retain a
+selection/eviction trace for offline comparison. For example, after a run
+whose tier fits 847 whole experts:
+
+```bash
+python3 tools/glm53_cuda_cache_sim.py /path/cache.csv --capacity 847
+```
+
+The script compares observed resident rows with a global-capacity LRU and a
+future-aware static top-frequency set. The latter is an upper bound; neither
+simulation accounts for per-device stranded capacity or upload time.
+
 The fields are cumulative within one model run:
 
 | Field | What it measures |

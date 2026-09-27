@@ -26,10 +26,28 @@ typedef struct {
 enum { G53_UPLOAD, G53_GATE, G53_UP, G53_CLAMP, G53_DOWN, G53_FALLBACK,
        G53_PROMOTION, G53_EVICT, G53_GROUP_ISSUE, G53_GROUP_TAKE, G53_PROFILE_TIMES };
 typedef struct {
+    uint64_t hit, miss, hit_rows, miss_rows, promotions, evictions;
+    uint64_t repromotions, dead_on_arrival, age_sum, age_min, age_max, age_unknown;
+    uint64_t incoming_heat_sum, victim_heat_sum;
+} G53CudaLayerCache;
+typedef struct {
+    uint64_t last_use_tick, upload_tick;
+    unsigned promotions, hits_since_upload;
+    unsigned char selected;
+} G53CudaExpertCache;
+typedef struct {
+    uint64_t tick, incoming_heat, victim_heat, victim_residence_age, victim_last_use_distance;
+    int incoming_layer, incoming_eid, victim_layer, victim_eid;
+} G53CudaEvictionRecord;
+typedef struct {
     double (*clock)(void);
     double seconds[G53_PROFILE_TIMES], forward_s, decode_forward_s;
     double disk_s, attn_s, ffn_s, head_s;
     uint64_t tokens, decode_tokens, forwards, evictions, fallback_compute_rows;
+    G53CudaLayerCache *cache_layer;
+    G53CudaExpertCache *cache_expert;
+    FILE *selection_trace, *eviction_records;
+    uint64_t selection_tick, repromotions, dead_on_arrival, eviction_record_count;
     int decode;
 } G53CudaProfile;
 typedef struct {
@@ -54,7 +72,72 @@ static void g53_cuda_profile_add(G53Cuda *g, int field, double start) {
 }
 static void g53_cuda_profile_enable(G53Cuda *g, double (*clock)(void)) {
     const char *env = getenv("GLM53_CUDA_PROFILE");
-    if (g->active && env && !strcmp(env, "1")) g->profile.clock = clock;
+    if (!g->active || !env || strcmp(env, "1")) return;
+    if (!g->profile.clock) {
+        g->profile.cache_layer = calloc((size_t)(g->count / g->ne), sizeof(*g->profile.cache_layer));
+        g->profile.cache_expert = calloc((size_t)g->count, sizeof(*g->profile.cache_expert));
+        if (g->profile.cache_expert) for (int i = 0; i < g->count; i++)
+            if (g->experts[i].w[0]) {
+                /* A late profiler start cannot know whether an earlier upload
+                 * had a hit. Do not call its eventual eviction dead-on-arrival. */
+                g->profile.cache_expert[i].promotions = 1;
+                g->profile.cache_expert[i].hits_since_upload = 1;
+            }
+        g->profile.eviction_records = tmpfile();
+        const char *path = getenv("GLM53_CUDA_TRACE");
+        if (path && *path) {
+            g->profile.selection_trace = fopen(path, "w");
+            if (g->profile.selection_trace)
+                fprintf(g->profile.selection_trace,
+                        "# S,tick,decode_token,layer,eid,rows,resident_before | E,tick,in_layer,in_eid,victim_layer,victim_eid,in_heat,victim_heat,victim_residence_age,victim_last_use_distance\n");
+            else fprintf(stderr, "[glm53-cuda-cache] cannot open trace %s: %s\n", path, strerror(errno));
+        }
+        if (!g->profile.cache_layer || !g->profile.cache_expert)
+            fprintf(stderr, "[glm53-cuda-cache] cache counters unavailable (allocation failed)\n");
+        if (!g->profile.eviction_records)
+            fprintf(stderr, "[glm53-cuda-cache] eviction record spool unavailable\n");
+    }
+    g->profile.clock = clock;
+}
+static void g53_cuda_cache_report(const G53Cuda *g) {
+    const G53CudaProfile *p = &g->profile;
+    if (!p->clock || !p->cache_layer || !p->cache_expert) return;
+    uint64_t unique_selected = 0, unique_resident = 0, unique_repromoted = 0;
+    for (int i = 0; i < g->count; i++) {
+        const G53CudaExpertCache *e = &p->cache_expert[i];
+        unique_selected += !!e->selected;
+        unique_resident += e->promotions > 0;
+        unique_repromoted += e->promotions > 1;
+    }
+    fprintf(stderr, "[glm53-cuda-cache] unique_selected=%llu unique_ever_resident=%llu unique_promoted_more_than_once=%llu re_promotions=%llu dead_on_arrival=%llu eviction_records=%llu\n",
+            (unsigned long long)unique_selected, (unsigned long long)unique_resident,
+            (unsigned long long)unique_repromoted, (unsigned long long)p->repromotions,
+            (unsigned long long)p->dead_on_arrival,
+            (unsigned long long)p->eviction_record_count);
+    for (int layer = 0; layer < g->count / g->ne; layer++) {
+        const G53CudaLayerCache *s = &p->cache_layer[layer];
+        if (!(s->hit || s->miss || s->promotions || s->evictions)) continue;
+        uint64_t selected = 0, resident = 0, repromoted = 0;
+        for (int eid = 0; eid < g->ne; eid++) {
+            const G53CudaExpertCache *e = &p->cache_expert[layer * g->ne + eid];
+            selected += !!e->selected;
+            resident += e->promotions > 0;
+            repromoted += e->promotions > 1;
+        }
+        fprintf(stderr, "[glm53-cuda-cache-layer] layer=%d hit=%llu miss=%llu hit_rows=%llu miss_rows=%llu promotions=%llu evictions=%llu re_promotions=%llu dead_on_arrival=%llu unique_selected=%llu unique_resident=%llu unique_repromoted=%llu victim_last_use_min=%llu victim_last_use_max=%llu victim_last_use_mean=%.1f victim_last_use_unknown=%llu incoming_heat_mean=%.1f victim_heat_mean=%.1f\n",
+                layer, (unsigned long long)s->hit, (unsigned long long)s->miss,
+                (unsigned long long)s->hit_rows, (unsigned long long)s->miss_rows,
+                (unsigned long long)s->promotions, (unsigned long long)s->evictions,
+                (unsigned long long)s->repromotions, (unsigned long long)s->dead_on_arrival,
+                (unsigned long long)selected, (unsigned long long)resident,
+                (unsigned long long)repromoted,
+                (unsigned long long)(s->evictions > s->age_unknown ? s->age_min : 0),
+                (unsigned long long)s->age_max,
+                s->evictions > s->age_unknown ? (double)s->age_sum / (s->evictions - s->age_unknown) : 0,
+                (unsigned long long)s->age_unknown,
+                s->evictions ? (double)s->incoming_heat_sum / s->evictions : 0,
+                s->evictions ? (double)s->victim_heat_sum / s->evictions : 0);
+    }
 }
 static void g53_cuda_profile_report(const G53Cuda *g, const char *phase) {
     const G53CudaProfile *p = &g->profile;
@@ -131,7 +214,12 @@ static void g53_cuda_close(G53Cuda *g) {
     g53_cuda_stats(g);
     g53_cuda_device_stats(g);
     g53_cuda_profile_report(g, "final"); /* before teardown, not an eviction */
+    g53_cuda_cache_report(g);
     for (int i = 0; i < g->count; i++) g53_cuda_drop(g, &g->experts[i]);
+    if (g->profile.selection_trace) fclose(g->profile.selection_trace);
+    if (g->profile.eviction_records) fclose(g->profile.eviction_records);
+    free(g->profile.cache_layer);
+    free(g->profile.cache_expert);
     free(g->experts);
     coli_cuda_shutdown();
     memset(g, 0, sizeof(*g));
@@ -223,7 +311,27 @@ static void g53_cuda_init(G53Cuda *g, int nl, int ne, int D, int I, int streamin
 }
 /* Called once per routed expert union, with its actual selected-row count. */
 static void g53_cuda_heat(G53Cuda *g, int layer, int eid, int rows) {
-    if (g->active) g->experts[layer * g->ne + eid].heat += (uint64_t)rows;
+    if (!g->active) return;
+    int index = layer * g->ne + eid;
+    G53CudaExpert *e = &g->experts[index];
+    if (g->profile.clock && g->profile.cache_layer && g->profile.cache_expert && rows > 0) {
+        G53CudaProfile *p = &g->profile;
+        G53CudaLayerCache *s = &p->cache_layer[layer];
+        G53CudaExpertCache *ec = &p->cache_expert[index];
+        int resident = e->w[0] != NULL;
+        uint64_t tick = ++p->selection_tick;
+        ec->selected = 1;
+        if (resident) {
+            s->hit++; s->hit_rows += (uint64_t)rows;
+            ec->last_use_tick = tick; ec->hits_since_upload++;
+        } else { s->miss++; s->miss_rows += (uint64_t)rows; }
+        if (p->selection_trace)
+            fprintf(p->selection_trace, "S,%llu,%llu,%d,%d,%d,%d\n",
+                    (unsigned long long)tick,
+                    (unsigned long long)(p->decode ? p->decode_tokens + 1 : 0),
+                    layer, eid, rows, resident);
+    }
+    e->heat += (uint64_t)rows;
 }
 static int g53_cuda_place(const G53Cuda *g) {
     int owner = -1;
@@ -247,6 +355,39 @@ static void g53_cuda_promote_impl(G53Cuda *g, int layer, int eid, uint8_t *const
                 victim = &g->experts[j];
         if (!victim || e->heat <= victim->heat) return;
         double evict_start = g53_cuda_profile_now(g);
+        if (g->profile.clock && g->profile.cache_layer && g->profile.cache_expert) {
+            G53CudaProfile *p = &g->profile;
+            int vi = (int)(victim - g->experts), vl = vi / g->ne, ve = vi % g->ne;
+            G53CudaExpertCache *vc = &p->cache_expert[vi];
+            G53CudaLayerCache *ls = &p->cache_layer[vl];
+            uint64_t age = vc->last_use_tick ? p->selection_tick - vc->last_use_tick : UINT64_MAX;
+            uint64_t residence_age = p->selection_tick - vc->upload_tick;
+            G53CudaEvictionRecord rec = {p->selection_tick, e->heat, victim->heat,
+                                         residence_age, age,
+                                         layer, eid, vl, ve};
+            ls->evictions++;
+            ls->incoming_heat_sum += e->heat;
+            ls->victim_heat_sum += victim->heat;
+            if (age == UINT64_MAX) ls->age_unknown++;
+            else {
+                if (ls->evictions - ls->age_unknown == 1 || age < ls->age_min) ls->age_min = age;
+                if (age > ls->age_max) ls->age_max = age;
+                ls->age_sum += age;
+            }
+            if (vc->promotions && !vc->hits_since_upload) {
+                ls->dead_on_arrival++; p->dead_on_arrival++;
+            }
+            if (p->eviction_records && fwrite(&rec, sizeof(rec), 1, p->eviction_records) == 1)
+                p->eviction_record_count++;
+            if (p->selection_trace)
+                fprintf(p->selection_trace, "E,%llu,%d,%d,%d,%d,%llu,%llu,%llu,%lld\n",
+                        (unsigned long long)rec.tick, rec.incoming_layer, rec.incoming_eid,
+                        rec.victim_layer, rec.victim_eid,
+                        (unsigned long long)rec.incoming_heat,
+                        (unsigned long long)rec.victim_heat,
+                        (unsigned long long)rec.victim_residence_age,
+                        age == UINT64_MAX ? -1LL : (long long)age);
+        }
         g53_cuda_drop(g, victim);
         /* Eviction changes the least-allocated device. The freed whole slot
          * guarantees at least one eligible owner. */
@@ -279,6 +420,16 @@ static void g53_cuda_promote_impl(G53Cuda *g, int layer, int eid, uint8_t *const
         g->bytes += bytes; g->used[owner] += bytes;
     }
     g->resident++; g->uploads++;
+    if (g->profile.clock && g->profile.cache_layer && g->profile.cache_expert) {
+        G53CudaProfile *p = &g->profile;
+        G53CudaExpertCache *ec = &p->cache_expert[layer * g->ne + eid];
+        p->cache_layer[layer].promotions++;
+        if (ec->promotions) { p->repromotions++; p->cache_layer[layer].repromotions++; }
+        ec->promotions++;
+        ec->hits_since_upload = 0;
+        ec->last_use_tick = 0;
+        ec->upload_tick = p->selection_tick;
+    }
 }
 static void g53_cuda_promote(G53Cuda *g, int layer, int eid, uint8_t *const *pieces) {
     double start = g53_cuda_profile_now(g);
