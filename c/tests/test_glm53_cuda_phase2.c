@@ -132,8 +132,16 @@ static void case_shutdown_pending(void) {
     model_fixture_close(&f);
     assert(group_take_calls - before == 2);
 }
+static void case_diagnostic_value_types(void) {
+    const float values[] = {1.5f, NAN, INFINITY, -INFINITY, -2.0f};
+    G53DiagValues s = g53_diag_values(values, sizeof(values) / sizeof(values[0]));
+    assert(s.bad == 3 && s.nan_count == 1 && s.pos_inf == 1 && s.neg_inf == 1);
+    assert(s.first_bad == 1 && isnan(s.first_value));
+    assert(s.has_finite && s.min == -2.0f && s.max == 1.5f && s.max_abs == 2.0f);
+}
 int main(void) {
     fixture();
+    case_diagnostic_value_types();
     case_group("0,1", 1, -1, -1, -1); /* device 1 completes first */
     case_group("1,0", 0, -1, -1, -1); /* physical device 0 completes first */
     case_group("0,1", 0, -1, 1, -1); /* second take fails after first succeeds */

@@ -242,7 +242,10 @@ expert, device, group position, output coordinate and input range. It replays
 that expert with the serial CUDA path and CPU `mlp3` before enabling the normal
 model-wide fallback. Set `GLM53_CUDA_DIAG_GROUP=1` to capture and compare every
 member of the failing device group in private scratch; this adds work only on
-the failure path. The synthetic production-geometry check is included in
+the failure path. For the first bad expert it also reports gate/up/down scale
+geometry and finite ranges, then CPU gate, up, SwiGLU and down stage ranges
+with separate NaN and infinity counts. The synthetic production-geometry
+check is included in
 `make glm53-cuda-multidev-check CUDA=1 CUDA_ARCH=sm_86` and skips if fewer than
 two CUDA devices are visible.
 

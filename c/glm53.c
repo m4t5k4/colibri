@@ -2253,10 +2253,58 @@ static G53DiagOutput g53_diag_output(const float *v, int n) {
     }
     return s;
 }
+typedef struct {
+    size_t bad, nan_count, pos_inf, neg_inf;
+    size_t first_bad;
+    float first_value, min, max, max_abs;
+    int has_finite;
+} G53DiagValues;
+static G53DiagValues g53_diag_values(const float *v, size_t n) {
+    G53DiagValues s = {0};
+    s.first_bad = SIZE_MAX;
+    for (size_t i = 0; i < n; i++) {
+        float value = v[i];
+        if (!isfinite(value)) {
+            if (s.first_bad == SIZE_MAX) { s.first_bad = i; s.first_value = value; }
+            s.bad++;
+            if (isnan(value)) s.nan_count++;
+            else if (value > 0) s.pos_inf++;
+            else s.neg_inf++;
+        } else {
+            if (!s.has_finite || value < s.min) s.min = value;
+            if (!s.has_finite || value > s.max) s.max = value;
+            if (fabsf(value) > s.max_abs) s.max_abs = fabsf(value);
+            s.has_finite = 1;
+        }
+    }
+    if (!s.has_finite) s.min = s.max = s.max_abs = NAN;
+    return s;
+}
+static void g53_diag_values_report(int layer, int eid, const char *kind,
+                                   const char *name, G53DiagValues s) {
+    char first_value[32];
+    if (s.first_bad == SIZE_MAX) snprintf(first_value, sizeof(first_value), "none");
+    else snprintf(first_value, sizeof(first_value), "%.9g", s.first_value);
+    fprintf(stderr, "[glm53-cuda-diag] %s layer=%d expert=%d name=%s finite=%d nonfinite=%zu nan=%zu pos_inf=%zu neg_inf=%zu first_bad=%lld first_value=%s finite_min=%g finite_max=%g finite_max_abs=%g\n",
+            kind, layer, eid, name, s.bad == 0, s.bad, s.nan_count,
+            s.pos_inf, s.neg_inf,
+            s.first_bad == SIZE_MAX ? -1LL : (long long)s.first_bad,
+            first_value,
+            s.min, s.max, s.max_abs);
+}
+static G53DiagValues g53_diag_scales(int layer, int eid, const char *name, const Mat *mat) {
+    size_t groups = mat->gs > 0 ? ((size_t)mat->columns + mat->gs - 1) / mat->gs : 1;
+    size_t count = (size_t)mat->rows * groups;
+    G53DiagValues s = g53_diag_values(mat->s, count);
+    fprintf(stderr, "[glm53-cuda-diag] scales layer=%d expert=%d name=%s rows=%d columns=%d gs=%d groups_per_row=%zu scale_count=%zu\n",
+            layer, eid, name, mat->rows, mat->columns, mat->gs, groups, count);
+    g53_diag_values_report(layer, eid, "scale_values", name, s);
+    return s;
+}
 /* Failure-only replay. Keep its scratch and accounting separate from the FFN
  * result; the caller has not yet marked the tier failed. */
 static void g53_diag_replay(GModel *m, int layer, int eid, const float *x,
-                            const float *grouped, int di, int j) {
+                            const float *grouped, int di, int j, int inspect_stages) {
     G53Cuda *g = &m->cuda;
     const Cfg *c = &m->c;
     float *scratch = malloc(((size_t)2 * c->hidden + (size_t)2 * c->moe_inter) * sizeof(float));
@@ -2275,7 +2323,42 @@ static void g53_diag_replay(GModel *m, int layer, int eid, const float *x,
     Slot *slot = expert_slot(m, layer, eid);
     Mat gate, up, down;
     expert_mats(m, slot, &gate, &up, &down);
-    mlp3(cpu, x, &gate, &up, &down, c->swiglu_limit, sg, su);
+    if (inspect_stages) {
+        G53DiagValues gs = g53_diag_scales(layer, eid, "gate", &gate);
+        G53DiagValues us = g53_diag_scales(layer, eid, "up", &up);
+        G53DiagValues ds = g53_diag_scales(layer, eid, "down", &down);
+        mv(sg, &gate, x);
+        G53DiagValues a = g53_diag_values(sg, (size_t)gate.rows);
+        g53_diag_values_report(layer, eid, "cpu_stage", "A_gate_projection", a);
+        mv(su, &up, x);
+        G53DiagValues b = g53_diag_values(su, (size_t)up.rows);
+        g53_diag_values_report(layer, eid, "cpu_stage", "B_up_projection", b);
+        swiglu_clamped(sg, su, gate.rows, c->swiglu_limit);
+        G53DiagValues cc = g53_diag_values(sg, (size_t)gate.rows);
+        g53_diag_values_report(layer, eid, "cpu_stage", "C_swiglu", cc);
+        mv(cpu, &down, sg);
+        G53DiagValues d = g53_diag_values(cpu, (size_t)down.rows);
+        g53_diag_values_report(layer, eid, "cpu_stage", "D_down_projection", d);
+        const char *first = a.bad ? "A_gate_projection" : b.bad ? "B_up_projection" :
+                            cc.bad ? "C_swiglu" : d.bad ? "D_down_projection" : "none";
+        const G53DiagValues stages[4] = {a, b, cc, d};
+        const char *stage_names[4] = {"A_gate_projection", "B_up_projection",
+                                      "C_swiglu", "D_down_projection"};
+        int first_inf = -1, first_nan = -1;
+        for (int k = 0; k < 4; k++) {
+            if (first_inf < 0 && (stages[k].pos_inf || stages[k].neg_inf)) first_inf = k;
+            if (first_nan < 0 && stages[k].nan_count) first_nan = k;
+        }
+        int scales_finite = !(gs.bad || us.bad || ds.bad);
+        int inf_before_nan = scales_finite && first_inf >= 0 &&
+                             first_nan >= 0 && first_inf < first_nan;
+        fprintf(stderr, "[glm53-cuda-diag] stage_summary layer=%d expert=%d scales_all_finite=%d first_nonfinite_stage=%s first_inf_stage=%s first_nan_stage=%s inf_before_nan=%d\n",
+                layer, eid, scales_finite, first,
+                first_inf < 0 ? "none" : stage_names[first_inf],
+                first_nan < 0 ? "none" : stage_names[first_nan], inf_before_nan);
+    } else {
+        mlp3(cpu, x, &gate, &up, &down, c->swiglu_limit, sg, su);
+    }
     G53DiagOutput cpu_stats = g53_diag_output(cpu, c->hidden);
     G53DiagOutput group_stats = g53_diag_output(grouped, c->hidden);
     float group_serial_diff = 0, group_cpu_diff = 0, serial_cpu_diff = 0;
@@ -2396,16 +2479,18 @@ static int g53_cuda_ffn_grouped(GModel *m, const GLayer *l, int index,
                         index, g->devices[di], group[di].count, bad_j, at, eid, bad_d,
                         captured_rows[(size_t)bad_j * c->hidden + bad_d], c->swiglu_limit,
                         xmin, xmax, xabs, input_finite);
-                g53_diag_replay(m, index, eid, input,
-                                captured_rows + (size_t)bad_j * c->hidden, di, bad_j);
                 const char *all = getenv("GLM53_CUDA_DIAG_GROUP");
-                if (all && !strcmp(all, "1")) {
+                int inspect = all && !strcmp(all, "1");
+                g53_diag_replay(m, index, eid, input,
+                                captured_rows + (size_t)bad_j * c->hidden, di, bad_j,
+                                inspect);
+                if (inspect) {
                     fprintf(stderr, "[glm53-cuda-diag] full_group layer=%d device=%d count=%d\n",
                             index, g->devices[di], group[di].count);
                     for (int j = 0; j < group[di].count; j++) if (j != bad_j)
                         g53_diag_replay(m, index, union_ids[group[di].at[j]],
                                         group[di].input + (size_t)j * c->hidden,
-                                        captured_rows + (size_t)j * c->hidden, di, j);
+                                        captured_rows + (size_t)j * c->hidden, di, j, 0);
                 }
                 free(capture);
                 g->failed = 1; g->errors++;
