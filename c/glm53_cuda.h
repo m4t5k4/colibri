@@ -89,7 +89,7 @@ static void g53_cuda_profile_enable(G53Cuda *g, double (*clock)(void)) {
             g->profile.selection_trace = fopen(path, "w");
             if (g->profile.selection_trace)
                 fprintf(g->profile.selection_trace,
-                        "# S,tick,decode_token,layer,eid,rows,resident_before | E,tick,in_layer,in_eid,victim_layer,victim_eid,in_heat,victim_heat,victim_residence_age,victim_last_use_distance\n");
+                        "# S,tick,decode_token,layer,eid,rows,resident_before | A,tick,layer,eid | P,tick,layer,eid,owner_index,device_id | E,tick,in_layer,in_eid,victim_layer,victim_eid,in_heat,victim_heat,victim_residence_age,victim_last_use_distance\n");
             else fprintf(stderr, "[glm53-cuda-cache] cannot open trace %s: %s\n", path, strerror(errno));
         }
         if (!g->profile.cache_layer || !g->profile.cache_expert)
@@ -420,6 +420,10 @@ static void g53_cuda_promote_impl(G53Cuda *g, int layer, int eid, uint8_t *const
         g->bytes += bytes; g->used[owner] += bytes;
     }
     g->resident++; g->uploads++;
+    if (g->profile.selection_trace)
+        fprintf(g->profile.selection_trace, "P,%llu,%d,%d,%d,%d\n",
+                (unsigned long long)g->profile.selection_tick, layer, eid,
+                owner, g->devices[owner]);
     if (g->profile.clock && g->profile.cache_layer && g->profile.cache_expert) {
         G53CudaProfile *p = &g->profile;
         G53CudaExpertCache *ec = &p->cache_expert[layer * g->ne + eid];
@@ -433,6 +437,9 @@ static void g53_cuda_promote_impl(G53Cuda *g, int layer, int eid, uint8_t *const
 }
 static void g53_cuda_promote(G53Cuda *g, int layer, int eid, uint8_t *const *pieces) {
     double start = g53_cuda_profile_now(g);
+    if (g->profile.selection_trace)
+        fprintf(g->profile.selection_trace, "A,%llu,%d,%d\n",
+                (unsigned long long)g->profile.selection_tick, layer, eid);
     g53_cuda_promote_impl(g, layer, eid, pieces);
     g53_cuda_profile_add(g, G53_PROMOTION, start);
 }

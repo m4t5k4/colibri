@@ -221,11 +221,20 @@ whose tier fits 847 whole experts:
 
 ```bash
 python3 tools/glm53_cuda_cache_sim.py /path/cache.csv --capacity 847
+python3 tools/glm53_cuda_cache_sim.py /path/cache.csv --capacity 847 --device-capacities 424,423
 ```
 
-The script compares observed resident rows with a global-capacity LRU and a
-future-aware static top-frequency set. The latter is an upper bound; neither
-simulation accounts for per-device stranded capacity or upload time.
+The script compares observed resident rows with global-capacity LRU, a
+future-aware static top-frequency set, and cumulative-heat admission/replacement
+counterfactuals. It reports both global and device-aware policy replays when
+ordered per-device capacities are supplied. The static set is an upper bound.
+Older selection/eviction traces infer promotion timing from each decode-layer
+selection group. New traces also contain promotion-attempt (`A`) and successful
+upload (`P`) events; the latter include owner index and physical device ID so
+the replay can check its device placement. Compare the replayed current-policy
+rows and event mismatch counts with the observed values before interpreting
+counterfactuals. The upload-time estimate is rough accounting, not a speed
+prediction; the replay does not model transient allocations or failed uploads.
 
 The fields are cumulative within one model run:
 
