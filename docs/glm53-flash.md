@@ -127,10 +127,15 @@ CPU capabilities and `numeric_class` remain unchanged. The CPU-only adapter
 build also ignores this CUDA opt-in instead of rejecting it.
 
 The RAM cache (`GLM53_EXPERT_GB`) stays intact. On-demand promotion begins
-after an expert has been selected for at least two rows; a full device tier
-replaces its least frequently selected resident only for a hotter candidate.
-Heat is cumulative for this model lifetime. Uploads are synchronous, after
-the normal disk-to-RAM read, and own their device memory independently of
+after an expert has been selected for at least two rows by default; a full
+device tier replaces its least frequently selected resident only for a hotter
+candidate. `GLM53_CUDA_HEAT_MIN` (positive integer, default `2`) and
+`GLM53_CUDA_HEAT_MARGIN` (nonnegative integer, default `0`) are experimental
+controls. At full capacity, replacement requires incoming heat greater than
+victim heat plus the margin. Invalid values fail initialization. The effective
+values appear once on the CUDA startup line. Heat remains cumulative for this
+model lifetime. Uploads are synchronous after the normal disk-to-RAM read and
+own their device memory independently of
 RAM-slot eviction. Resident hits bypass disk and RAM reads. Cold misses use
 the existing host path and become eligible for subsequent CUDA execution.
 

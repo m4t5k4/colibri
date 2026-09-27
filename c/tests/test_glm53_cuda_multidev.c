@@ -12,6 +12,18 @@ static void check_init_cleanup(void) {
 #endif
 
 int main(void) {
+    unsetenv("GLM53_CUDA_HEAT_MIN");
+    unsetenv("GLM53_CUDA_HEAT_MARGIN");
+    uint64_t parsed = 0;
+    assert(g53_cuda_heat_setting(NULL, 2, 0, &parsed) && parsed == 2);
+    assert(g53_cuda_heat_setting(NULL, 0, 1, &parsed) && parsed == 0);
+    assert(g53_cuda_heat_setting("18446744073709551615", 0, 1, &parsed) &&
+           parsed == UINT64_MAX);
+    const char *bad_heat[] = {"", "-1", "+1", " 1", "1x",
+                              "18446744073709551616"};
+    for (size_t i = 0; i < sizeof(bad_heat)/sizeof(*bad_heat); i++)
+        assert(!g53_cuda_heat_setting(bad_heat[i], 0, 1, &parsed));
+    assert(!g53_cuda_heat_setting("0", 2, 0, &parsed));
     int devices[COLI_CUDA_MAX_DEVICES];
     assert(g53_cuda_devices("0,1", "9", devices) == 2);
     assert(devices[0] == 0 && devices[1] == 1);
@@ -35,6 +47,7 @@ int main(void) {
     uint8_t *pieces[] = {weights, (uint8_t *)scales, weights, (uint8_t *)scales,
                         weights, (uint8_t *)scales};
     g53_cuda_init(&g, 1, 6, 64, 64, 1);
+    assert(g.heat_min == 2 && g.heat_margin == 0);
     assert(fake_ndev == 2 && fake_devices[0] == 0 && fake_devices[1] == 1);
     assert(g.budget == 4 * g.expert_bytes);
     for (int i = 0; i < 5; i++) {
@@ -54,6 +67,30 @@ int main(void) {
     assert(live_device[0] && live_device[1]);
     g53_cuda_close(&g); g53_cuda_close(&g);
     assert(!live_device[0] && !live_device[1] && shutdown_calls == 1);
+
+    /* A one-point heat advantage replaces at the default margin, but not
+     * under the experimental margin of one. Two points still replace. */
+    setenv("GLM53_CUDA_HEAT_MARGIN", "1", 1);
+    g53_cuda_init(&g, 1, 2, 64, 64, 1);
+    assert(g.heat_min == 2 && g.heat_margin == 1);
+    g.budget = g.expert_bytes;
+    g53_cuda_heat(&g, 0, 0, 2); g53_cuda_promote(&g, 0, 0, pieces);
+    g53_cuda_heat(&g, 0, 1, 3); g53_cuda_promote(&g, 0, 1, pieces);
+    assert(g.experts[0].w[0] && !g.experts[1].w[0] && g.uploads == 1);
+    g53_cuda_heat(&g, 0, 1, 1); g53_cuda_promote(&g, 0, 1, pieces);
+    assert(!g.experts[0].w[0] && g.experts[1].w[0] && g.uploads == 2);
+    g53_cuda_close(&g);
+    unsetenv("GLM53_CUDA_HEAT_MARGIN");
+
+    setenv("GLM53_CUDA_HEAT_MIN", "3", 1);
+    g53_cuda_init(&g, 1, 2, 64, 64, 1);
+    assert(g.heat_min == 3 && g.heat_margin == 0);
+    g53_cuda_heat(&g, 0, 0, 2); g53_cuda_promote(&g, 0, 0, pieces);
+    assert(!g.experts[0].w[0] && g.uploads == 0);
+    g53_cuda_heat(&g, 0, 0, 1); g53_cuda_promote(&g, 0, 0, pieces);
+    assert(g.experts[0].w[0] && g.uploads == 1);
+    g53_cuda_close(&g);
+    unsetenv("GLM53_CUDA_HEAT_MIN");
 
     /* Unequal free memory, whole-expert fragmentation, ordered tie breaking. */
     setenv("COLI_GPUS", "3,1", 1); setenv("CUDA_EXPERT_GB", "auto", 1);
@@ -85,13 +122,18 @@ int main(void) {
 #ifndef _WIN32
     /* Initialization has already created every context when the second query
      * or budget validation fails. Each error must shut the backend down. */
-    for (int mode = 0; mode < 2; mode++) {
+    for (int mode = 0; mode < 7; mode++) {
         pid_t child = fork(); assert(child >= 0);
         if (!child) {
             expected_shutdown = shutdown_calls + 1;
             assert(!atexit(check_init_cleanup));
             if (mode == 0) fail_mem_device = 1;
-            else setenv("CUDA_EXPERT_GB", "invalid", 1);
+            else if (mode == 1) setenv("CUDA_EXPERT_GB", "invalid", 1);
+            else if (mode == 2) setenv("GLM53_CUDA_HEAT_MIN", "0", 1);
+            else if (mode == 3) setenv("GLM53_CUDA_HEAT_MIN", "-1", 1);
+            else if (mode == 4) setenv("GLM53_CUDA_HEAT_MIN", "18446744073709551616", 1);
+            else if (mode == 5) setenv("GLM53_CUDA_HEAT_MARGIN", "-1", 1);
+            else setenv("GLM53_CUDA_HEAT_MARGIN", "1x", 1);
             g53_cuda_init(&g, 1, 2, 64, 64, 1);
             _Exit(98);
         }

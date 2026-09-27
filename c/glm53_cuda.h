@@ -15,6 +15,7 @@
 #include <math.h>
 #include <limits.h>
 #include <errno.h>
+#include <stdint.h>
 
 typedef struct {
     ColiCudaTensor *w[3];
@@ -59,6 +60,7 @@ typedef struct {
     unsigned char group_pending[COLI_CUDA_MAX_DEVICES];
     int failure_stage;
     size_t budget, bytes, expert_bytes;
+    uint64_t heat_min, heat_margin;
     unsigned resident;
     uint64_t executed, fallback, uploads, errors;
     G53CudaProfile profile;
@@ -241,6 +243,21 @@ static int g53_cuda_devices(const char *many, const char *single, int *devices) 
         p = end + 1;
     }
 }
+static int g53_cuda_heat_setting(const char *value, uint64_t fallback,
+                                 int allow_zero, uint64_t *result) {
+    if (!value) { *result = fallback; return 1; }
+    if (!*value) return 0;
+    uint64_t parsed = 0;
+    for (const char *p = value; *p; p++) {
+        if (*p < '0' || *p > '9') return 0;
+        unsigned digit = (unsigned)(*p - '0');
+        if (parsed > (UINT64_MAX - digit) / 10) return 0;
+        parsed = parsed * 10 + digit;
+    }
+    if (!allow_zero && !parsed) return 0;
+    *result = parsed;
+    return 1;
+}
 /* Summary only at teardown; the aggregate line above keeps its existing
  * cadence and format for dashboards and profile parsers. */
 static void g53_cuda_device_stats(const G53Cuda *g) {
@@ -273,6 +290,12 @@ static void g53_cuda_init(G53Cuda *g, int nl, int ne, int D, int I, int streamin
     if (coli_cuda_device_count() != g->ndev) {
         coli_cuda_shutdown(); fprintf(stderr, "GLM53 CUDA device count mismatch\n"); exit(1);
     }
+    if (!g53_cuda_heat_setting(getenv("GLM53_CUDA_HEAT_MIN"), 2, 0, &g->heat_min) ||
+        !g53_cuda_heat_setting(getenv("GLM53_CUDA_HEAT_MARGIN"), 0, 1, &g->heat_margin)) {
+        coli_cuda_shutdown();
+        fprintf(stderr, "invalid GLM53_CUDA_HEAT_MIN or GLM53_CUDA_HEAT_MARGIN\n");
+        exit(1);
+    }
     /* Decimal GB. Shared total cap; reserve 2 GB on EACH device for scratch.
      * Do not rigidly divide the cap: a small device must not strand allowance. */
     g->budget = 0;
@@ -300,8 +323,9 @@ static void g53_cuda_init(G53Cuda *g, int nl, int ne, int D, int I, int streamin
     g->experts = calloc((size_t)g->count, sizeof(*g->experts));
     if (!g->experts) { coli_cuda_shutdown(); fprintf(stderr, "OOM CUDA expert table\n"); exit(1); }
     g->active = 1;
-    fprintf(stderr, "[glm53-cuda] device=%d budget_bytes=%zu gs=64 host_clamp=1 group_clamp=%d devices=",
-            g->device, g->budget, g->ndev > 1);
+    fprintf(stderr, "[glm53-cuda] device=%d budget_bytes=%zu gs=64 host_clamp=1 group_clamp=%d heat_min=%llu heat_margin=%llu devices=",
+            g->device, g->budget, g->ndev > 1,
+            (unsigned long long)g->heat_min, (unsigned long long)g->heat_margin);
     for (int i = 0; i < g->ndev; i++)
         fprintf(stderr, "%s%d(usable_bytes=%zu,capacity=%zu)", i ? "," : "", g->devices[i],
                 g->capacity[i] < g->budget ? g->capacity[i] : g->budget,
@@ -346,14 +370,15 @@ static int g53_cuda_place(const G53Cuda *g) {
 static void g53_cuda_promote_impl(G53Cuda *g, int layer, int eid, uint8_t *const *pieces) {
     if (!g->active || g->failed || g->expert_bytes > g->budget) return;
     G53CudaExpert *e = &g->experts[layer * g->ne + eid];
-    if (e->w[0] || e->heat < 2) return;
+    if (e->w[0] || e->heat < g->heat_min) return;
     int owner = g53_cuda_place(g);
     if (owner < 0 || g->bytes > g->budget - g->expert_bytes) {
         G53CudaExpert *victim = NULL;
         for (int j = 0; j < g->count; j++)
             if (g->experts[j].w[0] && (!victim || g->experts[j].heat < victim->heat))
                 victim = &g->experts[j];
-        if (!victim || e->heat <= victim->heat) return;
+        if (!victim || e->heat <= victim->heat ||
+            e->heat - victim->heat <= g->heat_margin) return;
         double evict_start = g53_cuda_profile_now(g);
         if (g->profile.clock && g->profile.cache_layer && g->profile.cache_expert) {
             G53CudaProfile *p = &g->profile;
