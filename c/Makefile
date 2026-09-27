@@ -1319,17 +1319,21 @@ glm53$(EXE): glm53.c sse41_kernels.h decode_batch.h pin_pool.h cli_args.h st.h j
 	$(CC) $(CFLAGS) glm53.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
 .PHONY: glm53-cuda-tier-check glm53-cuda-check glm53-cuda-multidev-check
-glm53-cuda-tier-check: tests/test_glm53_cuda_adapters$(EXE) tests/test_glm53_cuda_profile$(EXE) tests/test_glm53_cuda_multidev$(EXE) tests/test_glm53_cuda_multidev_oracle$(EXE) tests/test_glm53_cuda_scatter$(EXE) tests/test_glm53_cuda_phase2$(EXE)
+glm53-cuda-tier-check: tests/test_glm53_cuda_adapters$(EXE) tests/test_glm53_cuda_profile$(EXE) tests/test_glm53_cuda_multidev$(EXE) tests/test_glm53_cuda_multidev_oracle$(EXE) tests/test_glm53_cuda_prodshape$(EXE) tests/test_glm53_cuda_scatter$(EXE) tests/test_glm53_cuda_phase2$(EXE)
 	$(CC) $(NOCUDA_CFLAGS) tests/test_glm53_cuda.c -o tests/test_glm53_cuda$(EXE) $(NOCUDA_LDFLAGS)
 	COLI_CUDA=1 COLI_GPU=0 COLI_GPUS= CUDA_EXPERT_GB=auto ./tests/test_glm53_cuda$(EXE)
 	./tests/test_glm53_cuda_adapters$(EXE)
 	./tests/test_glm53_cuda_profile$(EXE)
 	./tests/test_glm53_cuda_multidev$(EXE)
 	./tests/test_glm53_cuda_multidev_oracle$(EXE)
+	./tests/test_glm53_cuda_prodshape$(EXE)
 	./tests/test_glm53_cuda_scatter$(EXE)
 	./tests/test_glm53_cuda_phase2$(EXE)
 
 tests/test_glm53_cuda_multidev_oracle$(EXE): tests/test_glm53_cuda_multidev_oracle.c tests/test_glm53_cuda.c glm53_cuda.h backend_cuda.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_glm53_cuda_prodshape$(EXE): tests/test_glm53_cuda_prodshape.c tests/test_glm53_cuda.c glm53_cuda.h backend_cuda.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_glm53_cuda_scatter$(EXE): tests/test_glm53_cuda_scatter.c tests/test_glm53_cuda_multidev_oracle.c glm53.c glm53_cuda.h backend_cuda.h segment_runtime.c edge_runtime.c
@@ -1357,6 +1361,8 @@ glm53-cuda-multidev-check: $(CUDA_OBJ)
 	@test -n "$(CUDA_OBJ)" || { echo "requires CUDA=1" >&2; exit 1; }
 	$(CC) $(CFLAGS) -DG53_REAL_CUDA tests/test_glm53_cuda_multidev_oracle.c $(CUDA_OBJ) -o tests/test_glm53_cuda_multidev_real$(EXE) $(LDFLAGS)
 	./tests/test_glm53_cuda_multidev_real$(EXE)
+	$(CC) $(CFLAGS) -DG53_REAL_CUDA tests/test_glm53_cuda_prodshape.c $(CUDA_OBJ) -o tests/test_glm53_cuda_prodshape_real$(EXE) $(LDFLAGS)
+	./tests/test_glm53_cuda_prodshape_real$(EXE)
 
 kimi_k3$(EXE): kimi_k3.c sse41_kernels.h serve_budget.h cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h fp8_format.h idot.h omp_tune.h route_trace.h kv_prefix.h pin_pool.h serve_codec.h backend_cuda.h backend_metal.h backend_vulkan.h edge_adapters.h edge_runtime.h edge_tok_internal.h hybrid_split.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ)
 	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)

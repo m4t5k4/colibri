@@ -237,6 +237,15 @@ backend API does not expose separate H2D, kernel-only and D2H timings for these
 individual matmuls, so the profiler cannot attribute activation-transfer cost
 more narrowly without backend instrumentation.
 
+On the first non-finite grouped expert result, the CUDA tier logs the layer,
+expert, device, group position, output coordinate and input range. It replays
+that expert with the serial CUDA path and CPU `mlp3` before enabling the normal
+model-wide fallback. Set `GLM53_CUDA_DIAG_GROUP=1` to capture and compare every
+member of the failing device group in private scratch; this adds work only on
+the failure path. The synthetic production-geometry check is included in
+`make glm53-cuda-multidev-check CUDA=1 CUDA_ARCH=sm_86` and skips if fewer than
+two CUDA devices are visible.
+
 For a 64-token RTX 3070 run with the validated 4 GB tier, from `c/`:
 
 ```bash

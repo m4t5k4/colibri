@@ -2244,6 +2244,62 @@ typedef struct {
     int rows[8], at[8], count;
     float *input;
 } G53FfnGroup;
+typedef struct { int finite, first_bad; float max_abs; } G53DiagOutput;
+static G53DiagOutput g53_diag_output(const float *v, int n) {
+    G53DiagOutput s = {1, -1, 0};
+    for (int d = 0; d < n; d++) {
+        if (!isfinite(v[d])) { if (s.first_bad < 0) s.first_bad = d; s.finite = 0; }
+        else if (fabsf(v[d]) > s.max_abs) s.max_abs = fabsf(v[d]);
+    }
+    return s;
+}
+/* Failure-only replay. Keep its scratch and accounting separate from the FFN
+ * result; the caller has not yet marked the tier failed. */
+static void g53_diag_replay(GModel *m, int layer, int eid, const float *x,
+                            const float *grouped, int di, int j) {
+    G53Cuda *g = &m->cuda;
+    const Cfg *c = &m->c;
+    float *scratch = malloc(((size_t)2 * c->hidden + (size_t)2 * c->moe_inter) * sizeof(float));
+    if (!scratch) { fprintf(stderr, "[glm53-cuda-diag] replay allocation failed\n"); return; }
+    float *serial = scratch, *cpu = serial + c->hidden;
+    float *sg = cpu + c->hidden, *su = sg + c->moe_inter;
+    uint64_t executed = g->executed, device_executed = g->device_executed[di], errors = g->errors;
+    int failed = g->failed, stage = g->failure_stage;
+    G53CudaProfile profile = g->profile;
+    int serial_ok = g53_cuda_run(g, layer, eid, serial, x, sg, su,
+                                 c->swiglu_limit, swiglu_clamped);
+    G53DiagOutput serial_stats = serial_ok ? g53_diag_output(serial, c->hidden)
+                                            : (G53DiagOutput){0, -1, 0};
+    g->executed = executed; g->device_executed[di] = device_executed;
+    g->errors = errors; g->failed = failed; g->failure_stage = stage; g->profile = profile;
+    Slot *slot = expert_slot(m, layer, eid);
+    Mat gate, up, down;
+    expert_mats(m, slot, &gate, &up, &down);
+    mlp3(cpu, x, &gate, &up, &down, c->swiglu_limit, sg, su);
+    G53DiagOutput cpu_stats = g53_diag_output(cpu, c->hidden);
+    G53DiagOutput group_stats = g53_diag_output(grouped, c->hidden);
+    float group_serial_diff = 0, group_cpu_diff = 0, serial_cpu_diff = 0;
+    for (int d = 0; d < c->hidden; d++) {
+        if (serial_ok && isfinite(serial[d]) && isfinite(grouped[d])) {
+            float diff = fabsf(grouped[d] - serial[d]);
+            if (diff > group_serial_diff) group_serial_diff = diff;
+        }
+        if (isfinite(cpu[d]) && isfinite(grouped[d])) {
+            float diff = fabsf(grouped[d] - cpu[d]);
+            if (diff > group_cpu_diff) group_cpu_diff = diff;
+        }
+        if (serial_ok && isfinite(serial[d]) && isfinite(cpu[d])) {
+            float diff = fabsf(serial[d] - cpu[d]);
+            if (diff > serial_cpu_diff) serial_cpu_diff = diff;
+        }
+    }
+    fprintf(stderr, "[glm53-cuda-diag] replay layer=%d expert=%d device=%d j=%d grouped_finite=%d grouped_first_bad=%d grouped_max_abs=%g serial_ok=%d serial_finite=%d serial_first_bad=%d serial_max_abs=%g cpu_finite=%d cpu_first_bad=%d cpu_max_abs=%g finite_only_max_diff(group_serial,group_cpu,serial_cpu)=(%g,%g,%g)\n",
+            layer, eid, g->devices[di], j, group_stats.finite, group_stats.first_bad,
+            group_stats.max_abs, serial_ok, serial_stats.finite, serial_stats.first_bad,
+            serial_stats.max_abs, cpu_stats.finite, cpu_stats.first_bad, cpu_stats.max_abs,
+            group_serial_diff, group_cpu_diff, serial_cpu_diff);
+    free(scratch);
+}
 static int g53_cuda_ffn_grouped(GModel *m, const GLayer *l, int index,
                                 const float *x, float *out,
                                 const int *union_ids, int n_union,
@@ -2313,12 +2369,45 @@ static int g53_cuda_ffn_grouped(GModel *m, const GLayer *l, int index,
     for (int di = 0; di < g->ndev; di++) if (g->group_pending[di]) {
         const float *rows = g53_cuda_group_take(g, di);
         if (!rows) continue;
-        int finite = 1;
-        for (int j = 0; j < group[di].count; j++)
+        int bad_j = -1, bad_d = -1;
+        for (int j = 0; j < group[di].count && bad_j < 0; j++)
             for (int d = 0; d < c->hidden; d++)
-                if (!isfinite(rows[(size_t)j * c->hidden + d])) finite = 0;
-        if (!finite) {
+                if (!isfinite(rows[(size_t)j * c->hidden + d])) {
+                    bad_j = j; bad_d = d; break;
+                }
+        if (bad_j >= 0) {
             if (!g->failed) {
+                size_t capture_bytes = (size_t)group[di].count * c->hidden * sizeof(float);
+                float *capture = malloc(capture_bytes);
+                if (capture) memcpy(capture, rows, capture_bytes);
+                const float *captured_rows = capture ? capture : rows;
+                int at = group[di].at[bad_j], eid = union_ids[at];
+                const float *input = group[di].input + (size_t)bad_j * c->hidden;
+                float xmin = INFINITY, xmax = -INFINITY, xabs = 0;
+                int input_finite = 1;
+                for (int d = 0; d < c->hidden; d++) {
+                    float v = input[d];
+                    if (!isfinite(v)) { input_finite = 0; continue; }
+                    if (v < xmin) xmin = v;
+                    if (v > xmax) xmax = v;
+                    if (fabsf(v) > xabs) xabs = fabsf(v);
+                }
+                fprintf(stderr, "[glm53-cuda-diag] first_bad layer=%d device=%d group_count=%d j=%d at=%d expert=%d d=%d value=%g swiglu_limit=%g x_min=%g x_max=%g x_max_abs=%g x_all_finite=%d\n",
+                        index, g->devices[di], group[di].count, bad_j, at, eid, bad_d,
+                        captured_rows[(size_t)bad_j * c->hidden + bad_d], c->swiglu_limit,
+                        xmin, xmax, xabs, input_finite);
+                g53_diag_replay(m, index, eid, input,
+                                captured_rows + (size_t)bad_j * c->hidden, di, bad_j);
+                const char *all = getenv("GLM53_CUDA_DIAG_GROUP");
+                if (all && !strcmp(all, "1")) {
+                    fprintf(stderr, "[glm53-cuda-diag] full_group layer=%d device=%d count=%d\n",
+                            index, g->devices[di], group[di].count);
+                    for (int j = 0; j < group[di].count; j++) if (j != bad_j)
+                        g53_diag_replay(m, index, union_ids[group[di].at[j]],
+                                        group[di].input + (size_t)j * c->hidden,
+                                        captured_rows + (size_t)j * c->hidden, di, j);
+                }
+                free(capture);
                 g->failed = 1; g->errors++;
                 fprintf(stderr, "[glm53-cuda] group failed device=%d stage=validate; host fallback enabled\n",
                         g->devices[di]);

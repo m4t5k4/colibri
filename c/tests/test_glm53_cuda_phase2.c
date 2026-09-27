@@ -82,7 +82,9 @@ static void case_group(const char *order, int first_complete,
     fail_group_issue_device = fail_issue;
     fail_group_take_device = fail_take;
     nonfinite_group_device = nonfinite;
+    if (nonfinite >= 0) setenv("GLM53_CUDA_DIAG_GROUP", "1", 1);
     ffn_layer(&f.m, &f.layer, 0, x, 1, got);
+    if (nonfinite >= 0) unsetenv("GLM53_CUDA_DIAG_GROUP");
     compare_projection("phase-2 vs serial phase-1 FFN", got, serial, ORACLE_D);
     assert(group_issue_calls - issue_before == (fail_issue == 0 ? 1 : 2));
     assert(group_take_calls - take_before == (fail_issue == 0 ? 0 : fail_issue < 0 ? 2 : 1));
@@ -96,6 +98,7 @@ static void case_group(const char *order, int first_complete,
     if (fail_issue >= 0 || fail_take >= 0 || nonfinite >= 0) {
         assert(f.m.cuda.failed && f.m.cuda.errors == 1);
         assert(f.m.cuda.fallback >= 3); /* all contributions recomputed on CPU */
+        if (nonfinite >= 0) assert(f.m.cuda.executed == 3); /* replay is diagnostic */
     } else {
         assert(!f.m.cuda.failed && f.m.cuda.errors == 0);
         assert(f.m.cuda.device_executed[0] >= 1 && f.m.cuda.device_executed[1] >= 1);
