@@ -177,6 +177,65 @@ point accumulation order. GPU detection or `nvidia-smi` alone proves no tensor
 execution. CUDA kernel and full-model results must be measured on the target
 hardware before claiming performance.
 
+### Opt-in CUDA profiling
+
+Set `GLM53_CUDA_PROFILE=1` with the single-GPU CUDA tier. The profiler is off
+by default. It uses GLM53's monotonic host clock, adds no CUDA events or
+synchronization, and emits cumulative `[glm53-cuda-profile]` records at
+startup (`phase=start`), after each prefill chunk or decode forward, and before
+shutdown (`phase=final`). `phase=decode` labels an actual one-token decode
+forward, even when prefill chunks also contain one token. The timing checks
+avoid clock calls when profiling is off. The normal `[glm53-cuda]` diagnostics
+remain independent of this opt-in. Startup model loading and CUDA initialization
+finish before `phase=start`; their time is outside this profile.
+
+The fields are cumulative within one model run:
+
+| Field | What it measures |
+|---|---|
+| `tokens`, `decode_tokens`, `forwards` | Input rows processed in all forwards, rows in explicit decode forwards, and forward calls. |
+| `cuda_rows` | Successful CUDA routed-expert row executions (`executed` in the normal diagnostic). |
+| `fallback_rows` | Routed rows sent to the existing fallback path. |
+| `fallback_compute_rows` | Actual host `mlp3` calls in that path. |
+| `uploads`, `evictions`, `errors` | Successfully published whole experts, replacements of resident experts, and CUDA upload/execution errors. Teardown frees are not evictions. |
+| `resident`, `vram_bytes`, `budget_bytes`, `tier_full` | Current device expert count, allocated expert VRAM, budget, and whether another expert would exceed it. `tier_full` says nothing about steady state. |
+| `upload_s` | Wall time around gate/up/down tensor upload calls, including failed attempts. |
+| `gate_s`, `up_s`, `down_s` | Synchronous `coli_cuda_matmul` call-boundary wall time, including whatever H2D transfer, kernel execution, D2H transfer and completion wait the existing API performs. These are not kernel-only times. |
+| `clamp_s` | Host clamped-SwiGLU call time. |
+| `fallback_compute_s` | Host `mlp3` call time in fallback; excludes scatter/add and expert loading. |
+| `promotion_s`, `eviction_s` | Entire synchronous promotion decision/upload attempt, and the resident free within a replacement. `upload_s` and `eviction_s` are subsets of `promotion_s`. |
+| `cuda_expert_s` | Sum of gate/up/clamp/down call times, including attempted calls before a failure; excludes promotion, routing and scatter. |
+| `disk_s` | Existing GLM53 `t_disk`: expert load-batch wall time (plus single-slot reads). It does not isolate physical NVMe I/O from RAM/page-cache or allocation work. |
+| `attn_s`, `ffn_s`, `head_s` | Existing GLM53 cumulative phase timers. They overlap the expert sub-times and must not be added to them. |
+| `forward_s`, `decode_forward_s` | Whole forward-call wall time, and its explicit decode subset. Decode excludes sampling, text output and the profile record itself. |
+
+Successful CUDA rows and fallback rows are **not always a partition**: a late
+CUDA failure can lead to host recomputation of rows already attempted. Do not
+derive a CUDA share from those counters for a window containing errors. The
+backend API does not expose separate H2D, kernel-only and D2H timings for these
+individual matmuls, so the profiler cannot attribute activation-transfer cost
+more narrowly without backend instrumentation.
+
+For a 64-token RTX 3070 run with the validated 4 GB tier, from `c/`:
+
+```bash
+COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=4 GLM53_CUDA_PROFILE=1 \
+GLM53_VERBOSE=1 GLM53_MAXT=1024 DRAFT=0 \
+./glm53 --model /srv/models-fast/colibri/glm53-flash-i4 \
+  --prompt "Answer only with the word OK." --greedy 64 \
+  > glm53-cuda-64.log 2>&1
+python3 tools/glm53_cuda_profile.py glm53-cuda-64.log --warm-window 16 \
+  > glm53-cuda-64.csv
+```
+
+The parser prints per-decode-token deltas, including `uploads_delta`,
+`evictions_delta`, `errors_delta` and `decode_forward_s_delta`. It identifies a
+trailing 16-token **warm candidate** only when the tier was full before and
+after each token and the run remained error-free. The filling token is excluded.
+This occupancy condition is not proof of steady state: inspect the candidate's
+latency and upload/eviction deltas; continued churn means it has not settled.
+The CSV never computes a CUDA/fallback ratio.
+
 ### Relationship to Qwen3.8 streaming placement
 
 `qwen36_tier.c` already has a Qwen3.8 FP8 streaming mode (`qt_init_fp8`), in

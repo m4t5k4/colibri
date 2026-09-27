@@ -721,7 +721,12 @@ typedef struct {
     /* Telemetria per la dashboard (#1376 follow-up: Brain e Profile erano
      * vuoti su Flash perche' il motore non emetteva nulla). Tempi di fase
      * cumulativi dall'avvio; il turno ne prende la differenza. */
-    double t_attn, t_ffn, t_disk, t_head;
+    double t_attn, t_kda, t_mla, t_ffn, t_disk, t_head;
+    double t_kda_proj, t_kda_core, t_kda_out;
+    double t_kda_qkv, t_kda_decay, t_kda_beta;
+    double t_kda_gateproj, t_kda_normgate, t_kda_ko;
+    double t_mla_proj, t_mla_index, t_mla_core;
+    double t_mla_score, t_mla_value, t_mla_out;
     uint64_t forwards;
     uint8_t **ehit;                       /* [layer][expert] toccato in questo turno */
     /* torre vision: presente solo se il checkpoint la porta */
@@ -992,6 +997,407 @@ static void mv(float *out, const Mat *w, const float *x) {
     }
 }
 
+
+/* S=1 grouped-int4 pair used by KDA Q+K.
+ *
+ * Keep the same per-group accumulation order as matmul_i4_grouped.  On AVX2
+ * we enable this only when I is an exact multiple of gs: the production pair
+ * test documents that a partial final group can round differently. */
+static void matmul_i4_grouped_pair_s1(
+        float *ya, float *yb, const float *x,
+        const uint8_t *qa, const float *sa,
+        const uint8_t *qb, const float *sb,
+        int I, int O, int gs) {
+    const int rb = (I + 1) / 2;
+    const int ng = (I + gs - 1) / gs;
+
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint8_t *wa = qa + (int64_t)o * rb;
+        const uint8_t *wb = qb + (int64_t)o * rb;
+        const float *sla = sa + (int64_t)o * ng;
+        const float *slb = sb + (int64_t)o * ng;
+
+        float aa = 0.0f, ab = 0.0f;
+
+        for (int g = 0; g * gs < I; g++) {
+            const int base = g * gs;
+            int glen = gs;
+            if (base + glen > I) glen = I - base;
+
+            const float sca = sla[g];
+            const float scb = slb[g];
+            int i = base;
+
+#ifdef __AVX2__
+            const __m128i m4 = _mm_set1_epi8(0x0F);
+            const __m256i b8 = _mm256_set1_epi32(8);
+            __m256 acca = _mm256_setzero_ps();
+            __m256 accb = _mm256_setzero_ps();
+
+            for (; i + 16 <= base + glen; i += 16) {
+                const __m128i bya =
+                    _mm_loadl_epi64((const __m128i *)(wa + (i >> 1)));
+                const __m128i loa = _mm_and_si128(bya, m4);
+                const __m128i hia =
+                    _mm_and_si128(_mm_srli_epi16(bya, 4), m4);
+                const __m128i niba = _mm_unpacklo_epi8(loa, hia);
+
+                const __m256 w0a = _mm256_cvtepi32_ps(
+                    _mm256_sub_epi32(_mm256_cvtepu8_epi32(niba), b8));
+                const __m256 w1a = _mm256_cvtepi32_ps(
+                    _mm256_sub_epi32(
+                        _mm256_cvtepu8_epi32(_mm_srli_si128(niba, 8)), b8));
+
+                const __m128i byb =
+                    _mm_loadl_epi64((const __m128i *)(wb + (i >> 1)));
+                const __m128i lob = _mm_and_si128(byb, m4);
+                const __m128i hib =
+                    _mm_and_si128(_mm_srli_epi16(byb, 4), m4);
+                const __m128i nibb = _mm_unpacklo_epi8(lob, hib);
+
+                const __m256 w0b = _mm256_cvtepi32_ps(
+                    _mm256_sub_epi32(_mm256_cvtepu8_epi32(nibb), b8));
+                const __m256 w1b = _mm256_cvtepi32_ps(
+                    _mm256_sub_epi32(
+                        _mm256_cvtepu8_epi32(_mm_srli_si128(nibb, 8)), b8));
+
+                /* Written independently, as in the existing production pair
+                 * kernel; the compiler can reuse the x loads. */
+                acca = _mm256_fmadd_ps(_mm256_loadu_ps(x + i),     w0a, acca);
+                acca = _mm256_fmadd_ps(_mm256_loadu_ps(x + i + 8), w1a, acca);
+                accb = _mm256_fmadd_ps(_mm256_loadu_ps(x + i),     w0b, accb);
+                accb = _mm256_fmadd_ps(_mm256_loadu_ps(x + i + 8), w1b, accb);
+            }
+
+            aa = fmaf(hsum256(acca), sca, aa);
+            ab = fmaf(hsum256(accb), scb, ab);
+#endif
+
+            for (; i + 1 < base + glen; i += 2) {
+                const uint8_t ba = wa[i >> 1];
+                const uint8_t bb = wb[i >> 1];
+
+                aa += (x[i]     * (float)((int)(ba & 0xF) - 8) +
+                       x[i + 1] * (float)((int)(ba >> 4) - 8)) * sca;
+
+                ab += (x[i]     * (float)((int)(bb & 0xF) - 8) +
+                       x[i + 1] * (float)((int)(bb >> 4) - 8)) * scb;
+            }
+
+            if (i < base + glen) {
+                const uint8_t ba = wa[i >> 1];
+                const uint8_t bb = wb[i >> 1];
+
+                aa += x[i] * (float)((int)(ba & 0xF) - 8) * sca;
+                ab += x[i] * (float)((int)(bb & 0xF) - 8) * scb;
+            }
+        }
+
+        ya[o] = aa;
+        yb[o] = ab;
+    }
+}
+
+
+/* S=1 grouped-int4 triple for KDA Q/K/V.
+ *
+ * Same arithmetic order per matrix as matmul_i4_grouped.  Like the pair
+ * experiment, only used when I is an exact multiple of gs. */
+static void matmul_i4_grouped_triple_s1(
+        float *ya, float *yb, float *yc, const float *x,
+        const uint8_t *qa, const float *sa,
+        const uint8_t *qb, const float *sb,
+        const uint8_t *qc, const float *sc,
+        int I, int O, int gs) {
+    const int rb = (I + 1) / 2;
+    const int ng = (I + gs - 1) / gs;
+
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint8_t *wa = qa + (int64_t)o * rb;
+        const uint8_t *wb = qb + (int64_t)o * rb;
+        const uint8_t *wc = qc + (int64_t)o * rb;
+
+        const float *sla = sa + (int64_t)o * ng;
+        const float *slb = sb + (int64_t)o * ng;
+        const float *slc = sc + (int64_t)o * ng;
+
+        float aa = 0.0f, ab = 0.0f, ac = 0.0f;
+
+        for (int g = 0; g * gs < I; g++) {
+            const int base = g * gs;
+            int glen = gs;
+            if (base + glen > I) glen = I - base;
+
+            const float sca = sla[g];
+            const float scb = slb[g];
+            const float scc = slc[g];
+            int i = base;
+
+#ifdef __AVX2__
+            const __m128i m4 = _mm_set1_epi8(0x0F);
+            const __m128i b8 = _mm_set1_epi8(8);
+
+            __m256 acca = _mm256_setzero_ps();
+            __m256 accb = _mm256_setzero_ps();
+            __m256 accc = _mm256_setzero_ps();
+
+            for (; i + 16 <= base + glen; i += 16) {
+                const __m256 x0 = _mm256_loadu_ps(x + i);
+                const __m256 x1 = _mm256_loadu_ps(x + i + 8);
+
+#define GLM53_I4_DECODE_ACC(W, ACC) do {                                      \
+                const __m128i by =                                            \
+                    _mm_loadl_epi64((const __m128i *)((W) + (i >> 1)));       \
+                const __m128i lo = _mm_and_si128(by, m4);                     \
+                const __m128i hi =                                            \
+                    _mm_and_si128(_mm_srli_epi16(by, 4), m4);                 \
+                const __m128i nib =                                        \
+                    _mm_sub_epi8(_mm_unpacklo_epi8(lo, hi), b8);              \
+                const __m256 w0 = _mm256_cvtepi32_ps(                         \
+                    _mm256_cvtepi8_epi32(nib));                               \
+                const __m256 w1 = _mm256_cvtepi32_ps(                         \
+                    _mm256_cvtepi8_epi32(_mm_srli_si128(nib, 8)));            \
+                (ACC) = _mm256_fmadd_ps(x0, w0, (ACC));                       \
+                (ACC) = _mm256_fmadd_ps(x1, w1, (ACC));                       \
+            } while (0)
+
+                GLM53_I4_DECODE_ACC(wa, acca);
+                GLM53_I4_DECODE_ACC(wb, accb);
+                GLM53_I4_DECODE_ACC(wc, accc);
+
+#undef GLM53_I4_DECODE_ACC
+            }
+
+            aa = fmaf(hsum256(acca), sca, aa);
+            ab = fmaf(hsum256(accb), scb, ab);
+            ac = fmaf(hsum256(accc), scc, ac);
+#endif
+
+            for (; i + 1 < base + glen; i += 2) {
+                const uint8_t ba = wa[i >> 1];
+                const uint8_t bb = wb[i >> 1];
+                const uint8_t bc = wc[i >> 1];
+
+                aa += (x[i]     * (float)((int)(ba & 0xF) - 8) +
+                       x[i + 1] * (float)((int)(ba >> 4) - 8)) * sca;
+
+                ab += (x[i]     * (float)((int)(bb & 0xF) - 8) +
+                       x[i + 1] * (float)((int)(bb >> 4) - 8)) * scb;
+
+                ac += (x[i]     * (float)((int)(bc & 0xF) - 8) +
+                       x[i + 1] * (float)((int)(bc >> 4) - 8)) * scc;
+            }
+
+            if (i < base + glen) {
+                const uint8_t ba = wa[i >> 1];
+                const uint8_t bb = wb[i >> 1];
+                const uint8_t bc = wc[i >> 1];
+
+                aa += x[i] * (float)((int)(ba & 0xF) - 8) * sca;
+                ab += x[i] * (float)((int)(bb & 0xF) - 8) * scb;
+                ac += x[i] * (float)((int)(bc & 0xF) - 8) * scc;
+            }
+        }
+
+        ya[o] = aa;
+        yb[o] = ab;
+        yc[o] = ac;
+    }
+}
+
+static void mv_triple(float *ya, float *yb, float *yc,
+                      const Mat *a, const Mat *b, const Mat *c,
+                      const float *x) {
+#if !defined(COLI_METAL) && !defined(COLI_VULKAN)
+    if (a->fmt == 4 && b->fmt == 4 && c->fmt == 4 &&
+        a->columns == b->columns &&
+        a->columns == c->columns &&
+        a->rows == b->rows &&
+        a->rows == c->rows &&
+        a->gs == b->gs &&
+        a->gs == c->gs &&
+        a->gs > 0 &&
+        a->columns % a->gs == 0) {
+        matmul_i4_grouped_triple_s1(
+            ya, yb, yc, x,
+            a->q4, a->s,
+            b->q4, b->s,
+            c->q4, c->s,
+            a->columns, a->rows, a->gs);
+        return;
+    }
+#endif
+
+    mv(ya, a, x);
+    mv(yb, b, x);
+    mv(yc, c, x);
+}
+
+/* Pair only the CPU grouped-int4 path.  Metal/Vulkan builds retain their
+ * existing resident-matrix dispatch through mv(). */
+static void mv_pair(float *ya, float *yb,
+                    const Mat *a, const Mat *b, const float *x) {
+#if !defined(COLI_METAL) && !defined(COLI_VULKAN)
+    if (a->fmt == 4 && b->fmt == 4 &&
+        a->columns == b->columns &&
+        a->rows == b->rows &&
+        a->gs == b->gs &&
+        a->gs > 0 &&
+        a->columns % a->gs == 0) {
+        matmul_i4_grouped_pair_s1(
+            ya, yb, x,
+            a->q4, a->s,
+            b->q4, b->s,
+            a->columns, a->rows, a->gs);
+        return;
+    }
+#endif
+
+    mv(ya, a, x);
+    mv(yb, b, x);
+}
+
+
+#ifdef __AVX2__
+/* S=1 grouped-int4 rows4 kernel for the KDA output projection.
+ *
+ * Each output row keeps the same AVX2 accumulation structure as
+ * matmul_i4_grouped.  Four independent rows share each pair of x loads.
+ * This is deliberately local to glm53 first; promote it to quant.h only
+ * after correctness and performance are established. */
+static void matmul_i4_grouped_rows4_s1(
+        float *y, const float *x,
+        const uint8_t *q4, const float *scale,
+        int I, int O, int gs) {
+    const int rb = (I + 1) / 2;
+    const int ng = (I + gs - 1) / gs;
+
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o += 4) {
+        const uint8_t *w0 = q4 + (int64_t)(o + 0) * rb;
+        const uint8_t *w1 = q4 + (int64_t)(o + 1) * rb;
+        const uint8_t *w2 = q4 + (int64_t)(o + 2) * rb;
+        const uint8_t *w3 = q4 + (int64_t)(o + 3) * rb;
+
+        const float *s0 = scale + (int64_t)(o + 0) * ng;
+        const float *s1 = scale + (int64_t)(o + 1) * ng;
+        const float *s2 = scale + (int64_t)(o + 2) * ng;
+        const float *s3 = scale + (int64_t)(o + 3) * ng;
+
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+
+        for (int g = 0; g * gs < I; g++) {
+            const int base = g * gs;
+            int glen = gs;
+            if (base + glen > I) glen = I - base;
+
+            const float sc0 = s0[g];
+            const float sc1 = s1[g];
+            const float sc2 = s2[g];
+            const float sc3 = s3[g];
+
+            int i = base;
+
+            const __m128i m4 = _mm_set1_epi8(0x0F);
+            const __m256i b8 = _mm256_set1_epi32(8);
+
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps();
+            __m256 acc3 = _mm256_setzero_ps();
+
+            for (; i + 16 <= base + glen; i += 16) {
+                const __m256 x0 = _mm256_loadu_ps(x + i);
+                const __m256 x1 = _mm256_loadu_ps(x + i + 8);
+
+#define GLM53_ROWS4_ACC(W, ACC) do {                                      \
+                const __m128i by =                                       \
+                    _mm_loadl_epi64((const __m128i *)((W) + (i >> 1)));  \
+                const __m128i lo = _mm_and_si128(by, m4);                \
+                const __m128i hi =                                       \
+                    _mm_and_si128(_mm_srli_epi16(by, 4), m4);            \
+                const __m128i nib = _mm_unpacklo_epi8(lo, hi);           \
+                const __m256 qw0 = _mm256_cvtepi32_ps(                   \
+                    _mm256_sub_epi32(_mm256_cvtepu8_epi32(nib), b8));    \
+                const __m256 qw1 = _mm256_cvtepi32_ps(                   \
+                    _mm256_sub_epi32(                                    \
+                      _mm256_cvtepu8_epi32(_mm_srli_si128(nib, 8)), b8));\
+                (ACC) = _mm256_fmadd_ps(x0, qw0, (ACC));                 \
+                (ACC) = _mm256_fmadd_ps(x1, qw1, (ACC));                 \
+            } while (0)
+
+                GLM53_ROWS4_ACC(w0, acc0);
+                GLM53_ROWS4_ACC(w1, acc1);
+                GLM53_ROWS4_ACC(w2, acc2);
+                GLM53_ROWS4_ACC(w3, acc3);
+
+#undef GLM53_ROWS4_ACC
+            }
+
+            a0 = fmaf(hsum256(acc0), sc0, a0);
+            a1 = fmaf(hsum256(acc1), sc1, a1);
+            a2 = fmaf(hsum256(acc2), sc2, a2);
+            a3 = fmaf(hsum256(acc3), sc3, a3);
+
+            /* Normally zero for our gs64 KDA matrices, but preserve the
+             * production kernel's scalar group tail. */
+            for (; i + 1 < base + glen; i += 2) {
+                const uint8_t b0 = w0[i >> 1];
+                const uint8_t b1 = w1[i >> 1];
+                const uint8_t b2 = w2[i >> 1];
+                const uint8_t b3 = w3[i >> 1];
+
+#define GLM53_ROWS4_TAIL(A, B, SC) \
+                (A) += (x[i] * (float)((int)((B) & 0xF) - 8) + \
+                        x[i + 1] * (float)((int)((B) >> 4) - 8)) * (SC)
+
+                GLM53_ROWS4_TAIL(a0, b0, sc0);
+                GLM53_ROWS4_TAIL(a1, b1, sc1);
+                GLM53_ROWS4_TAIL(a2, b2, sc2);
+                GLM53_ROWS4_TAIL(a3, b3, sc3);
+
+#undef GLM53_ROWS4_TAIL
+            }
+
+            if (i < base + glen) {
+                const uint8_t b0 = w0[i >> 1];
+                const uint8_t b1 = w1[i >> 1];
+                const uint8_t b2 = w2[i >> 1];
+                const uint8_t b3 = w3[i >> 1];
+
+                a0 += x[i] * (float)((int)(b0 & 0xF) - 8) * sc0;
+                a1 += x[i] * (float)((int)(b1 & 0xF) - 8) * sc1;
+                a2 += x[i] * (float)((int)(b2 & 0xF) - 8) * sc2;
+                a3 += x[i] * (float)((int)(b3 & 0xF) - 8) * sc3;
+            }
+        }
+
+        y[o + 0] = a0;
+        y[o + 1] = a1;
+        y[o + 2] = a2;
+        y[o + 3] = a3;
+    }
+}
+#endif
+
+static void mv_kda_ko(float *out, const Mat *w, const float *x) {
+#if defined(__AVX2__) && !defined(COLI_METAL) && !defined(COLI_VULKAN)
+    if (w->fmt == 4 &&
+        w->gs > 0 &&
+        (w->rows & 3) == 0 &&
+        w->columns % w->gs == 0) {
+        matmul_i4_grouped_rows4_s1(
+            out, x, w->q4, w->s,
+            w->columns, w->rows, w->gs);
+        return;
+    }
+#endif
+
+    mv(out, w, x);
+}
+
 static void rms(float *out, const float *x, const float *w, int n, float eps) {
     float square = 0.0f;
     for (int i = 0; i < n; i++) square += x[i] * x[i];
@@ -1036,7 +1442,9 @@ static void mlp3(float *out, const float *x, const Mat *g, const Mat *u, const M
 }
 
 /* ---------- KDA: proiezioni, gate, ricorrenza ---------- */
-static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
+static double now_s(void);
+
+static void kda_layer(GModel *m, const Cfg *c, const GLayer *l, const float *x, int tokens,
                       float *out, float *state, float *window, float *scratch) {
     const int P = c->kda_proj, H = c->kda_heads, D = c->kda_hd;
     float *qkv = malloc((size_t)3 * P * sizeof(float));
@@ -1047,10 +1455,14 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     float *core = malloc((size_t)P * sizeof(float));
     for (int t = 0; t < tokens; t++) {
         const float *row = x + (size_t)t * c->hidden;
-        mv(qkv, &l->kq, row);
-        mv(qkv + P, &l->kk, row);
-        mv(qkv + 2 * P, &l->kv, row);
+        const double t_proj0 = now_s();
+        const double t_qkv0 = now_s();
+        mv_triple(qkv, qkv + P, qkv + 2 * P,
+                  &l->kq, &l->kk, &l->kv, row);
+        m->t_kda_qkv += now_s() - t_qkv0;
+
         /* decadimento: gate_lower_bound * sigmoid(exp(A_log[h]) * (W_fb W_fa x + dt_bias)) */
+        const double t_decay0 = now_s();
         mv(low, &l->kfa, row);
         mv(decay, &l->kfb, low);
         for (int h = 0; h < H; h++)
@@ -1058,14 +1470,26 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                 int i = h * D + d;
                 decay[i] = c->gate_lb * sigmoidf_(expf(l->alog[h]) * (decay[i] + l->dt[i]));
             }
+        m->t_kda_decay += now_s() - t_decay0;
+
+        const double t_beta0 = now_s();
         mv(beta, &l->kb, row);
         for (int h = 0; h < H; h++) beta[h] = sigmoidf_(beta[h]);
+        m->t_kda_beta += now_s() - t_beta0;
+
+        m->t_kda_proj += now_s() - t_proj0;
+        const double t_core0 = now_s();
         coli_kda_step(core, state, window, qkv, l->conv, decay, beta,
                       H, D, D, c->conv_k, 1e-6f, scratch);
+        m->t_kda_core += now_s() - t_core0;
+        const double t_out0 = now_s();
         /* uscita: RMSNorm per testa, pesata da o_norm, moltiplicata dal gate
          * low-rank, poi la proiezione di uscita. */
+        const double t_gateproj0 = now_s();
         mv(low, &l->kga, row);
         mv(gate, &l->kgb, low);
+        m->t_kda_gateproj += now_s() - t_gateproj0;
+        const double t_normgate0 = now_s();
         float *normed = qkv;                         /* riuso: 3P >= P */
         for (int h = 0; h < H; h++) {
             const float *src = core + (size_t)h * D;
@@ -1076,13 +1500,19 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
             for (int d = 0; d < D; d++)
                 dst[d] = src[d] * inverse * l->onorm[d] * sigmoidf_(gate[(size_t)h * D + d]);
         }
-        mv(out + (size_t)t * c->hidden, &l->ko, normed);
+        m->t_kda_normgate += now_s() - t_normgate0;
+
+        const double t_ko0 = now_s();
+        mv_kda_ko(out + (size_t)t * c->hidden, &l->ko, normed);
+        m->t_kda_ko += now_s() - t_ko0;
+
+        m->t_kda_out += now_s() - t_out0;
     }
     free(core); free(low); free(beta); free(decay); free(gate); free(qkv);
 }
 
 /* ---------- MLA + indexer con k-pool ---------- */
-static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
+static void mla_layer(GModel *m, const Cfg *c, const GLayer *l, const float *x, int tokens,
                       float *out, GLayerState *st, int base) {
     const int H = c->n_heads, QK = c->qk_nope, V = c->v_head;
     const int IH = c->index_nh, ID = c->index_hd;
@@ -1102,6 +1532,7 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     for (int t = 0; t < tokens; t++) {
         const int at = base + t;          /* posizione assoluta nella cache */
         const float *row = x + (size_t)t * c->hidden;
+        const double t_proj0 = now_s();
         float *qn = qa + (size_t)t * c->q_lora;
         mv(qn, &l->qa, row);
         rms(qn, qn, l->qa_ln, c->q_lora, c->eps);
@@ -1123,15 +1554,19 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         mv(gates + (size_t)at * ID, &l->ikpg, row);
         mv(head_w + (size_t)t * IH, &l->iwp, row);
         for (int h = 0; h < IH; h++) head_w[(size_t)t * IH + h] /= sqrtf((float)IH);
+        m->t_mla_proj += now_s() - t_proj0;
     }
 
     const int width = coli_sparse_index_width(c->index_topk, c->index_kpool, c->index_kpool_tail);
     int *selected = malloc((size_t)tokens * width * sizeof(int));
+    const double t_index0 = now_s();
     if (coli_sparse_index_select_range(selected, iq, ik, gates, head_w, l->ikpa, valid,
                                        seen, IH, ID, c->index_kpool, c->index_topk,
                                        c->index_kpool_tail, base, seen)) {
         fprintf(stderr, "indexer selection failed\n"); exit(1);
     }
+    m->t_mla_index += now_s() - t_index0;
+
     /* GLM53_DUMP_INDEX=1 stampa le righe scelte dall'indexer: e' il primo
      * posto da guardare quando il motore diverge solo su certe lunghezze. */
     if (getenv("GLM53_DUMP_INDEX")) {
@@ -1144,44 +1579,88 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     /* Attenzione nello spazio del latente. La scala resta 1/sqrt(qk_nope):
      * il prodotto e' lo stesso numero di prima, calcolato in un altro ordine. */
     float *context = malloc((size_t)H * V * sizeof(float));
-    float *pooled = malloc((size_t)L * sizeof(float));
-    float *score = malloc((size_t)width * sizeof(float));
+    float *pooled = malloc((size_t)H * L * sizeof(float));
+    float *score = malloc((size_t)H * width * sizeof(float));
+    int *used_h = malloc((size_t)H * sizeof(int));
     const float scale = 1.0f / sqrtf((float)QK);
+    const double t_core0 = now_s();
     for (int t = 0; t < tokens; t++) {
         const int *chosen = selected + (size_t)t * width;
+
+        /* Score/softmax/pooling is independent per attention head.
+         * Parallelise here, then leave mv_rows outside this region so its own
+         * OpenMP parallel-for can still use the full team. */
+        const double t_score0 = now_s();
+        #pragma omp parallel for schedule(static)
         for (int h = 0; h < H; h++) {
             const float *q = absorbed + ((size_t)t * H + h) * L;
+            float *score_h = score + (size_t)h * width;
+            float *pooled_h = pooled + (size_t)h * L;
+
             float top = -INFINITY;
             int used = 0;
+
             for (int i = 0; i < width; i++) {
                 const int at = chosen[i];
                 if (at < 0 || at >= seen) continue;
+
                 const float *c_j = latent + (size_t)at * L;
                 float dot = 0.0f;
-                for (int d = 0; d < L; d++) dot += q[d] * c_j[d];
-                score[used] = dot * scale;
-                if (score[used] > top) top = score[used];
+                for (int d = 0; d < L; d++)
+                    dot += q[d] * c_j[d];
+
+                score_h[used] = dot * scale;
+                if (score_h[used] > top) top = score_h[used];
                 used++;
             }
-            float *result = context + (size_t)h * V;
-            memset(result, 0, (size_t)V * sizeof(float));
-            if (!used) continue;
+
+            used_h[h] = used;
+            memset(pooled_h, 0, (size_t)L * sizeof(float));
+
+            if (!used)
+                continue;
+
             double total = 0.0;
-            for (int i = 0; i < used; i++) { score[i] = expf(score[i] - top); total += score[i]; }
-            memset(pooled, 0, (size_t)L * sizeof(float));
+            for (int i = 0; i < used; i++) {
+                score_h[i] = expf(score_h[i] - top);
+                total += score_h[i];
+            }
+
             int seen_slot = 0;
             for (int i = 0; i < width; i++) {
                 const int at = chosen[i];
                 if (at < 0 || at >= seen) continue;
-                const float weight = (float)(score[seen_slot++] / total);
+
+                const float weight =
+                    (float)(score_h[seen_slot++] / total);
                 const float *c_j = latent + (size_t)at * L;
-                for (int d = 0; d < L; d++) pooled[d] += weight * c_j[d];
+
+                for (int d = 0; d < L; d++)
+                    pooled_h[d] += weight * c_j[d];
             }
-            mv_rows(result, &l->kvb_v, pooled, h * V, V);
         }
+        m->t_mla_score += now_s() - t_score0;
+
+        /* These matvecs already parallelise internally. */
+        for (int h = 0; h < H; h++) {
+            float *result = context + (size_t)h * V;
+            memset(result, 0, (size_t)V * sizeof(float));
+
+            if (!used_h[h])
+                continue;
+
+            const double t_value0 = now_s();
+            mv_rows(result, &l->kvb_v,
+                    pooled + (size_t)h * L, h * V, V);
+            m->t_mla_value += now_s() - t_value0;
+        }
+
+        const double t_out0 = now_s();
         mv(out + (size_t)t * c->hidden, &l->o, context);
+        m->t_mla_out += now_s() - t_out0;
     }
-    free(score); free(pooled);
+    m->t_mla_core += now_s() - t_core0;
+    free(used_h); free(score); free(pooled);
 
     free(context); free(selected); free(valid); free(head_w);
     free(iq); free(absorbed); free(queries); free(qa);
@@ -2017,8 +2496,15 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                             break;
                         }
                     if (scale == 0.0f) continue;
+#ifdef COLI_CUDA
+                    double fallback_start = g53_cuda_profile_now(&m->cuda);
+#endif
                     mlp3(tmp, x + (size_t)t * c->hidden, &gate, &up, &down,
                          c->swiglu_limit, sg, su);
+#ifdef COLI_CUDA
+                    if (m->cuda.profile.clock) m->cuda.profile.fallback_compute_rows++;
+                    g53_cuda_profile_add(&m->cuda, G53_FALLBACK, fallback_start);
+#endif
                     float *dst = out + (size_t)t * c->hidden;
                     for (int d = 0; d < c->hidden; d++) dst[d] += scale * tmp[d];
                 }
@@ -2403,15 +2889,22 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                 /* Lo stato non si azzera a ogni chiamata: e' della
                  * conversazione, e azzerarlo qui vorrebbe dire ricominciare
                  * la ricorrenza a ogni token generato. */
-                if (c->is_full[i]) mla_layer(c, l, normed, n, branch, st, start);
-                else kda_layer(c, l, normed, n, branch, st->kda_state, st->kda_window,
+                if (c->is_full[i]) mla_layer(m, c, l, normed, n, branch, st, start);
+                else kda_layer(m, c, l, normed, n, branch, st->kda_state, st->kda_window,
                                s->kda_scratch);
             } else {
                 ffn_layer(m, l, i, normed, n, branch);
             }
             /* Un solo paio di letture del clock per sito, il ramo dice a chi
              * va il tempo. */
-            *(site ? &m->t_ffn : &m->t_attn) += now_s() - t_phase;
+            const double phase_s = now_s() - t_phase;
+            if (site) {
+                m->t_ffn += phase_s;
+            } else {
+                m->t_attn += phase_s;
+                if (c->is_full[i]) m->t_mla += phase_s;
+                else m->t_kda += phase_s;
+            }
             for (int t = 0; t < n; t++)
                 coli_hc_post(next + (size_t)t * H * D, branch + (size_t)t * D,
                              streams + (size_t)t * H * D, post + (size_t)t * H,
@@ -2523,6 +3016,8 @@ static void model_load(GModel *m, const char *dir) {
 #ifdef COLI_CUDA
     g53_cuda_init(&m->cuda, m->c.n_layers, m->c.n_experts,
                   m->c.hidden, m->c.moe_inter, m->streaming);
+    g53_cuda_profile_enable(&m->cuda, now_s);
+    g53_cuda_profile_report(&m->cuda, "start");
 #else
     if (getenv("COLI_CUDA") && !strcmp(getenv("COLI_CUDA"), "1")) {
         fprintf(stderr, "GLM53: COLI_CUDA=1 requires a CUDA build\n"); exit(1);
@@ -2568,6 +3063,9 @@ static void glm_echo(unsigned long long id, int pos, int token,
 
 static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
                            const float *vision, int n_vision) {
+#ifdef COLI_CUDA
+    const double profile_start = g53_cuda_profile_now(&m->cuda);
+#endif
     const Cfg *c = &m->c;
     const int H = c->hc_mult;
     const int start = s->filled;   /* NON 'base': nel ciclo dei layer e' gia' preso */
@@ -2639,6 +3137,46 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
     free(normed); free(collapsed);
     free(next); free(streams);
     s->filled = start + n;
+#ifdef COLI_CUDA
+    G53CudaProfile *p = &m->cuda.profile;
+    if (p->clock) {
+        double elapsed = p->clock() - profile_start;
+        p->tokens += (uint64_t)n; p->forwards++; p->forward_s += elapsed;
+        if (p->decode) { p->decode_tokens += (uint64_t)n; p->decode_forward_s += elapsed; }
+        p->disk_s = m->t_disk; p->attn_s = m->t_attn;
+        p->ffn_s = m->t_ffn; p->head_s = m->t_head;
+        g53_cuda_profile_report(&m->cuda, p->decode ? "decode" : "prefill");
+        if (p->decode)
+            fprintf(stderr,
+                    "[glm53-attn-split] decode_tokens=%llu "
+                    "kda_s=%.6f kda_proj_s=%.6f kda_core_s=%.6f kda_out_s=%.6f "
+                    "kda_qkv_s=%.6f kda_decay_s=%.6f kda_beta_s=%.6f "
+                    "kda_gateproj_s=%.6f kda_normgate_s=%.6f kda_ko_s=%.6f "
+                    "mla_s=%.6f mla_proj_s=%.6f mla_index_s=%.6f mla_core_s=%.6f "
+                    "mla_score_s=%.6f mla_value_s=%.6f mla_out_s=%.6f "
+                    "attn_s=%.6f\n",
+                    (unsigned long long)p->decode_tokens,
+                    m->t_kda, m->t_kda_proj, m->t_kda_core, m->t_kda_out,
+                    m->t_kda_qkv, m->t_kda_decay, m->t_kda_beta,
+                    m->t_kda_gateproj, m->t_kda_normgate, m->t_kda_ko,
+                    m->t_mla, m->t_mla_proj, m->t_mla_index, m->t_mla_core,
+                    m->t_mla_score, m->t_mla_value, m->t_mla_out,
+                    m->t_attn);
+    }
+#endif
+    return logits;
+}
+
+/* Label actual decode calls explicitly: a one-token prefill is still prefill.
+ * Timing covers forward_span, excluding sampling, text output and this report. */
+static float *forward_decode(GModel *m, GSession *s, const int *token) {
+#ifdef COLI_CUDA
+    if (m->cuda.profile.clock) m->cuda.profile.decode = 1;
+#endif
+    float *logits = forward_span(m, s, token, 1, NULL, 0);
+#ifdef COLI_CUDA
+    if (m->cuda.profile.clock) m->cuda.profile.decode = 0;
+#endif
     return logits;
 }
 
@@ -3395,7 +3933,7 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         if (q->logprobs > 0) serve_data_lp(q->id, piece, written, lptail);
         else serve_data(q->id, piece, written);
         if (step + 1 == budget) { limited = 1; break; }
-        logits = forward_span(m, session, &next, 1, NULL, 0);
+        logits = forward_decode(m, session, &next);
         rows = 1;
     }
     free(logits);
@@ -3758,7 +4296,7 @@ int main(int argc, char **argv) {
             }
             /* Il token nuovo non e' mai un segnaposto immagine: la torre ha
              * gia' dato i suoi embedding durante il prefill. */
-            logits = forward_span(&model, session, &next, 1, NULL, 0);
+            logits = forward_decode(&model, session, &next);
             rows = 1;
             produced++;
         }
