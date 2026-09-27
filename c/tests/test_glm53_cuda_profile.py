@@ -32,7 +32,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual([r["forward_s"] for r in rows], [3, 1])
         self.assertEqual([r["uploads"] for r in rows], [2, 1])
-        self.assertEqual(profile.warm_window(rows, 1), rows[-1:])
+        self.assertEqual(profile.warm_window(rows, 1), [])
         self.assertEqual(profile.warm_window(rows, 2), [])
 
     def test_faulted_window_is_not_warm(self):
@@ -54,13 +54,23 @@ class ProfileTests(unittest.TestCase):
             line("decode", tokens=3, decode_tokens=2, forwards=3, tier_full=1)]))
         self.assertEqual(profile.warm_window(rows, 2), [])
 
+    def test_not_full_but_unchanging_working_set_is_steady(self):
+        rows = list(profile.decode_rows([line("start"),
+            line("decode", tokens=1, decode_tokens=1, forwards=1, tier_full=0,
+                 uploads=2, evictions=1),
+            line("decode", tokens=2, decode_tokens=2, forwards=2, tier_full=0,
+                 uploads=2, evictions=1),
+            line("decode", tokens=3, decode_tokens=3, forwards=3, tier_full=0,
+                 uploads=2, evictions=1)]))
+        self.assertEqual(profile.warm_window(rows, 2), rows[-2:])
+        self.assertEqual(profile.warm_window(rows, 3), [])
+
     def test_cli_exposes_churn_deltas_without_a_partition_ratio(self):
-        lines = [line("start", tier_full=1),
+        lines = [line("start", tier_full=0),
                  line("decode", tokens=1, decode_tokens=1, forwards=1,
-                      tier_full=1, cuda_rows=2, fallback_rows=1, uploads=1),
+                      tier_full=0, cuda_rows=2, fallback_rows=1),
                  line("decode", tokens=2, decode_tokens=2, forwards=2,
-                      tier_full=1, cuda_rows=3, fallback_rows=2, uploads=2,
-                      evictions=1)]
+                      tier_full=0, cuda_rows=3, fallback_rows=2)]
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "profile.log"
             path.write_text("\n".join(lines), encoding="utf-8")
@@ -70,7 +80,8 @@ class ProfileTests(unittest.TestCase):
         result = output.getvalue()
         for field in ("uploads_delta", "evictions_delta", "errors_delta"):
             self.assertIn(field, result)
-        self.assertIn("Warm candidate", result)
+        self.assertIn("Steady working-set candidate", result)
+        self.assertIn("tier=not_full", result)
         self.assertNotIn("ratio", result)
         self.assertNotIn("share", result)
 

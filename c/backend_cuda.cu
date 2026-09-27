@@ -21,6 +21,7 @@ static_assert(FP8_BLOCK == 128, "fmt=8 on-disk containers carry ceil(dim/128)-ed
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <cmath>
 #include <chrono>
 #include <mutex>
 #include <vector>
@@ -910,7 +911,7 @@ __global__ static void grouped_down_w4(float *y,const float *x,const GroupDesc *
  * straddles a group). gs<=0 degrades to per-row (ng=1), so mixed fmt2/fmt4
  * groups run correctly through this one kernel family. */
 __global__ static void grouped_hidden_g4_dual(float *gate,float *up,const float *x,
-                                              const GroupDesc *desc,int I,int D){
+                                              const GroupDesc *desc,int I,int D,float limit){
     int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
     const uint8_t *gr=(const uint8_t*)d.g+(size_t)o*((D+1)/2);
     const uint8_t *ur=(const uint8_t*)d.u+(size_t)o*((D+1)/2);
@@ -928,6 +929,11 @@ __global__ static void grouped_hidden_g4_dual(float *gate,float *up,const float 
      * applied inside the accumulation, so silu runs on the raw sums) */
     if(!threadIdx.x){size_t z=(size_t)(d.offset+s)*I+o;
         float g=gp[0],u=upv[0];
+        if(limit>0){
+            /* Match GLM53's host comparisons, including NaN propagation. */
+            if(g>limit)g=limit;
+            if(u<-limit)u=-limit;else if(u>limit)u=limit;
+        }
         gate[z]=(g/(1.0f+expf(-g)))*u;(void)up;}
 }
 __global__ static void grouped_down_g4(float *y,const float *x,const GroupDesc *desc,int D,int I){
@@ -2137,7 +2143,7 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
         /* grouped-int4 (fmt=4) present: per-group scales (#334). fmt=2 members
          * ride along as the ng=1 special case. silu fused in the dual epilogue. */
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
-        grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D,0);
         grouped_down_g4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }else{
         /* generic path decodes fmt 0/1/2/3 only — refuse everything else rather
@@ -2212,11 +2218,11 @@ extern "C" int coli_cuda_expert_group_pinned(ColiCudaTensor *const *gates,
  * scratch buffers. Small batches only (decode/spec): bigger totals keep the sync
  * path with its TC variants. Numerics are the sync path's small-batch kernels,
  * so greedy output is byte-identical by construction. */
-extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
+static int expert_group_issue_impl(ColiCudaTensor *const *gates,
                                               ColiCudaTensor *const *ups,
                                               ColiCudaTensor *const *downs,
                                               const int *rows, int count,
-                                              const float *x) {
+                                              const float *x, float clamp_limit) {
     if (!gates || !ups || !downs || !rows || !x || count < 1 || count > 64) return 0;
     ColiCudaTensor *first=gates[0];
     if (!first) return 0;
@@ -2238,31 +2244,36 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         any_g4|=g->fmt==4||u->fmt==4||d->fmt==4;
         any_f8|=g->fmt==8||u->fmt==8||d->fmt==8;
         all_f8&=g->fmt==8&&u->fmt==8&&d->fmt==8;
+        if(clamp_limit>0 && (g->fmt!=4||u->fmt!=4||d->fmt!=4||
+                             g->gs!=64||u->gs!=64||d->gs!=64)) return 0;
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
     if(any_e8&&!all_e8) return 0;
     if(any_f8&&!all_f8) return 0;   /* mixed FP8: no homogeneous kernel, sync path has the per-expert loop */
     if(total>8) return 0;                       /* decode-scale only */
     DeviceContext *ctx=find_ctx(device); if(!ctx||ctx->group_pending||!select_ctx(ctx)) return 0;
-    if(!prepare_group_weights(ctx,gates,ups,downs,count,host)) return 0;
+    /* A failed issue may already have queued copies or kernels. Never let the
+     * caller evict tensors while those commands still reference them. */
+    auto abort_issue=[&](){cudaStreamSynchronize(ctx->stream);return 0;};
+    if(!prepare_group_weights(ctx,gates,ups,downs,count,host)) return abort_issue();
     size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float);
     if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,xb)||
        !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)||
        !reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,(size_t)count*sizeof(GroupDesc))||
        !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
-       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb)) return 0;
+       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb)) return abort_issue();
     std::memcpy(ctx->host_x,x,xb);
     if(!cuda_ok(cudaMemcpyAsync(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),
                                 cudaMemcpyHostToDevice,ctx->stream),
                 "expert group issue descriptors")||
        !cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
-                "expert group issue upload")) return 0;
+                "expert group issue upload")) return abort_issue();
     if(all_e8){
         GroupDesc *dev=(GroupDesc*)ctx->group_desc;
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
         dim3 og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         grouped_hidden_e8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
-        if(!e8_rot_rows_dev(ctx->gate,total,I,ctx->stream))return 0;
+        if(!e8_rot_rows_dev(ctx->gate,total,I,ctx->stream))return abort_issue();
         grouped_down_e8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }else if(all_f8){
         /* fp8-e4m3 groups on the async decode path: same launch helper as the
@@ -2292,7 +2303,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         /* silu is fused in the dual kernel's epilogue (like the sync path):
          * an extra silu_mul here would re-apply it against the never-written
          * ctx->up buffer. */
-        grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D,clamp_limit);
         grouped_down_g4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     } else {
         /* Fallback runs quant_matmul with gs=0,ng=1 — per-row-scale semantics.
@@ -2301,7 +2312,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
          * tensors) instead of silently mis-scaling them, mirroring the sync
          * path's refusal (#334). fmt=6 cannot reach here (any_e8 gates above). */
         for(int c=0;c<count;c++)
-            if(host[c].gf>3||host[c].uf>3||host[c].df>3) return 0;
+            if(host[c].gf>3||host[c].uf>3||host[c].df>3) return abort_issue();
         for(int c=0;c<count;c++){
         int r=rows[c];
         float *g16=ctx->gate+(size_t)host[c].offset*I,*u16=ctx->up+(size_t)host[c].offset*I;
@@ -2316,7 +2327,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
     }}
     if(!cuda_ok(cudaGetLastError(),"expert group issue launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
-                "expert group issue download")) return 0;
+                "expert group issue download")) return abort_issue();
     ctx->group_pending=1; ctx->group_pending_bytes=xb;
     { std::lock_guard<std::mutex> lock(g_group_stats_mu);
       int index=(int)(ctx-g_ctx);
@@ -2324,6 +2335,22 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
       g_device_group_calls[index]++; g_device_group_experts[index]+=(uint64_t)count;
       g_device_group_rows[index]+=(uint64_t)total; }
     return 1;
+}
+
+extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
+                                              ColiCudaTensor *const *ups,
+                                              ColiCudaTensor *const *downs,
+                                              const int *rows, int count,
+                                              const float *x) {
+    return expert_group_issue_impl(gates,ups,downs,rows,count,x,0);
+}
+extern "C" int coli_cuda_expert_group_issue_clamped(ColiCudaTensor *const *gates,
+                                              ColiCudaTensor *const *ups,
+                                              ColiCudaTensor *const *downs,
+                                              const int *rows, int count,
+                                              const float *x, float limit) {
+    if(!std::isfinite(limit)||limit<=0||fault_injected()) return 0;
+    return expert_group_issue_impl(gates,ups,downs,rows,count,x,limit);
 }
 
 extern "C" const float *coli_cuda_expert_group_take(int device) {

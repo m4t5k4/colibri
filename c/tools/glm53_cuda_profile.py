@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Decode deltas from cumulative GLM53_CUDA_PROFILE=1 snapshots (stdlib only).
 
-A trailing full-tier window is a candidate for warm analysis, not proof of
-steady state. Inspect its latency, uploads and evictions before drawing conclusions.
+A trailing error-free decode window without uploads or evictions is a steady
+working-set candidate. Tier fullness remains a separate occupancy gauge.
 """
 import argparse
 import csv
@@ -12,7 +12,8 @@ import sys
 COUNTS = ("tokens", "decode_tokens", "forwards", "cuda_rows", "fallback_rows",
           "fallback_compute_rows", "uploads", "evictions", "errors")
 TIMES = ("forward_s", "decode_forward_s", "disk_s", "promotion_s", "upload_s",
-         "eviction_s", "gate_s", "up_s", "clamp_s", "down_s", "cuda_expert_s",
+         "eviction_s", "gate_s", "up_s", "clamp_s", "down_s", "group_issue_s",
+         "group_take_s", "cuda_expert_s",
          "fallback_compute_s", "attn_s", "ffn_s", "head_s")
 GAUGES = ("resident", "vram_bytes", "budget_bytes", "tier_full")
 
@@ -26,7 +27,7 @@ def decode_rows(lines):
             continue
         fields = dict(word.split("=", 1) for word in line.split()[1:])
         phase = fields["phase"]
-        current = {k: float(fields[k]) if k in TIMES else int(fields[k])
+        current = {k: float(fields.get(k, 0)) if k in TIMES else int(fields[k])
                    for k in COUNTS + TIMES + GAUGES}
         if any(not math.isfinite(v) or v < 0 for v in current.values()):
             raise ValueError("nonfinite or negative profile value")
@@ -52,12 +53,12 @@ def decode_rows(lines):
 
 
 def warm_window(rows, size):
-    """Exclude the filling token, interrupted decode spans, and faulted runs."""
+    """Find a trailing decode span with no errors, uploads, or evictions."""
     tail = []
     for row in rows:
         if tail and (not row["continuation"] or row["run"] != tail[-1]["run"] or row["token"] != tail[-1]["token"] + 1):
             tail = []
-        if not row["tier_full"] or not row["full_before"] or row["total_errors"]:
+        if row["total_errors"] or row["errors"] or row["uploads"] or row["evictions"]:
             tail = []
         else:
             tail.append(row)
@@ -87,14 +88,15 @@ def main():
         writer.writerow(output)
     warm = warm_window(rows, args.warm_window)
     if not warm:
-        print("# No sufficiently long trailing full-tier, error-free decode window.")
+        print("# No sufficiently long trailing steady working-set decode window.")
     else:
-        print(f"# Warm candidate: run={warm[0]['run']} tokens={warm[0]['token']}..{warm[-1]['token']}; occupancy criterion only.")
+        fullness = "full" if all(r["tier_full"] for r in warm) else "not_full"
+        print(f"# Steady working-set candidate: run={warm[0]['run']} tokens={warm[0]['token']}..{warm[-1]['token']}; tier={fullness}.")
         print("# Mean deltas per token: " + " ".join(
             f"{k}_delta={sum(r[k] for r in warm)/len(warm):.6f}"
             for k in ("cuda_rows", "fallback_rows", "uploads", "evictions") + TIMES))
-        print("# errors_delta=0 throughout this candidate; full does not imply steady."
-              " Inspect latency, uploads_delta and evictions_delta for continuing churn.")
+        print("# errors_delta=uploads_delta=evictions_delta=0 throughout this candidate;"
+              " tier_full reports occupancy separately.")
 
 
 if __name__ == "__main__":

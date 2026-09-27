@@ -2235,6 +2235,139 @@ static void expert_mats(const GModel *m, const Slot *slot, Mat *gate, Mat *up, M
     *gate = shape[0]; *up = shape[1]; *down = shape[2];
 }
 
+#ifdef COLI_CUDA
+/* Decode-scale group path. Every contribution is private until all devices
+ * have been drained. The old serial path below remains the prefill and
+ * single-device path, including its original host clamp and cache batching. */
+typedef struct {
+    ColiCudaTensor *gate[8], *up[8], *down[8];
+    int rows[8], at[8], count;
+    float *input;
+} G53FfnGroup;
+static int g53_cuda_ffn_grouped(GModel *m, const GLayer *l, int index,
+                                const float *x, float *out,
+                                const int *union_ids, int n_union,
+                                const int *chosen, const float *weight,
+                                float *sg, float *su) {
+    G53Cuda *g = &m->cuda;
+    const Cfg *c = &m->c;
+    if (!g->active || g->failed || g->ndev < 2 || n_union < 1 || n_union > 8 ||
+        !isfinite(c->swiglu_limit) || c->swiglu_limit <= 0)
+        return 0;
+    G53FfnGroup group[COLI_CUDA_MAX_DEVICES] = {0};
+    unsigned char resident[8] = {0};
+    float route_weight[8];
+    float *result = malloc((size_t)n_union * c->hidden * sizeof(float));
+    if (!result) return 0;
+    int valid = 1;
+    for (int i = 0; i < n_union && valid; i++) {
+        int eid = union_ids[i], found = 0;
+        for (int k = 0; k < c->topk; k++) if (chosen[k] == eid) {
+            route_weight[i] = weight[k]; found = 1; break;
+        }
+        if (!found || route_weight[i] == 0) { valid = 0; break; }
+        G53CudaExpert *e = &g->experts[index * g->ne + eid];
+        if (!e->w[0]) continue;
+        int di = e->owner, j = group[di].count++;
+        group[di].gate[j] = e->w[0]; group[di].up[j] = e->w[1];
+        group[di].down[j] = e->w[2]; group[di].rows[j] = 1;
+        group[di].at[j] = i; resident[i] = 1;
+    }
+    for (int di = 0; di < g->ndev && valid; di++) if (group[di].count) {
+        group[di].input = malloc((size_t)group[di].count * c->hidden * sizeof(float));
+        if (!group[di].input) valid = 0;
+        else for (int j = 0; j < group[di].count; j++)
+            memcpy(group[di].input + (size_t)j * c->hidden, x,
+                   (size_t)c->hidden * sizeof(float));
+    }
+    if (!valid) {
+        for (int di = 0; di < g->ndev; di++) free(group[di].input);
+        free(result); return 0;
+    }
+    for (int i = 0; i < n_union; i++) g53_cuda_heat(g, index, union_ids[i], 1);
+    /* All issues precede the first take; distinct device streams can run at
+     * once. An issue failure still leaves earlier devices to drain. */
+    for (int di = 0; di < g->ndev; di++) if (group[di].count && !g->failed)
+        g53_cuda_group_issue(g, di, group[di].gate, group[di].up,
+                             group[di].down, group[di].rows,
+                             group[di].count, group[di].input, c->swiglu_limit);
+    /* Disk/RAM cache misses are independent of the resident device tensors.
+     * Compute them into private rows while the GPU streams are in flight. */
+    for (int i = 0; i < n_union; i++) if (!resident[i]) {
+#ifdef GLM53_CUDA_TEST_HOOK
+        glm53_cuda_test_cpu_miss_pending(g);
+#endif
+        int eid = union_ids[i];
+        Slot *slot = expert_slot(m, index, eid);
+        Mat gate, up, down;
+        expert_mats(m, slot, &gate, &up, &down);
+        double start = g53_cuda_profile_now(g);
+        mlp3(result + (size_t)i * c->hidden, x, &gate, &up, &down,
+             c->swiglu_limit, sg, su);
+        if (g->profile.clock) g->profile.fallback_compute_rows++;
+        g53_cuda_profile_add(g, G53_FALLBACK, start);
+        g->fallback++;
+    }
+    /* Drain every successfully issued device, even after another failed.
+     * Copy pinned rows before any subsequent issue can reuse backend staging. */
+    for (int di = 0; di < g->ndev; di++) if (g->group_pending[di]) {
+        const float *rows = g53_cuda_group_take(g, di);
+        if (!rows) continue;
+        int finite = 1;
+        for (int j = 0; j < group[di].count; j++)
+            for (int d = 0; d < c->hidden; d++)
+                if (!isfinite(rows[(size_t)j * c->hidden + d])) finite = 0;
+        if (!finite) {
+            if (!g->failed) {
+                g->failed = 1; g->errors++;
+                fprintf(stderr, "[glm53-cuda] group failed device=%d stage=validate; host fallback enabled\n",
+                        g->devices[di]);
+            }
+            continue;
+        }
+        for (int j = 0; j < group[di].count; j++) {
+            memcpy(result + (size_t)group[di].at[j] * c->hidden,
+                   rows + (size_t)j * c->hidden, (size_t)c->hidden * sizeof(float));
+            g->executed++; g->device_executed[di]++;
+        }
+    }
+    if (g->failed) {
+        /* No GPU contribution has touched out. Recompute every resident row,
+         * including a device that completed successfully before the fault. */
+        for (int i = 0; i < n_union; i++) if (resident[i]) {
+            Slot *slot = expert_slot(m, index, union_ids[i]);
+            Mat gate, up, down;
+            expert_mats(m, slot, &gate, &up, &down);
+            double start = g53_cuda_profile_now(g);
+            mlp3(result + (size_t)i * c->hidden, x, &gate, &up, &down,
+                 c->swiglu_limit, sg, su);
+            if (g->profile.clock) g->profile.fallback_compute_rows++;
+            g53_cuda_profile_add(g, G53_FALLBACK, start);
+            g->fallback++;
+        }
+    }
+    /* Match phase 1's logical accumulation: resident hits first in union
+     * order, followed by CPU misses. Faulted groups use all-CPU union order. */
+    for (int pass = 0; pass < (g->failed ? 1 : 2); pass++)
+        for (int i = 0; i < n_union; i++)
+            if (g->failed || resident[i] == (pass == 0)) {
+                float *dst = out;
+                const float *src = result + (size_t)i * c->hidden;
+                for (int d = 0; d < c->hidden; d++) dst[d] += route_weight[i] * src[d];
+                if (resident[i] && !g->failed) ehit_mark(m, index, union_ids[i]);
+            }
+    /* Promotions can evict tensors; they occur only after every take. */
+    if (!g->failed) for (int i = 0; i < n_union; i++) if (!resident[i]) {
+        Slot *slot = slot_find(m, index, union_ids[i]);
+        if (!slot) slot = expert_slot(m, index, union_ids[i]);
+        g53_cuda_promote(g, index, union_ids[i], slot->piece);
+    }
+    for (int di = 0; di < g->ndev; di++) free(group[di].input);
+    free(result);
+    return 1;
+}
+#endif
+
 /* Il MoE, in due tempi.
  *
  * Prima si decide: per ogni token del blocco quali esperti servono e con che
@@ -2347,6 +2480,13 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     }
 
 #ifdef COLI_CUDA
+    if (tokens == 1 && m->cuda.active && m->cuda.ndev > 1 &&
+        g53_cuda_ffn_grouped(m, l, index, x, out, union_ids, n_union,
+                             chosen, weight, sg, su)) {
+        if (index == m->layer_end - 1) g53_cuda_stats(&m->cuda);
+        free(union_ids); free(tmp); free(su); free(sg); free(weight); free(chosen);
+        return;
+    }
     if (m->cuda.active) {
         /* Resolve VRAM hits before touching the RAM cache or disk. Commit an
          * expert's rows together so a late CUDA error cannot double-scatter. */

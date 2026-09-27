@@ -24,7 +24,7 @@ typedef struct {
 /* Host wall-clock envelopes, using the engine's existing monotonic clock.
  * No clock calls or environment lookups on hot paths when clock is NULL. */
 enum { G53_UPLOAD, G53_GATE, G53_UP, G53_CLAMP, G53_DOWN, G53_FALLBACK,
-       G53_PROMOTION, G53_EVICT, G53_PROFILE_TIMES };
+       G53_PROMOTION, G53_EVICT, G53_GROUP_ISSUE, G53_GROUP_TAKE, G53_PROFILE_TIMES };
 typedef struct {
     double (*clock)(void);
     double seconds[G53_PROFILE_TIMES], forward_s, decode_forward_s;
@@ -38,6 +38,7 @@ typedef struct {
     int ndev, devices[COLI_CUDA_MAX_DEVICES];
     size_t capacity[COLI_CUDA_MAX_DEVICES], used[COLI_CUDA_MAX_DEVICES];
     uint64_t device_executed[COLI_CUDA_MAX_DEVICES];
+    unsigned char group_pending[COLI_CUDA_MAX_DEVICES];
     int failure_stage;
     size_t budget, bytes, expert_bytes;
     unsigned resident;
@@ -71,7 +72,7 @@ static void g53_cuda_profile_report(const G53Cuda *g, const char *phase) {
         " cuda_rows=%llu fallback_rows=%llu fallback_compute_rows=%llu uploads=%llu evictions=%llu errors=%llu"
         " resident=%u vram_bytes=%zu budget_bytes=%zu tier_full=%d"
         " upload_s=%.6f gate_s=%.6f up_s=%.6f clamp_s=%.6f down_s=%.6f"
-        " fallback_compute_s=%.6f promotion_s=%.6f eviction_s=%.6f cuda_expert_s=%.6f"
+        " fallback_compute_s=%.6f promotion_s=%.6f eviction_s=%.6f group_issue_s=%.6f group_take_s=%.6f cuda_expert_s=%.6f"
         " disk_s=%.6f attn_s=%.6f ffn_s=%.6f head_s=%.6f forward_s=%.6f decode_forward_s=%.6f\n",
         phase, (unsigned long long)p->tokens, (unsigned long long)p->decode_tokens,
         (unsigned long long)p->forwards, (unsigned long long)g->executed,
@@ -81,7 +82,9 @@ static void g53_cuda_profile_report(const G53Cuda *g, const char *phase) {
         p->seconds[G53_UPLOAD], p->seconds[G53_GATE], p->seconds[G53_UP],
         p->seconds[G53_CLAMP], p->seconds[G53_DOWN], p->seconds[G53_FALLBACK],
         p->seconds[G53_PROMOTION], p->seconds[G53_EVICT],
-        p->seconds[G53_GATE]+p->seconds[G53_UP]+p->seconds[G53_CLAMP]+p->seconds[G53_DOWN],
+        p->seconds[G53_GROUP_ISSUE], p->seconds[G53_GROUP_TAKE],
+        p->seconds[G53_GATE]+p->seconds[G53_UP]+p->seconds[G53_CLAMP]+p->seconds[G53_DOWN]
+            +p->seconds[G53_GROUP_ISSUE]+p->seconds[G53_GROUP_TAKE],
         p->disk_s, p->attn_s, p->ffn_s, p->head_s, p->forward_s, p->decode_forward_s);
 }
 
@@ -94,6 +97,17 @@ static void g53_cuda_stats(const G53Cuda *g) {
 }
 static void g53_cuda_drop(G53Cuda *g, G53CudaExpert *e) {
     if (!e->w[0]) return;
+    if (g->group_pending[e->owner]) {
+        /* Defensive lifetime guard. The FFN path normally drains before it
+         * can promote/evict, but teardown and future callers must also be safe. */
+        coli_cuda_expert_group_take(g->devices[e->owner]);
+        g->group_pending[e->owner] = 0;
+        if (!g->failed) {
+            g->failed = 1; g->errors++;
+            fprintf(stderr, "[glm53-cuda] outstanding group discarded device=%d stage=eviction\n",
+                    g->devices[e->owner]);
+        }
+    }
     for (int k = 0; k < 3; k++) {
         size_t bytes = coli_cuda_tensor_vram(e->w[k]);
         g->bytes -= bytes;
@@ -105,6 +119,15 @@ static void g53_cuda_drop(G53Cuda *g, G53CudaExpert *e) {
 static void g53_cuda_device_stats(const G53Cuda *g);
 static void g53_cuda_close(G53Cuda *g) {
     if (!g->active) return;
+    for (int i = 0; i < g->ndev; i++) if (g->group_pending[i]) {
+        const float *result = coli_cuda_expert_group_take(g->devices[i]);
+        g->group_pending[i] = 0;
+        if (!result && !g->failed) {
+            g->failed = 1; g->errors++;
+            fprintf(stderr, "[glm53-cuda] group drain failed device=%d stage=shutdown\n",
+                    g->devices[i]);
+        }
+    }
     g53_cuda_stats(g);
     g53_cuda_device_stats(g);
     g53_cuda_profile_report(g, "final"); /* before teardown, not an eviction */
@@ -189,7 +212,8 @@ static void g53_cuda_init(G53Cuda *g, int nl, int ne, int D, int I, int streamin
     g->experts = calloc((size_t)g->count, sizeof(*g->experts));
     if (!g->experts) { coli_cuda_shutdown(); fprintf(stderr, "OOM CUDA expert table\n"); exit(1); }
     g->active = 1;
-    fprintf(stderr, "[glm53-cuda] device=%d budget_bytes=%zu gs=64 host_clamp=1 devices=", g->device, g->budget);
+    fprintf(stderr, "[glm53-cuda] device=%d budget_bytes=%zu gs=64 host_clamp=1 group_clamp=%d devices=",
+            g->device, g->budget, g->ndev > 1);
     for (int i = 0; i < g->ndev; i++)
         fprintf(stderr, "%s%d(usable_bytes=%zu,capacity=%zu)", i ? "," : "", g->devices[i],
                 g->capacity[i] < g->budget ? g->capacity[i] : g->budget,
@@ -293,5 +317,38 @@ static int g53_cuda_run(G53Cuda *g, int layer, int eid, float *y, const float *x
                 g->devices[e->owner], (const char *const[]){"gate", "up", "down"}[g->failure_stage]);
     } else { g->executed++; g->device_executed[e->owner]++; }
     return ok;
+}
+/* One in-flight group per device, matching the shared backend contract.
+ * Results belong to backend pinned staging until that device is issued again. */
+static int g53_cuda_group_issue(G53Cuda *g, int di, ColiCudaTensor *const *gate,
+                               ColiCudaTensor *const *up, ColiCudaTensor *const *down,
+                               const int *rows, int count, const float *x, float limit) {
+    if (g->failed || g->group_pending[di]) return 0;
+    double start = g53_cuda_profile_now(g);
+    int ok = coli_cuda_expert_group_issue_clamped(gate, up, down, rows, count, x, limit);
+    g53_cuda_profile_add(g, G53_GROUP_ISSUE, start);
+    if (!ok) {
+        if (!g->failed) {
+            g->failed = 1; g->errors++;
+            fprintf(stderr, "[glm53-cuda] group failed device=%d stage=issue; host fallback enabled\n",
+                    g->devices[di]);
+        }
+        return 0;
+    }
+    g->group_pending[di] = 1;
+    return 1;
+}
+static const float *g53_cuda_group_take(G53Cuda *g, int di) {
+    if (!g->group_pending[di]) return NULL;
+    double start = g53_cuda_profile_now(g);
+    const float *result = coli_cuda_expert_group_take(g->devices[di]);
+    g53_cuda_profile_add(g, G53_GROUP_TAKE, start);
+    g->group_pending[di] = 0;
+    if (!result && !g->failed) {
+        g->failed = 1; g->errors++;
+        fprintf(stderr, "[glm53-cuda] group failed device=%d stage=take; host fallback enabled\n",
+                g->devices[di]);
+    }
+    return result;
 }
 #endif

@@ -88,6 +88,11 @@ typedef int            (*fn_expert_group_issue)(ColiCudaTensor *const *gates,
                                                 ColiCudaTensor *const *ups,
                                                 ColiCudaTensor *const *downs,
                                                 const int *rows, int count, const float *x);
+typedef int            (*fn_expert_group_issue_clamped)(ColiCudaTensor *const *gates,
+                                                ColiCudaTensor *const *ups,
+                                                ColiCudaTensor *const *downs,
+                                                const int *rows, int count, const float *x,
+                                                float limit);
 typedef const float *  (*fn_expert_group_take)(int device);
 typedef int            (*fn_attention_absorb)(ColiCudaTensor *kv_b, float *ctx, const float *q,
                                               const float *latent, const float *rope, int H, int Q,
@@ -176,6 +181,7 @@ static struct {
     fn_expert_group    expert_group;
     fn_expert_group_pinned expert_group_pinned;
     fn_expert_group_issue expert_group_issue;
+    fn_expert_group_issue_clamped expert_group_issue_clamped;
     fn_expert_group_take expert_group_take;
     fn_attention_absorb attention_absorb;
     fn_tensor_upload   tensor_upload;
@@ -1428,6 +1434,7 @@ static int coli_cuda_load(void){
     RESOLVE(expert_group,   fn_expert_group)
     RESOLVE_OPT(expert_group_pinned, fn_expert_group_pinned)
     RESOLVE(expert_group_issue, fn_expert_group_issue)
+    RESOLVE_OPT(expert_group_issue_clamped, fn_expert_group_issue_clamped)
     RESOLVE(expert_group_take, fn_expert_group_take)
     RESOLVE(attention_absorb, fn_attention_absorb)
     RESOLVE(tensor_upload,  fn_tensor_upload)
@@ -1615,6 +1622,14 @@ int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
                                  const int *rows, int count, const float *x){
     if(!g_cuda.available) return 0;
     return g_cuda.expert_group_issue(gates, ups, downs, rows, count, x);
+}
+
+int coli_cuda_expert_group_issue_clamped(ColiCudaTensor *const *gates,
+                                 ColiCudaTensor *const *ups,
+                                 ColiCudaTensor *const *downs,
+                                 const int *rows, int count, const float *x, float limit){
+    if(!g_cuda.available || !g_cuda.expert_group_issue_clamped) return 0;
+    return g_cuda.expert_group_issue_clamped(gates, ups, downs, rows, count, x, limit);
 }
 
 const float *coli_cuda_expert_group_take(int device){

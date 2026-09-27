@@ -142,13 +142,16 @@ device with enough allowance, breaking ties by list order. The cap is shared
 dynamically, not multiplied by the device count or rigidly divided; every
 device must also stay within its own allowance. The startup line shows the
 total cap and each device's usable bytes and whole-expert capacity (these
-individual maxima are subject to the shared cap). Execution remains serial
-on each expert's owning device. This tier does not upload attention, dense or
-shared-expert weights. Gate/up/down run through existing CUDA resident
-matmuls, with GLM53's exact clamped SwiGLU on the host between projections.
-The generic fused CUDA expert API uses plain SiLU and is unsuitable here.
-Extra activation transfers and synchronous promotion mean speedup is not
-guaranteed. The model/container format is unchanged.
+individual maxima are subject to the shared cap). Single-GPU execution retains
+the original serial gate/up/host-clamp/down path. With multiple devices,
+decode-scale resident experts issue one clamped gs64 group per participating
+device. CPU misses run while groups are pending; every issued device is drained
+before any routed contribution is scattered. Results accumulate in stable
+logical order, and a failed issue, take, or nonfinite result recomputes the
+operation on the CPU without publishing a partial GPU result. Promotions wait
+until all groups have drained. Larger prefill blocks retain the serial path.
+This tier does not upload attention, dense, or shared-expert weights. The
+model/container format is unchanged.
 
 `[glm53-cuda]` diagnostics report resident expert count, allocated expert
 VRAM bytes (excluding runtime scratch), successfully executed expert rows,
@@ -163,6 +166,7 @@ Validation (a skip is not a pass):
 ```bash
 make glm53-cuda-tier-check                         # fake backend, no GPU
 make glm53-cuda-check CUDA=1 CUDA_ARCH=sm_86        # real CUDA tensor numerics
+CUDA_VISIBLE_DEVICES=0,1 make glm53-cuda-multidev-check CUDA=1 CUDA_ARCH=sm_86
 python3 tests/glm53_cuda_harness.py --binary ./glm53 --fixture ~/glm53_stream-i4
 ```
 
@@ -220,7 +224,8 @@ The fields are cumulative within one model run:
 | `clamp_s` | Host clamped-SwiGLU call time. |
 | `fallback_compute_s` | Host `mlp3` call time in fallback; excludes scatter/add and expert loading. |
 | `promotion_s`, `eviction_s` | Entire synchronous promotion decision/upload attempt, and the resident free within a replacement. `upload_s` and `eviction_s` are subsets of `promotion_s`. |
-| `cuda_expert_s` | Sum of gate/up/clamp/down call times, including attempted calls before a failure; excludes promotion, routing and scatter. |
+| `group_issue_s`, `group_take_s` | Host call-boundary time for grouped decode work. Device execution can overlap CPU misses between these calls. |
+| `cuda_expert_s` | Sum of serial gate/up/clamp/down and grouped issue/take call times, including attempted calls before a failure; excludes promotion, routing and scatter. |
 | `disk_s` | Existing GLM53 `t_disk`: expert load-batch wall time (plus single-slot reads). It does not isolate physical NVMe I/O from RAM/page-cache or allocation work. |
 | `attn_s`, `ffn_s`, `head_s` | Existing GLM53 cumulative phase timers. They overlap the expert sub-times and must not be added to them. |
 | `forward_s`, `decode_forward_s` | Whole forward-call wall time, and its explicit decode subset. Decode excludes sampling, text output and the profile record itself. |
@@ -246,11 +251,10 @@ python3 tools/glm53_cuda_profile.py glm53-cuda-64.log --warm-window 16 \
 
 The parser prints per-decode-token deltas, including `uploads_delta`,
 `evictions_delta`, `errors_delta` and `decode_forward_s_delta`. It identifies a
-trailing 16-token **warm candidate** only when the tier was full before and
-after each token and the run remained error-free. The filling token is excluded.
-This occupancy condition is not proof of steady state: inspect the candidate's
-latency and upload/eviction deltas; continued churn means it has not settled.
-The CSV never computes a CUDA/fallback ratio.
+trailing 16-token **steady working-set candidate** when the continuous decode
+window has zero errors, uploads and evictions, even if `tier_full=0`.
+`tier_full` remains a separate occupancy gauge. The CSV never computes a
+CUDA/fallback ratio.
 
 ### Relationship to Qwen3.8 streaming placement
 

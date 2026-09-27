@@ -112,6 +112,33 @@ static void check_order(const char *order, int first, int second, int fail) {
 #endif
     printf("PASS order=%s owner0=%d owner1=%d failure=%d\n", order, first, second, fail);
 }
+static void check_clamped_group(const char *order) {
+    G53Cuda g = {0};
+    float x[ORACLE_D], serial[2][ORACLE_D], sg[ORACLE_I], su[ORACLE_I];
+    for (int j = 0; j < ORACLE_D; j++) x[j] = (j % 23 - 11) * 0.13f;
+    setenv("COLI_CUDA", "1", 1);
+    setenv("COLI_GPUS", order, 1);
+    setenv("CUDA_EXPERT_GB", "auto", 1);
+    g53_cuda_init(&g, 1, ORACLE_EXPERTS, ORACLE_D, ORACLE_I, 1);
+    for (int e = 0; e < 2; e++) {
+        g53_cuda_heat(&g, 0, e, 2);
+        g53_cuda_promote(&g, 0, e, opieces[e]);
+        assert(g53_cuda_run(&g, 0, e, serial[e], x, sg, su, 0.5f, clamp_ref));
+    }
+    int one[1] = {1};
+    for (int di = 0; di < 2; di++) {
+        G53CudaExpert *e = &g.experts[di];
+        ColiCudaTensor *gate[1] = {e->w[0]}, *up[1] = {e->w[1]}, *down[1] = {e->w[2]};
+        assert(g53_cuda_group_issue(&g, di, gate, up, down, one, 1, x, 0.5f));
+    }
+    for (int di = 0; di < 2; di++) {
+        const float *got = g53_cuda_group_take(&g, di);
+        assert(got);
+        compare_projection("clamped async group vs phase-1 serial", got, serial[di], ORACLE_D);
+    }
+    g53_cuda_close(&g);
+    puts("PASS clamped async groups against serial gs64 experts");
+}
 #ifndef G53_ORACLE_NO_MAIN
 int main(void) {
     unsetenv("COLI_GPU_FAIL_AFTER");
@@ -124,6 +151,8 @@ int main(void) {
     fixture();
     check_order("0,1", 0, 1, 1);
     check_order("1,0", 1, 0, 0);
+    check_clamped_group("0,1");
+    check_clamped_group("1,0");
     puts("PASS GLM53 CUDA two-device numerical parity, order, eviction, fallback, cleanup");
     return 0;
 }

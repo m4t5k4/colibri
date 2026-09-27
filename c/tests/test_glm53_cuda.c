@@ -46,13 +46,30 @@ static int live, upload_calls, fail_upload, mat_calls, fail_mat, init_calls, shu
 static int fake_ndev, fake_devices[COLI_CUDA_MAX_DEVICES], live_device[COLI_CUDA_MAX_DEVICES];
 static size_t fake_free[COLI_CUDA_MAX_DEVICES];
 static int fail_mem_device = -1;
+static int group_issue_calls, group_take_calls, fail_group_issue_device = -1;
+static int fail_group_take_device = -1, nonfinite_group_device = -1;
+static int fake_completion_first = -1, fake_completion_order[1024];
+static int fake_completion_count;
+static struct {
+    ColiCudaTensor *gate[8], *up[8], *down[8];
+    int rows[8], count, D, I, pending, done;
+    float *input, *output, limit;
+} fake_group[COLI_CUDA_MAX_DEVICES];
 int coli_cuda_init(const int *d, int n) {
     init_calls++; fake_ndev = n;
     memcpy(fake_devices, d, (size_t)n * sizeof(*d)); return 1;
 }
 int coli_cuda_device_count(void) { return fake_ndev; }
 int coli_cuda_available_device_count(void) { return 2; }
-void coli_cuda_shutdown(void) { assert(live == 0); shutdown_calls++; }
+void coli_cuda_shutdown(void) {
+    assert(live == 0);
+    for (int d = 0; d < COLI_CUDA_MAX_DEVICES; d++) {
+        assert(!fake_group[d].pending);
+        free(fake_group[d].input); free(fake_group[d].output);
+        memset(&fake_group[d], 0, sizeof(fake_group[d]));
+    }
+    shutdown_calls++;
+}
 int coli_cuda_mem_info(int d, size_t *f, size_t *t) {
     if (d == fail_mem_device) return 0;
     *f = *t = fake_free[d] ? fake_free[d] : 8000000000ULL; return 1;
@@ -60,7 +77,8 @@ int coli_cuda_mem_info(int d, size_t *f, size_t *t) {
 size_t coli_cuda_alloc_footprint(size_t b) { return b; }
 size_t coli_cuda_tensor_vram(const ColiCudaTensor *t) { return (size_t)t->I * t->O * 9 / 16; }
 void coli_cuda_tensor_free(ColiCudaTensor *t) {
-    if (t) { assert(live_device[t->device] > 0); live_device[t->device]--;
+    if (t) { assert(!fake_group[t->device].pending);
+        assert(live_device[t->device] > 0); live_device[t->device]--;
         free(t->w); free(t->s); free(t); live--; }
 }
 int coli_cuda_tensor_upload_g(ColiCudaTensor **t, const void *w, const float *s,
@@ -82,6 +100,71 @@ int coli_cuda_matmul(ColiCudaTensor **t, float *y, const float *x, const void *w
     assert(*t && (*t)->I == I && (*t)->O == O);
     if (++mat_calls == fail_mat) { y[0] = 12345; return 0; }
     project(y, x, (*t)->w, (*t)->s, I, O); return 1;
+}
+static void fake_complete_group(int d) {
+    if (!fake_group[d].pending || fake_group[d].done) return;
+    int off = 0, D = fake_group[d].D, I = fake_group[d].I;
+    float *sg = malloc((size_t)I * sizeof(float)), *su = malloc((size_t)I * sizeof(float));
+    assert(sg && su);
+    for (int j = 0; j < fake_group[d].count; j++) {
+        for (int r = 0; r < fake_group[d].rows[j]; r++) {
+            const float *x = fake_group[d].input + (size_t)off * D;
+            project(sg, x, fake_group[d].gate[j]->w, fake_group[d].gate[j]->s, D, I);
+            project(su, x, fake_group[d].up[j]->w, fake_group[d].up[j]->s, D, I);
+            if (fake_group[d].limit > 0) clamp_ref(sg, su, I, fake_group[d].limit);
+            else for (int k = 0; k < I; k++) sg[k] = sg[k] / (1 + expf(-sg[k])) * su[k];
+            project(fake_group[d].output + (size_t)off * D, sg,
+                    fake_group[d].down[j]->w, fake_group[d].down[j]->s, I, D);
+            off++;
+        }
+    }
+    free(su); free(sg);
+    if (d == nonfinite_group_device) fake_group[d].output[0] = NAN;
+    fake_group[d].done = 1;
+    assert(fake_completion_count < (int)(sizeof(fake_completion_order)/sizeof(fake_completion_order[0])));
+    fake_completion_order[fake_completion_count++] = d;
+}
+int coli_cuda_expert_group_issue_clamped(ColiCudaTensor *const *gate,
+        ColiCudaTensor *const *up, ColiCudaTensor *const *down,
+        const int *rows, int count, const float *x, float limit) {
+    assert(count > 0 && count <= 8 && gate && up && down && rows && x);
+    int d = gate[0]->device, total = 0, D = gate[0]->I, I = gate[0]->O;
+    assert(!fake_group[d].pending);
+    group_issue_calls++;
+    if (d == fail_group_issue_device) return 0;
+    for (int j = 0; j < count; j++) {
+        assert(rows[j] > 0 && gate[j]->device == d && up[j]->device == d && down[j]->device == d);
+        assert(gate[j]->I == D && gate[j]->O == I && down[j]->I == I && down[j]->O == D);
+        fake_group[d].gate[j] = gate[j]; fake_group[d].up[j] = up[j];
+        fake_group[d].down[j] = down[j]; fake_group[d].rows[j] = rows[j];
+        total += rows[j];
+    }
+    assert(total <= 8);
+    free(fake_group[d].input); free(fake_group[d].output);
+    fake_group[d].input = malloc((size_t)total * D * sizeof(float));
+    fake_group[d].output = malloc((size_t)total * D * sizeof(float));
+    assert(fake_group[d].input && fake_group[d].output);
+    memcpy(fake_group[d].input, x, (size_t)total * D * sizeof(float));
+    fake_group[d].count = count; fake_group[d].D = D; fake_group[d].I = I;
+    fake_group[d].limit = limit; fake_group[d].pending = 1; fake_group[d].done = 0;
+    if (fake_completion_first >= 0 && fake_group[0].pending && fake_group[1].pending) {
+        fake_complete_group(fake_completion_first);
+        fake_complete_group(1 - fake_completion_first);
+    }
+    return 1;
+}
+int coli_cuda_expert_group_issue(ColiCudaTensor *const *gate,
+        ColiCudaTensor *const *up, ColiCudaTensor *const *down,
+        const int *rows, int count, const float *x) {
+    return coli_cuda_expert_group_issue_clamped(gate, up, down, rows, count, x, 0);
+}
+const float *coli_cuda_expert_group_take(int d) {
+    assert(fake_group[d].pending);
+    group_take_calls++;
+    fake_complete_group(d);
+    fake_group[d].pending = 0;
+    if (d == fail_group_take_device) return NULL;
+    return fake_group[d].output;
 }
 #endif
 #ifndef G53_CUDA_NO_TEST_MAIN
