@@ -167,6 +167,16 @@ may run while uploads finish. The model still joins and publishes in logical
 order before reading tier residency or failure state; prefill and every other
 join/flush path retain their previous location.
 
+`GLM53_MLA_OUT_ROWS4=1` is a separate, default-off CPU attention experiment.
+For a one-token MLA output projection it reuses KDA KO's AVX2 rows4 int4
+kernel only when the output matrix is fmt4/gs64, has a row count divisible by
+four, and its input dimension is divisible by 64. Other formats/geometries,
+non-AVX2 builds, and Metal/Vulkan builds keep the generic `mv` path. It does
+not change KDA dispatch or the CUDA expert tier. When CUDA profiling is on,
+the cumulative `[glm53-attn-split]` line includes
+`mla_out_rows4_calls` and `mla_out_generic_calls`; `mla_out_s` retains its
+existing inclusive timing interval.
+
 `CUDA_EXPERT_GB` is a total decimal-GB cap across all selected devices, or
 `auto` (default): the sum of free VRAM minus 2 GB of runtime headroom on each
 device, floored at zero per device. A numeric cap is clamped to that total;

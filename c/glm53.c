@@ -738,6 +738,8 @@ typedef struct {
     double t_kda_gateproj, t_kda_normgate, t_kda_ko;
     double t_mla_proj, t_mla_index, t_mla_core;
     double t_mla_score, t_mla_value, t_mla_out;
+    int mla_out_rows4;
+    uint64_t mla_out_rows4_calls, mla_out_generic_calls;
     uint64_t forwards;
     uint8_t **ehit;                       /* [layer][expert] toccato in questo turno */
     /* torre vision: presente solo se il checkpoint la porta */
@@ -1456,20 +1458,35 @@ static void matmul_i4_grouped_rows4_s1(
 }
 #endif
 
-static void mv_kda_ko(float *out, const Mat *w, const float *x) {
+/* The rows4 kernel retains each row's grouped AVX2 accumulation and FMA
+ * reduction order. KDA KO always opts in; MLA output does so experimentally. */
+static int mv_rows4_s1_or_generic(float *out, const Mat *w, const float *x,
+                                  int rows4_enabled) {
 #if defined(__AVX2__) && !defined(COLI_METAL) && !defined(COLI_VULKAN)
-    if (w->fmt == 4 &&
+    if (rows4_enabled && w->fmt == 4 &&
         w->gs > 0 &&
         (w->rows & 3) == 0 &&
         w->columns % w->gs == 0) {
         matmul_i4_grouped_rows4_s1(
             out, x, w->q4, w->s,
             w->columns, w->rows, w->gs);
-        return;
+        return 1;
     }
+#else
+    (void)rows4_enabled;
 #endif
 
     mv(out, w, x);
+    return 0;
+}
+
+static void mv_kda_ko(float *out, const Mat *w, const float *x) {
+    (void)mv_rows4_s1_or_generic(out, w, x, 1);
+}
+
+static int mv_mla_out(float *out, const Mat *w, const float *x, int enabled) {
+    /* This experiment is limited to the production gs64 geometry. */
+    return mv_rows4_s1_or_generic(out, w, x, enabled && w->gs == 64);
 }
 
 static void rms(float *out, const float *x, const float *w, int n, float eps) {
@@ -1730,8 +1747,13 @@ static void mla_layer(GModel *m, const Cfg *c, const GLayer *l, const float *x, 
         }
 
         const double t_out0 = now_s();
-        mv(out + (size_t)t * c->hidden, &l->o, context);
+        const int rows4 = mv_mla_out(out + (size_t)t * c->hidden, &l->o, context,
+                                     m->mla_out_rows4);
         m->t_mla_out += now_s() - t_out0;
+        if (rows4)
+            m->mla_out_rows4_calls++;
+        else
+            m->mla_out_generic_calls++;
     }
     m->t_mla_core += now_s() - t_core0;
     free(used_h); free(score); free(pooled);
@@ -3174,9 +3196,15 @@ static void expert_geometry(GModel *m);
 static void expert_table_init(GModel *m);
 static void expert_cache_init(GModel *m);
 
+static int glm53_mla_out_rows4_env(void) {
+    const char *setting = getenv("GLM53_MLA_OUT_ROWS4");
+    return setting && !strcmp(setting, "1");
+}
+
 static void model_load_range(GModel *m, const char *dir, int layer_begin,
                              int layer_end, int load_io) {
     load_cfg(&m->c, dir);
+    m->mla_out_rows4 = glm53_mla_out_rows4_env();
     st_init(&m->S, dir);
     glm53_mirror_setup(m, dir);
     /* Il checkpoint reale annida il modello testuale sotto il wrapper vision;
@@ -3813,6 +3841,7 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
                     "kda_gateproj_s=%.6f kda_normgate_s=%.6f kda_ko_s=%.6f "
                     "mla_s=%.6f mla_proj_s=%.6f mla_index_s=%.6f mla_core_s=%.6f "
                     "mla_score_s=%.6f mla_value_s=%.6f mla_out_s=%.6f "
+                    "mla_out_rows4_calls=%llu mla_out_generic_calls=%llu "
                     "attn_s=%.6f\n",
                     (unsigned long long)p->decode_tokens,
                     m->t_kda, m->t_kda_proj, m->t_kda_core, m->t_kda_out,
@@ -3820,6 +3849,8 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
                     m->t_kda_gateproj, m->t_kda_normgate, m->t_kda_ko,
                     m->t_mla, m->t_mla_proj, m->t_mla_index, m->t_mla_core,
                     m->t_mla_score, m->t_mla_value, m->t_mla_out,
+                    (unsigned long long)m->mla_out_rows4_calls,
+                    (unsigned long long)m->mla_out_generic_calls,
                     m->t_attn);
     }
 #endif
