@@ -154,6 +154,30 @@ static void case_integrated_parallel_fill(void) {
     unsetenv("GLM53_CUDA_PARALLEL_PROMOTE");
     unsetenv("GLM53_CUDA_PROFILE");
 }
+static void case_integrated_heat_noop(void) {
+    FixtureModel f;
+    setenv("GLM53_CUDA_PARALLEL_PROMOTE", "1", 1);
+    setenv("GLM53_CUDA_PROFILE", "1", 1);
+    model_fixture(&f, "0,1");
+    f.bias[1] = 1; f.bias[2] = 2; /* route 0, 2, 1 */
+    float x[ORACLE_D], reference[ORACLE_D] = {0}, got[ORACLE_D] = {0};
+    for (int d = 0; d < ORACLE_D; d++) x[d] = ((d * 7) % 19 - 9) * 0.09f;
+    ffn_layer(&f.m, &f.layer, 0, x, 1, reference);
+    g53_cuda_drop(&f.m.cuda, &f.m.cuda.experts[0]);
+    g53_cuda_drop(&f.m.cuda, &f.m.cuda.experts[1]);
+    f.m.cuda.experts[2].heat = 0;
+    f.m.cuda.budget = 4 * f.m.cuda.expert_bytes;
+    g53_cuda_profile_enable(&f.m.cuda, now_s);
+    ffn_layer(&f.m, &f.layer, 0, x, 1, got);
+    compare_projection("integrated heat no-op vs serial FFN", got, reference, ORACLE_D);
+    assert(f.m.cuda.profile.heat_noop_passthrough == 1);
+    assert(f.m.cuda.profile.batch_size_hist[2] == 1 &&
+           f.m.cuda.profile.flush_batch_full == 1);
+    assert(f.m.cuda.resident == 2 && !f.m.cuda.failed && !fake_upload_active);
+    model_fixture_close(&f);
+    unsetenv("GLM53_CUDA_PARALLEL_PROMOTE");
+    unsetenv("GLM53_CUDA_PROFILE");
+}
 static void case_diagnostic_value_types(void) {
     const float values[] = {1.5f, NAN, INFINITY, -INFINITY, -2.0f};
     G53DiagValues s = g53_diag_values(values, sizeof(values) / sizeof(values[0]));
@@ -217,6 +241,7 @@ int main(void) {
     case_group("0,1", 0, -1, -1, 1); /* nonfinite result never publishes */
     case_shutdown_pending();
     case_integrated_parallel_fill();
+    case_integrated_heat_noop();
     puts("PASS GLM53 phase-2 groups: completion order, misses, failure, eviction, teardown");
     return 0;
 }

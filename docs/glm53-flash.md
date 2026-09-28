@@ -232,6 +232,21 @@ active time appears in `[glm53-cuda-promotion-device]`. `upload_s` remains the
 sum of per-expert upload work durations; these durations can overlap and must
 not be read as elapsed wall time. The batch wall field is elapsed time. The
 optional selection trace adds `U` records with each expert's upload duration.
+Heat-ineligible attempts pass through a pending batch without reserving an
+owner or staging expert bytes. `[glm53-cuda-promotion-flush]` counts only drains
+of nonempty batches by end boundary, repeated owner, capacity/possible eviction,
+full one-task-per-device batch, failure/disabled state, staging failure, or
+other serial-only cases. `heat_noop_passthrough` counts below-minimum attempts
+encountered while a batch is pending. `[glm53-cuda-promotion-batch-size]`
+reports completed batches by size from 1 through the selected device count.
+The existing `concurrent` field counts experts in batches larger than one; it
+does not prove simultaneous DMA. `serial` includes singleton batches and
+serial replacement uploads. `batch_devices` sums occupied device slots over
+all batches, rather than counting distinct devices across the run.
+`eviction_boundaries` counts pending batches drained by the capacity check,
+not total evictions; `flush_capacity_or_eviction` gives the same drain count.
+The inactive/failed fast path does not drain a batch in the current call graph,
+so `flush_failure_or_disabled` normally stays zero.
 
 At shutdown, profiling also prints `[glm53-cuda-cache]` totals and a
 `[glm53-cuda-cache-layer]` row for each selected sparse layer: resident

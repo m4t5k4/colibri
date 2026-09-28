@@ -52,6 +52,10 @@ typedef struct {
     int decode;
     uint64_t promotion_batches, concurrent_promotions, serial_promotions;
     uint64_t eviction_batch_boundaries, batch_experts, batch_devices;
+    uint64_t flush_end_boundary, flush_owner_busy, flush_capacity_or_eviction;
+    uint64_t flush_batch_full, flush_failure_or_disabled, flush_staging_failure;
+    uint64_t flush_other_serial;
+    uint64_t heat_noop_passthrough, batch_size_hist[COLI_CUDA_MAX_DEVICES + 1];
     double promotion_plan_s, promotion_dispatch_wait_s, promotion_join_s;
     double promotion_batch_wall_s, promotion_worker_s[COLI_CUDA_MAX_DEVICES];
     double promotion_expert_upload_min_s, promotion_expert_upload_max_s;
@@ -186,6 +190,19 @@ static void g53_cuda_profile_report(const G53Cuda *g, const char *phase) {
             p->promotion_plan_s, p->promotion_dispatch_wait_s, p->promotion_join_s,
             p->promotion_batch_wall_s, p->seconds[G53_UPLOAD],
             p->promotion_expert_upload_min_s, p->promotion_expert_upload_max_s);
+    fprintf(stderr, "[glm53-cuda-promotion-flush] phase=%s flush_end_boundary=%llu flush_owner_busy=%llu flush_capacity_or_eviction=%llu flush_batch_full=%llu flush_failure_or_disabled=%llu flush_staging_failure=%llu flush_other_serial=%llu heat_noop_passthrough=%llu\n",
+            phase, (unsigned long long)p->flush_end_boundary,
+            (unsigned long long)p->flush_owner_busy,
+            (unsigned long long)p->flush_capacity_or_eviction,
+            (unsigned long long)p->flush_batch_full,
+            (unsigned long long)p->flush_failure_or_disabled,
+            (unsigned long long)p->flush_staging_failure,
+            (unsigned long long)p->flush_other_serial,
+            (unsigned long long)p->heat_noop_passthrough);
+    fprintf(stderr, "[glm53-cuda-promotion-batch-size] phase=%s", phase);
+    for (int n = 1; n <= g->ndev; n++)
+        fprintf(stderr, " size%d=%llu", n, (unsigned long long)p->batch_size_hist[n]);
+    fputc('\n', stderr);
     for (int i = 0; i < g->ndev; i++)
         fprintf(stderr, "[glm53-cuda-promotion-device] phase=%s device=%d worker_active_s=%.6f\n",
                 phase, g->devices[i], p->promotion_worker_s[i]);
@@ -533,16 +550,32 @@ static void g53_cuda_upload_task(G53CudaPromotionTask *t) {
     }
     t->active_s = t->clock ? t->clock() - start : 0;
 }
-static void g53_cuda_batch_flush(G53Cuda *g, G53CudaPromotionBatch *b) {
+typedef enum {
+    G53_FLUSH_END_BOUNDARY, G53_FLUSH_OWNER_BUSY, G53_FLUSH_CAPACITY_OR_EVICTION,
+    G53_FLUSH_BATCH_FULL, G53_FLUSH_FAILURE_OR_DISABLED, G53_FLUSH_STAGING_FAILURE,
+    G53_FLUSH_OTHER_SERIAL
+} G53CudaFlushReason;
+static void g53_cuda_batch_flush_reason(G53Cuda *g, G53CudaPromotionBatch *b,
+                                         G53CudaFlushReason reason) {
     if (!b->n) return;
+    if (g->profile.clock) {
+        G53CudaProfile *p = &g->profile;
+        switch (reason) {
+        case G53_FLUSH_END_BOUNDARY: p->flush_end_boundary++; break;
+        case G53_FLUSH_OWNER_BUSY: p->flush_owner_busy++; break;
+        case G53_FLUSH_CAPACITY_OR_EVICTION:
+            p->flush_capacity_or_eviction++; p->eviction_batch_boundaries++; break;
+        case G53_FLUSH_BATCH_FULL: p->flush_batch_full++; break;
+        case G53_FLUSH_FAILURE_OR_DISABLED: p->flush_failure_or_disabled++; break;
+        case G53_FLUSH_STAGING_FAILURE: p->flush_staging_failure++; break;
+        case G53_FLUSH_OTHER_SERIAL: p->flush_other_serial++; break;
+        }
+    }
     double wall = g53_cuda_profile_now(g);
     for (int i = 0; i < b->n; i++) {
         G53CudaPromotionTask *t = &b->task[i];
         t->clock = g->profile.clock;
         t->dispatched = wall;
-        if (g->profile.selection_trace)
-            fprintf(g->profile.selection_trace, "A,%llu,%d,%d\n",
-                    (unsigned long long)g->profile.selection_tick, t->layer, t->eid);
     }
     if (b->n == 1) g53_cuda_upload_task(&b->task[0]);
     else {
@@ -555,6 +588,7 @@ static void g53_cuda_batch_flush(G53Cuda *g, G53CudaPromotionBatch *b) {
     if (g->profile.clock) {
         G53CudaProfile *p = &g->profile;
         p->promotion_batches++;
+        p->batch_size_hist[b->n]++;
         p->batch_experts += (uint64_t)b->n;
         p->batch_devices += (uint64_t)b->n;
         if (b->n > 1) p->concurrent_promotions += (uint64_t)b->n;
@@ -600,6 +634,9 @@ static void g53_cuda_batch_flush(G53Cuda *g, G53CudaPromotionBatch *b) {
     }
     memset(b, 0, sizeof(*b));
 }
+static void g53_cuda_batch_flush(G53Cuda *g, G53CudaPromotionBatch *b) {
+    g53_cuda_batch_flush_reason(g, b, G53_FLUSH_END_BOUNDARY);
+}
 static int g53_cuda_batch_owner(const G53Cuda *g, const G53CudaPromotionBatch *b) {
     int owner = -1;
     for (int i = 0; i < g->ndev; i++)
@@ -619,19 +656,22 @@ static void g53_cuda_promote_batched(G53Cuda *g, G53CudaPromotionBatch *b,
     }
     double plan = g53_cuda_profile_now(g);
     G53CudaExpert *e = &g->experts[layer * g->ne + eid];
-    if (g->expert_bytes > g->budget || e->w[0] || e->heat < g->heat_min) {
-        g53_cuda_batch_flush(g, b);
+    if (g->expert_bytes > g->budget || e->w[0]) {
+        g53_cuda_batch_flush_reason(g, b, G53_FLUSH_OTHER_SERIAL);
+        g53_cuda_promote(g, layer, eid, pieces); return;
+    }
+    if (e->heat < g->heat_min) {
+        if (b->n && g->profile.clock) g->profile.heat_noop_passthrough++;
         g53_cuda_promote(g, layer, eid, pieces); return;
     }
     if (!b->n) g53_cuda_batch_reset(g, b);
     int owner = g53_cuda_batch_owner(g, b);
     if (owner < 0 || b->planned_bytes > g->budget - g->expert_bytes) {
-        if (b->n && g->profile.clock) g->profile.eviction_batch_boundaries++;
-        g53_cuda_batch_flush(g, b);
+        g53_cuda_batch_flush_reason(g, b, G53_FLUSH_CAPACITY_OR_EVICTION);
         g53_cuda_promote(g, layer, eid, pieces); return;
     }
     if (b->owner_busy[owner]) {
-        g53_cuda_batch_flush(g, b);
+        g53_cuda_batch_flush_reason(g, b, G53_FLUSH_OWNER_BUSY);
         if (g->failed) { g53_cuda_promote(g, layer, eid, pieces); return; }
         g53_cuda_batch_reset(g, b);
         owner = g53_cuda_batch_owner(g, b);
@@ -645,7 +685,7 @@ static void g53_cuda_promote_batched(G53Cuda *g, G53CudaPromotionBatch *b,
     size_t host_bytes = 3 * (wb + sb);
     uint8_t *host = malloc(host_bytes);
     if (!host) {
-        g53_cuda_batch_flush(g, b);
+        g53_cuda_batch_flush_reason(g, b, G53_FLUSH_STAGING_FAILURE);
         g53_cuda_promote(g, layer, eid, pieces); return;
     }
     G53CudaPromotionTask *t = &b->task[b->n++];
@@ -660,12 +700,16 @@ static void g53_cuda_promote_batched(G53Cuda *g, G53CudaPromotionBatch *b,
     b->owner_busy[owner] = 1;
     b->planned_used[owner] += g->expert_bytes;
     b->planned_bytes += g->expert_bytes;
+    if (g->profile.selection_trace)
+        fprintf(g->profile.selection_trace, "A,%llu,%d,%d\n",
+                (unsigned long long)g->profile.selection_tick, layer, eid);
     if (g->profile.clock) {
         double elapsed = g->profile.clock() - plan;
         g->profile.promotion_plan_s += elapsed;
         g->profile.seconds[G53_PROMOTION] += elapsed;
     }
-    if (b->n == g->ndev) g53_cuda_batch_flush(g, b);
+    if (b->n == g->ndev)
+        g53_cuda_batch_flush_reason(g, b, G53_FLUSH_BATCH_FULL);
 }
 /* Each existing matmul already copies y back synchronously. This measures
  * the whole API call, NOT kernel-only time, and adds no device synchronization. */

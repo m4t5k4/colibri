@@ -79,6 +79,61 @@ int main(void) {
     g53_cuda_close(&g);
     fake_upload_delay = 0;
 
+    /* A heat-ineligible attempt is a logical A event, but must leave the
+     * independent device-0 upload queued for the device-1 candidate. */
+    g53_cuda_init(&g, 1, 4, D, I, 1);
+    g53_cuda_profile_enable(&g, test_clock);
+    g.profile.selection_trace = tmpfile();
+    assert(g.profile.selection_trace);
+    g53_cuda_heat(&g, 0, 0, 2);
+    g53_cuda_promote_batched(&g, &batch, 0, 0, pieces);
+    assert(batch.n == 1);
+    g53_cuda_heat(&g, 0, 1, 1);
+    g53_cuda_promote_batched(&g, &batch, 0, 1, pieces);
+    assert(batch.n == 1 && !g.experts[1].w[0] && g.resident == 0);
+    g53_cuda_heat(&g, 0, 2, 2);
+    g53_cuda_promote_batched(&g, &batch, 0, 2, other);
+    assert(!batch.n && g.experts[0].owner == 0 && g.experts[2].owner == 1);
+    assert(g.uploads == 2 && g.profile.promotion_batches == 1 &&
+           g.profile.batch_size_hist[2] == 1 && !g.profile.batch_size_hist[1]);
+    assert(g.profile.heat_noop_passthrough == 1 &&
+           g.profile.flush_batch_full == 1 && !g.profile.flush_end_boundary &&
+           !g.profile.flush_owner_busy && !g.profile.flush_capacity_or_eviction);
+    fflush(g.profile.selection_trace);
+    rewind(g.profile.selection_trace);
+    char trace_line[256], logical[6] = {0};
+    int trace_eid[5] = {0}, trace_n = 0;
+    while (fgets(trace_line, sizeof(trace_line), g.profile.selection_trace)) {
+        char kind; unsigned long long tick; int layer, eid;
+        if (sscanf(trace_line, "%c,%llu,%d,%d", &kind, &tick, &layer, &eid) == 4 &&
+            (kind == 'A' || kind == 'P' || kind == 'E')) {
+            assert(trace_n < 5 && layer == 0);
+            logical[trace_n] = kind; trace_eid[trace_n++] = eid;
+        }
+    }
+    assert(trace_n == 5 && !strcmp(logical, "AAAPP"));
+    assert(trace_eid[0] == 0 && trace_eid[1] == 1 && trace_eid[2] == 2 &&
+           trace_eid[3] == 0 && trace_eid[4] == 2);
+    g53_cuda_close(&g);
+
+    /* A repeated planned owner still flushes; a no-op does not hide it. */
+    g53_cuda_init(&g, 1, 4, D, I, 1);
+    g53_cuda_profile_enable(&g, test_clock);
+    g.capacity[1] = 0;
+    g53_cuda_heat(&g, 0, 0, 2);
+    g53_cuda_promote_batched(&g, &batch, 0, 0, pieces);
+    g53_cuda_heat(&g, 0, 1, 1);
+    g53_cuda_promote_batched(&g, &batch, 0, 1, pieces);
+    g53_cuda_heat(&g, 0, 2, 2);
+    g53_cuda_promote_batched(&g, &batch, 0, 2, pieces);
+    assert(batch.n == 1 && g.experts[0].w[0] && !g.experts[2].w[0]);
+    g53_cuda_batch_flush(&g, &batch);
+    assert(g.profile.flush_owner_busy == 1 && g.profile.flush_end_boundary == 1 &&
+           g.profile.heat_noop_passthrough == 1 &&
+           g.profile.batch_size_hist[1] == 2 && g.uploads == 2);
+    assert(g.experts[0].owner == 0 && g.experts[2].owner == 0);
+    g53_cuda_close(&g);
+
     /* Unequal ceilings and a second batch must reproduce serial owner
      * choices, including the tie order after the first three reservations. */
     select_devices("0,1,2");
@@ -113,14 +168,37 @@ int main(void) {
      * original global heat-victim decision is made. */
     g53_cuda_init(&g, 1, 4, D, I, 1);
     g53_cuda_profile_enable(&g, test_clock);
+    g.profile.selection_trace = tmpfile();
+    assert(g.profile.selection_trace);
     g.budget = g.expert_bytes;
     g53_cuda_heat(&g, 0, 0, 2);
     g53_cuda_promote_batched(&g, &batch, 0, 0, pieces);
     assert(batch.n == 1 && !g.experts[0].w[0]);
+    g53_cuda_heat(&g, 0, 2, 1);
+    g53_cuda_promote_batched(&g, &batch, 0, 2, pieces);
+    assert(batch.n == 1 && !g.experts[2].w[0]);
     g53_cuda_heat(&g, 0, 1, 4);
     g53_cuda_promote_batched(&g, &batch, 0, 1, pieces);
     assert(!batch.n && !g.experts[0].w[0] && g.experts[1].w[0]);
     assert(g.profile.eviction_batch_boundaries == 1 && g.profile.evictions == 1);
+    assert(g.profile.flush_capacity_or_eviction == 1 &&
+           g.profile.batch_size_hist[1] == 1 && !g.profile.flush_end_boundary &&
+           g.profile.heat_noop_passthrough == 1);
+    fflush(g.profile.selection_trace);
+    rewind(g.profile.selection_trace);
+    char eviction_trace[7] = {0}; int eviction_eid[6] = {0}, eviction_n = 0;
+    while (fgets(trace_line, sizeof(trace_line), g.profile.selection_trace)) {
+        char kind; unsigned long long tick; int layer, eid;
+        if (sscanf(trace_line, "%c,%llu,%d,%d", &kind, &tick, &layer, &eid) == 4 &&
+            (kind == 'A' || kind == 'P' || kind == 'E')) {
+            assert(eviction_n < 6 && layer == 0);
+            eviction_trace[eviction_n] = kind; eviction_eid[eviction_n++] = eid;
+        }
+    }
+    assert(eviction_n == 6 && !strcmp(eviction_trace, "AAPAEP"));
+    assert(eviction_eid[0] == 0 && eviction_eid[1] == 2 &&
+           eviction_eid[2] == 0 && eviction_eid[3] == 1 &&
+           eviction_eid[4] == 1 && eviction_eid[5] == 1);
     g53_cuda_close(&g);
 
     /* If the second owner fails, the successful logical prefix remains,
@@ -144,12 +222,16 @@ int main(void) {
     g53_cuda_init(&g, 1, 4, D, I, 1);
     memset(fake_device_upload_calls, 0, sizeof(fake_device_upload_calls));
     fake_fail_upload_device = 0; fake_fail_upload_n = 1;
-    for (int e = 0; e < 2; e++) {
-        g53_cuda_heat(&g, 0, e, 2);
-        g53_cuda_promote_batched(&g, &batch, 0, e, pieces);
-    }
+    g53_cuda_heat(&g, 0, 0, 2);
+    g53_cuda_promote_batched(&g, &batch, 0, 0, pieces);
+    g53_cuda_heat(&g, 0, 1, 1);
+    g53_cuda_promote_batched(&g, &batch, 0, 1, pieces);
+    assert(batch.n == 1 && !g.failed);
+    g53_cuda_heat(&g, 0, 2, 2);
+    g53_cuda_promote_batched(&g, &batch, 0, 2, pieces);
     assert(g.failed && g.resident == 0 && !g.experts[0].w[0] &&
-           !g.experts[1].w[0] && !live && !fake_upload_active);
+           !g.experts[1].w[0] && !g.experts[2].w[0] && !live && !fake_upload_active);
+    assert(!g53_cuda_run(&g, 0, 2, b, x, sg, su, 0.5f, clamp_ref));
     g53_cuda_close(&g);
     fake_fail_upload_device = -1;
 
