@@ -24,6 +24,14 @@ int main(void) {
     assert(clock_calls == 0);
     setenv("GLM53_CUDA_PROFILE", "1", 1);
     g53_cuda_profile_enable(&g, fake_clock);
+    assert(g.profile.late_join_opportunities == 0);
+    g53_cuda_profile_late_join(&g, 5, 2, 0.5, 0.25, 1, 0.1);
+    g53_cuda_profile_late_join(&g, 1, 4, 1, 1, 1, 0.5);
+    assert(g.profile.late_join_opportunities == 2);
+    assert(g.profile.late_join_current_wait_s == 6);
+    assert(g.profile.late_join_prelude_s == 6);
+    assert(g.profile.late_join_hideable_upper_s == 3); /* min(5,2)+min(1,4) */
+    assert(g.profile.late_join_misc_s > 0.6 && g.profile.late_join_misc_s < 0.7);
     assert(g53_cuda_run(&g, 0, 0, y, x, sg, su, 0.5f, clamp_ref));
     assert(!memcmp(reference, y, sizeof(y)));
     assert(g.profile.seconds[G53_GATE] == 1 && g.profile.seconds[G53_UP] == 1);
@@ -62,6 +70,26 @@ int main(void) {
     assert(cache.profile.repromotions == 1 && cache.profile.dead_on_arrival == 1);
     assert(cache.profile.eviction_record_count == 2);
     g53_cuda_close(&cache);
+    assert(live == 0);
+    float unprofiled[64], profiled[64];
+    uint64_t prior_uploads = 0, prior_executed = 0;
+    for (int enabled = 0; enabled < 2; enabled++) {
+        G53Cuda compare = {0};
+        g53_cuda_init(&compare, 1, 2, 64, 64, 1);
+        if (enabled) g53_cuda_profile_enable(&compare, fake_clock);
+        g53_cuda_heat(&compare, 0, 0, 2);
+        g53_cuda_promote(&compare, 0, 0, pieces);
+        float *target = enabled ? profiled : unprofiled;
+        assert(g53_cuda_run(&compare, 0, 0, target, x, sg, su, 0.5f, clamp_ref));
+        assert(compare.experts[0].owner == 0 && compare.resident == 1);
+        if (enabled) {
+            assert(compare.uploads == prior_uploads && compare.executed == prior_executed);
+            assert(!memcmp(unprofiled, profiled, sizeof(profiled)));
+        } else {
+            prior_uploads = compare.uploads; prior_executed = compare.executed;
+        }
+        g53_cuda_close(&compare);
+    }
     assert(live == 0);
     puts("PASS GLM53 profiler: disabled clock, unchanged output, intervals, eviction and failure accounting");
     return 0;

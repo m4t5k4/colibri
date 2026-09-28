@@ -34,6 +34,17 @@ int main(void) {
         other[2*k] = other_weights[k]; other[2*k+1] = (uint8_t *)other_scales[k];
     }
     for (int d = 0; d < D; d++) x[d] = (d % 7 - 3) * 0.02f;
+    G53CudaPromotionFlight intervals = {0};
+    intervals.batch.n = 2;
+    intervals.batch.task[0].dispatched = 10;
+    intervals.batch.task[0].start_wait = 1;
+    intervals.batch.task[0].completed = 15;
+    intervals.batch.task[1].dispatched = 10;
+    intervals.batch.task[1].start_wait = 2;
+    intervals.batch.task[1].completed = 16;
+    assert(g53_cuda_worker_overlap(&intervals, 11, 14) == 3);
+    assert(g53_cuda_worker_overlap(&intervals, 14, 17) == 2);
+    assert(g53_cuda_worker_overlap(&intervals, 16, 17) == 0);
     select_devices("0,1");
     unsetenv("GLM53_CUDA_PARALLEL_PROMOTE");
     G53Cuda serial = {0};
@@ -82,9 +93,10 @@ int main(void) {
     /* Deferred end boundary: private uploads run during CPU-only work, with
      * no residency or policy publication until the mandatory join. */
     setenv("GLM53_CUDA_PROMOTE_OVERLAP", "1", 1);
+    setenv("GLM53_CUDA_PROMOTE_LATE_JOIN", "1", 1);
     g53_cuda_init(&g, 2, 4, D, I, 1);
     g53_cuda_profile_enable(&g, test_clock);
-    assert(g.promote_overlap);
+    assert(g.promote_overlap && g.promote_late_join);
     fake_upload_delay = 1;
     for (int e = 0; e < 2; e++) {
         g53_cuda_heat(&g, 0, e, 2);
@@ -126,6 +138,7 @@ int main(void) {
     assert(g.experts[4].owner == 2 && g.resident == 3); /* next-layer owner */
     g53_cuda_close(&g);
     fake_upload_delay = 0;
+    setenv("GLM53_CUDA_PROMOTE_LATE_JOIN", "1", 1);
     for (int failing = 0; failing < 2; failing++) {
         memset(fake_device_upload_calls, 0, sizeof(fake_device_upload_calls));
         fake_fail_upload_device = failing; fake_fail_upload_n = 1;
@@ -137,16 +150,22 @@ int main(void) {
         }
         g53_cuda_batch_dispatch_end(&g, &batch);
         assert(g.promotion_flight && !g.failed && !g.resident);
+        double prelude_begin = test_clock();
         cpu_until = test_clock() + 0.002;
         while (test_clock() < cpu_until) { }
+        g.late_window = (G53CudaLateWindow){.armed = 1,
+            .prelude_begin = prelude_begin, .prelude_end = test_clock()};
         assert(!g.failed); /* CPU-only work did not expose a worker fault. */
         g53_cuda_join_pending(&g, G53_JOIN_NEXT_FFN);
+        assert(g.profile.late_join_actual_opportunities == 1 &&
+               !g.late_window.armed);
         assert(g.failed && g.errors == 1 && !g.promotion_flight);
         assert(g.resident == (unsigned)failing && g.uploads == (uint64_t)failing);
         assert(!g.experts[1].w[0] && live == 3 * failing);
         assert(!g53_cuda_run(&g, 0, 0, b, x, sg, su, 0.5f, clamp_ref));
         g53_cuda_close(&g); assert(!live && !fake_upload_active);
     }
+    unsetenv("GLM53_CUDA_PROMOTE_LATE_JOIN");
     fake_fail_upload_device = -1;
     g53_cuda_init(&g, 2, 4, D, I, 1);
     for (int e = 0; e < 2; e++) {
@@ -327,14 +346,30 @@ int main(void) {
     fake_fail_upload_device = -1;
 
     setenv("GLM53_CUDA_PROMOTE_OVERLAP", "1", 1);
+    setenv("GLM53_CUDA_PROMOTE_LATE_JOIN", "1", 1);
     select_devices("0");
     g53_cuda_init(&g, 1, 2, D, I, 1);
-    assert(!g.parallel_promote && !g.promote_overlap);
+    assert(!g.parallel_promote && !g.promote_overlap && !g.promote_late_join);
     g53_cuda_heat(&g, 0, 0, 2);
     g53_cuda_promote_batched(&g, &batch, 0, 0, pieces);
     assert(g.uploads == 1 && !batch.n);
     g53_cuda_close(&g);
+    select_devices("0,1");
+    unsetenv("GLM53_CUDA_PARALLEL_PROMOTE");
+    g53_cuda_init(&g, 1, 2, D, I, 1);
+    assert(!g.parallel_promote && !g.promote_overlap && !g.promote_late_join);
+    g53_cuda_close(&g);
+    setenv("GLM53_CUDA_PARALLEL_PROMOTE", "1", 1);
     unsetenv("GLM53_CUDA_PROMOTE_OVERLAP");
+    g53_cuda_init(&g, 1, 2, D, I, 1);
+    assert(g.parallel_promote && !g.promote_overlap && !g.promote_late_join);
+    g53_cuda_close(&g);
+    setenv("GLM53_CUDA_PROMOTE_OVERLAP", "1", 1);
+    g53_cuda_init(&g, 1, 2, D, I, 1);
+    assert(g.parallel_promote && g.promote_overlap && g.promote_late_join);
+    g53_cuda_close(&g);
+    unsetenv("GLM53_CUDA_PROMOTE_OVERLAP");
+    unsetenv("GLM53_CUDA_PROMOTE_LATE_JOIN");
     puts("PASS GLM53 concurrent promotion planning, lifetime, failure, eviction, one-device fallback");
     return 0;
 }

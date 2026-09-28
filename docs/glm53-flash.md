@@ -158,6 +158,14 @@ owned layers, prefill, full batches, eviction/owner boundaries, and serial
 replacements still join immediately. Teardown also joins before freeing CUDA
 state. Even a one-token prefill chunk stays synchronous. No CUDA attention or
 dense operation is overlapped by this path.
+`GLM53_CUDA_PROMOTE_LATE_JOIN=1` is a further opt-in (default off) requiring
+both `GLM53_CUDA_PARALLEL_PROMOTE=1` and `GLM53_CUDA_PROMOTE_OVERLAP=1`.
+Only for an already deferred one-token sparse decode batch, it moves the
+next FFN's join from function entry to immediately before the first CUDA-tier
+branch. Router scoring/top-k, the CPU shared-expert MLP, and union construction
+may run while uploads finish. The model still joins and publishes in logical
+order before reading tier residency or failure state; prefill and every other
+join/flush path retain their previous location.
 
 `CUDA_EXPERT_GB` is a total decimal-GB cap across all selected devices, or
 `auto` (default): the sum of free VRAM minus 2 GB of runtime headroom on each
@@ -266,13 +274,20 @@ gaps and does not sum concurrent workers.
 before the barrier; `join_next_ffn` and the `forced_*` fields identify barrier
 reasons. Per-device worker active time remains in the existing device lines.
 `[glm53-cuda-late-join-opportunity]` measures only FFNs entered with a pending
-deferred batch. The current join still happens at FFN entry. `late_join_current_wait_s`
-is the caller time blocked there; `late_join_prelude_s` is the subsequent CPU
+deferred batch. With late join disabled, `late_join_current_wait_s` is the caller
+time blocked at entry; `late_join_prelude_s` is the subsequent CPU
 router, top-k, shared-expert MLP, union, and miscellaneous setup through the
 first CUDA-tier branch. The component fields partition that measured prelude.
 `late_join_hideable_upper_s` sums `min(join wait, prelude)` per opportunity.
 It is a counterfactual upper estimate, **not** elapsed time saved: concurrent
-uploads could slow the prelude. No upload is left in flight through it today.
+uploads could slow the prelude. With late join enabled, these two old-estimate
+fields remain zero; the measured prelude fields reflect CPU work with the
+outstanding batch. `[glm53-cuda-late-join-actual]` reports the effective switch,
+actual late joins, caller-blocked wait at their barrier, and whether all workers
+were already complete. `late_join_hidden_s` / `prelude_inflight_s` are the same
+union of worker-active intervals clipped to the CPU prelude; router, top-k,
+shared, and union `*_inflight_s` clip that union to each substage. They do not
+sum worker durations or imply an equal end-to-end wall-time saving.
 `[glm53-cuda-decode-profile]` reports decode-only deltas for the named phase,
 promotion, and KDA/MLA substage timers. It snapshots each explicit decode
 forward separately, so prefill before or between decode calls is excluded.

@@ -2805,16 +2805,20 @@ static int g53_scale_audit_cli(const char *dir, int audit, int scan_all) {
 static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                       int tokens, float *out) {
 #ifdef COLI_CUDA
+    const int late_join = m->cuda.promote_late_join && m->cuda.promotion_flight &&
+                          m->cuda.decode_call && tokens == 1 &&
+                          index >= m->c.first_dense && m->streaming;
     const int late_opportunity = m->cuda.profile.clock && m->cuda.promotion_flight &&
                                  tokens == 1 && index >= m->c.first_dense && m->streaming;
     const double join_before = late_opportunity ? m->cuda.profile.deferred_join_wait_s : 0;
-    /* The preceding layer's uploads may run through CPU mHC/attention, but
-     * no FFN may inspect residency or failure before ordered publication. */
-    g53_cuda_join_pending(&m->cuda, G53_JOIN_NEXT_FFN);
-    const double late_wait = late_opportunity ?
+    /* Default and all non-eligible calls retain the entry barrier. */
+    if (!late_join) g53_cuda_join_pending(&m->cuda, G53_JOIN_NEXT_FFN);
+    double late_wait = late_opportunity ?
         m->cuda.profile.deferred_join_wait_s - join_before : 0;
     const double late_start = late_opportunity ? now_s() : 0;
     double late_router = 0, late_topk = 0, late_shared = 0, late_union = 0;
+    double router_begin = 0, router_end = 0, topk_begin = 0, topk_end = 0;
+    double shared_begin = 0, shared_end = 0, union_begin = 0, union_end = 0;
 #endif
     const Cfg *c = &m->c;
     const int wide = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
@@ -2840,6 +2844,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         const float *row = x + (size_t)t * c->hidden;
 #ifdef COLI_CUDA
         const double score_start = late_opportunity ? now_s() : 0;
+        if (late_join && late_opportunity) router_begin = score_start;
 #endif
         for (int e = 0; e < c->n_experts; e++) {
             const float *w = l->router + (size_t)e * c->hidden;
@@ -2848,8 +2853,14 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             score[e] = sigmoidf_(sum);
         }
 #ifdef COLI_CUDA
-        if (late_opportunity) late_router += now_s() - score_start;
+        if (late_opportunity) {
+            router_end = now_s(); late_router += router_end - score_start;
+        }
+#ifdef GLM53_CUDA_TEST_HOOK
+        glm53_cuda_test_ffn_prelude_stage(&m->cuda, 0); /* router */
+#endif
         const double topk_start = late_opportunity ? now_s() : 0;
+        if (late_join && late_opportunity) topk_begin = topk_start;
 #endif
         /* la selezione usa score+bias, il PESO usa lo score puro: la
          * distinzione e' sottile e sbagliarla cambia quali esperti contano
@@ -2872,7 +2883,12 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         for (int k = 0; k < topk; k++)
             mine_w[k] = mine_w[k] / (total + 1e-20f) * c->routed_scale;
 #ifdef COLI_CUDA
-        if (late_opportunity) late_topk += now_s() - topk_start;
+        if (late_opportunity) {
+            topk_end = now_s(); late_topk += topk_end - topk_start;
+        }
+#ifdef GLM53_CUDA_TEST_HOOK
+        glm53_cuda_test_ffn_prelude_stage(&m->cuda, 1); /* top-k */
+#endif
 #endif
 
         /* Record the exact experts and post-normalisation gates applied by
@@ -2899,12 +2915,18 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     /* l'esperto condiviso e' sempre attivo e non passa dalla cache */
 #ifdef COLI_CUDA
     const double shared_start = late_opportunity ? now_s() : 0;
+    if (late_join && late_opportunity) shared_begin = shared_start;
 #endif
     for (int t = 0; t < tokens; t++)
         mlp3(out + (size_t)t * c->hidden, x + (size_t)t * c->hidden,
              &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
 #ifdef COLI_CUDA
-    if (late_opportunity) late_shared = now_s() - shared_start;
+    if (late_opportunity) {
+        shared_end = now_s(); late_shared = shared_end - shared_start;
+    }
+#ifdef GLM53_CUDA_TEST_HOOK
+    glm53_cuda_test_ffn_prelude_stage(&m->cuda, 2); /* shared expert */
+#endif
 #endif
 
     if (!m->streaming) {
@@ -2924,6 +2946,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     /* unione dei distinti, nell'ordine in cui compaiono */
 #ifdef COLI_CUDA
     const double union_start = late_opportunity ? now_s() : 0;
+    if (late_join && late_opportunity) union_begin = union_start;
 #endif
     int *union_ids = malloc((size_t)tokens * topk * sizeof(int));
     int n_union = 0;
@@ -2935,9 +2958,32 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     }
 
 #ifdef COLI_CUDA
+    const double prelude_end = late_opportunity ? now_s() : 0;
     if (late_opportunity) {
-        late_union = now_s() - union_start;
-        g53_cuda_profile_late_join(&m->cuda, late_wait, now_s() - late_start,
+        union_end = prelude_end; late_union = union_end - union_start;
+    }
+#ifdef GLM53_CUDA_TEST_HOOK
+    glm53_cuda_test_ffn_prelude_stage(&m->cuda, 3); /* union */
+#endif
+    if (late_join) {
+        /* CPU-only prelude is complete. Publish/fail before the first tier
+         * branch reads active, failed, residency, heat, or tensor handles. */
+        if (late_opportunity) m->cuda.late_window = (G53CudaLateWindow){
+            .armed = 1, .prelude_begin = late_start, .prelude_end = prelude_end,
+            .router_begin = router_begin, .router_end = router_end,
+            .topk_begin = topk_begin, .topk_end = topk_end,
+            .shared_begin = shared_begin, .shared_end = shared_end,
+            .union_begin = union_begin, .union_end = union_end,
+        };
+        g53_cuda_join_pending(&m->cuda, G53_JOIN_NEXT_FFN);
+        if (late_opportunity)
+            late_wait = m->cuda.profile.deferred_join_wait_s - join_before;
+    }
+#ifdef GLM53_CUDA_TEST_HOOK
+    glm53_cuda_test_ffn_prelude_stage(&m->cuda, 4); /* joined tier boundary */
+#endif
+    if (late_opportunity) {
+        g53_cuda_profile_late_join(&m->cuda, late_wait, prelude_end - late_start,
                                    late_router, late_topk, late_shared, late_union);
     }
     if (tokens == 1 && m->cuda.active && m->cuda.ndev > 1 &&

@@ -74,7 +74,17 @@ typedef struct {
     double late_join_prelude_s, late_join_current_wait_s, late_join_hideable_upper_s;
     double late_join_router_s, late_join_topk_s, late_join_shared_s;
     double late_join_union_s, late_join_misc_s;
+    uint64_t late_join_actual_opportunities, late_join_already_complete;
+    double late_join_join_wait_s, late_join_hidden_s;
+    double late_join_router_inflight_s, late_join_topk_inflight_s;
+    double late_join_shared_inflight_s, late_join_union_inflight_s;
 } G53CudaProfile;
+typedef struct {
+    int armed;
+    double prelude_begin, prelude_end;
+    double router_begin, router_end, topk_begin, topk_end;
+    double shared_begin, shared_end, union_begin, union_end;
+} G53CudaLateWindow;
 struct G53Cuda {
     G53CudaExpert *experts;
     int device, D, I, ne, count, active, failed;
@@ -87,8 +97,10 @@ struct G53Cuda {
     uint64_t heat_min, heat_margin;
     int parallel_promote;
     int promote_overlap;
+    int promote_late_join;
     int decode_call;
     G53CudaPromotionFlight *promotion_flight;
+    G53CudaLateWindow late_window; /* model-thread-only profiling around the late barrier */
     unsigned resident;
     uint64_t executed, fallback, uploads, errors;
     G53CudaProfile profile;
@@ -107,9 +119,12 @@ static void g53_cuda_profile_late_join(G53Cuda *g, double wait, double prelude,
     G53CudaProfile *p = &g->profile;
     if (!p->clock) return;
     p->late_join_opportunities++;
-    p->late_join_current_wait_s += wait;
     p->late_join_prelude_s += prelude;
-    p->late_join_hideable_upper_s += wait < prelude ? wait : prelude;
+    /* The old entry-join estimate is only measurable when joining there. */
+    if (!g->promote_late_join) {
+        p->late_join_current_wait_s += wait;
+        p->late_join_hideable_upper_s += wait < prelude ? wait : prelude;
+    }
     p->late_join_router_s += router;
     p->late_join_topk_s += topk;
     p->late_join_shared_s += shared;
@@ -243,6 +258,14 @@ static void g53_cuda_profile_report(G53Cuda *g, const char *phase) {
             p->late_join_hideable_upper_s, p->late_join_router_s,
             p->late_join_topk_s, p->late_join_shared_s,
             p->late_join_union_s, p->late_join_misc_s);
+    fprintf(stderr, "[glm53-cuda-late-join-actual] phase=%s late_join_enabled=%d late_join_actual_opportunities=%llu late_join_join_wait_s=%.6f late_join_hidden_s=%.6f late_join_already_complete=%llu prelude_inflight_s=%.6f router_inflight_s=%.6f topk_inflight_s=%.6f shared_inflight_s=%.6f union_inflight_s=%.6f\n",
+            phase, g->promote_late_join,
+            (unsigned long long)p->late_join_actual_opportunities,
+            p->late_join_join_wait_s, p->late_join_hidden_s,
+            (unsigned long long)p->late_join_already_complete,
+            p->late_join_hidden_s, p->late_join_router_inflight_s,
+            p->late_join_topk_inflight_s, p->late_join_shared_inflight_s,
+            p->late_join_union_inflight_s);
     fprintf(stderr, "[glm53-cuda-promotion-flush] phase=%s flush_end_boundary=%llu flush_owner_busy=%llu flush_capacity_or_eviction=%llu flush_batch_full=%llu flush_failure_or_disabled=%llu flush_staging_failure=%llu flush_other_serial=%llu heat_noop_passthrough=%llu\n",
             phase, (unsigned long long)p->flush_end_boundary,
             (unsigned long long)p->flush_owner_busy,
@@ -418,6 +441,8 @@ static void g53_cuda_init(G53Cuda *g, int nl, int ne, int D, int I, int streamin
                           !strcmp(getenv("GLM53_CUDA_PARALLEL_PROMOTE"), "1");
     g->promote_overlap = g->parallel_promote && getenv("GLM53_CUDA_PROMOTE_OVERLAP") &&
                          !strcmp(getenv("GLM53_CUDA_PROMOTE_OVERLAP"), "1");
+    g->promote_late_join = g->promote_overlap && getenv("GLM53_CUDA_PROMOTE_LATE_JOIN") &&
+                           !strcmp(getenv("GLM53_CUDA_PROMOTE_LATE_JOIN"), "1");
     fprintf(stderr, "[glm53-cuda] device=%d budget_bytes=%zu gs=64 host_clamp=1 group_clamp=%d heat_min=%llu heat_margin=%llu devices=",
             g->device, g->budget, g->ndev > 1,
             (unsigned long long)g->heat_min, (unsigned long long)g->heat_margin);
@@ -426,8 +451,8 @@ static void g53_cuda_init(G53Cuda *g, int nl, int ne, int D, int I, int streamin
                 g->capacity[i] < g->budget ? g->capacity[i] : g->budget,
                 (g->capacity[i] < g->budget ? g->capacity[i] : g->budget) / g->expert_bytes);
     fputc('\n', stderr);
-    fprintf(stderr, "[glm53-cuda] parallel_promotion=%d promotion_overlap=%d\n",
-            g->parallel_promote, g->promote_overlap);
+    fprintf(stderr, "[glm53-cuda] parallel_promotion=%d promotion_overlap=%d promotion_late_join=%d\n",
+            g->parallel_promote, g->promote_overlap, g->promote_late_join);
     g53_cuda_stats(g);
 }
 /* Called once per routed expert union, with its actual selected-row count. */
@@ -721,6 +746,33 @@ static void g53_cuda_batch_finish(G53Cuda *g, G53CudaPromotionBatch *b,
 static void g53_cuda_batch_flush(G53Cuda *g, G53CudaPromotionBatch *b) {
     g53_cuda_batch_flush_reason(g, b, G53_FLUSH_END_BOUNDARY);
 }
+/* Union of worker-active intervals, clipped to a model-thread CPU interval.
+ * Called only after pthread_join, when every task timestamp is published. */
+static double g53_cuda_worker_overlap(const G53CudaPromotionFlight *f,
+                                      double from, double to) {
+    if (to <= from) return 0;
+    double starts[COLI_CUDA_MAX_DEVICES], ends[COLI_CUDA_MAX_DEVICES];
+    int n = 0;
+    for (int i = 0; i < f->batch.n; i++) {
+        const G53CudaPromotionTask *t = &f->batch.task[i];
+        double start = t->dispatched + t->start_wait, end = t->completed;
+        if (start < from) start = from;
+        if (end > to) end = to;
+        if (end <= start) continue;
+        int j = n++;
+        while (j && starts[j-1] > start) {
+            starts[j] = starts[j-1]; ends[j] = ends[j-1]; j--;
+        }
+        starts[j] = start; ends[j] = end;
+    }
+    double overlap = 0, until = from;
+    for (int i = 0; i < n; i++) {
+        double begin = starts[i] > until ? starts[i] : until;
+        if (ends[i] > begin) overlap += ends[i] - begin;
+        if (ends[i] > until) until = ends[i];
+    }
+    return overlap;
+}
 static void g53_cuda_join_pending(G53Cuda *g, int reason) {
     G53CudaPromotionFlight *f = g->promotion_flight;
     if (!f) return;
@@ -760,7 +812,24 @@ static void g53_cuda_join_pending(G53Cuda *g, int reason) {
             if (ends[i] > until) until = ends[i];
         }
         p->deferred_hidden_s += hidden;
+        if (g->late_window.armed && reason == G53_JOIN_NEXT_FFN) {
+            const G53CudaLateWindow *w = &g->late_window;
+            p->late_join_actual_opportunities++;
+            p->late_join_join_wait_s += wait;
+            p->late_join_already_complete += complete;
+            p->late_join_hidden_s += g53_cuda_worker_overlap(f, w->prelude_begin,
+                                                               w->prelude_end);
+            p->late_join_router_inflight_s += g53_cuda_worker_overlap(f, w->router_begin,
+                                                                         w->router_end);
+            p->late_join_topk_inflight_s += g53_cuda_worker_overlap(f, w->topk_begin,
+                                                                       w->topk_end);
+            p->late_join_shared_inflight_s += g53_cuda_worker_overlap(f, w->shared_begin,
+                                                                         w->shared_end);
+            p->late_join_union_inflight_s += g53_cuda_worker_overlap(f, w->union_begin,
+                                                                        w->union_end);
+        }
     }
+    g->late_window.armed = 0;
     g->promotion_flight = NULL;
     g53_cuda_batch_finish(g, &f->batch, f->dispatched, joined,
                           wait, dispatch + wait);
