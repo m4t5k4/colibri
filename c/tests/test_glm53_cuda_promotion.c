@@ -79,6 +79,97 @@ int main(void) {
     g53_cuda_close(&g);
     fake_upload_delay = 0;
 
+    /* Deferred end boundary: private uploads run during CPU-only work, with
+     * no residency or policy publication until the mandatory join. */
+    setenv("GLM53_CUDA_PROMOTE_OVERLAP", "1", 1);
+    g53_cuda_init(&g, 2, 4, D, I, 1);
+    g53_cuda_profile_enable(&g, test_clock);
+    assert(g.promote_overlap);
+    fake_upload_delay = 1;
+    for (int e = 0; e < 2; e++) {
+        g53_cuda_heat(&g, 0, e, 2);
+        g53_cuda_promote_batched(&g, &batch, 0, e, e ? other : pieces);
+    }
+    /* A two-device full batch was synchronous, so use a three-device tier
+     * below for a genuinely deferred two-task end batch. */
+    assert(!batch.n && !g.promotion_flight);
+    g53_cuda_close(&g);
+    select_devices("0,1,2");
+    g53_cuda_init(&g, 2, 4, D, I, 1);
+    g53_cuda_profile_enable(&g, test_clock);
+    for (int e = 0; e < 2; e++) {
+        g53_cuda_heat(&g, 0, e, 2);
+        g53_cuda_promote_batched(&g, &batch, 0, e, e ? other : pieces);
+    }
+    g53_cuda_batch_dispatch_end(&g, &batch);
+    assert(!batch.n && g.promotion_flight && !g.resident && !g.uploads);
+    weights[0][0] ^= 0xff; /* reusable host slot changes during upload */
+    double cpu_until = test_clock() + 0.008;
+    while (test_clock() < cpu_until) { } /* deterministic CPU-only attention stand-in */
+    weights[0][0] = saved_weight;
+    assert(g.promotion_flight && !g.experts[0].w[0] && !g.experts[1].w[0]);
+    g53_cuda_join_pending(&g, G53_JOIN_NEXT_FFN);
+    assert(!g.promotion_flight && g.uploads == 2 && g.resident == 2);
+    assert(g.experts[0].owner == 0 && g.experts[1].owner == 1);
+    assert(g.profile.deferred_end_batches == 1 && g.profile.deferred_end_experts == 2);
+    assert(g.profile.deferred_lifetime_s > g.profile.deferred_join_wait_s &&
+           g.profile.deferred_hidden_s > 0.004);
+    fprintf(stderr, "[glm53-overlap-test] lifetime_s=%.6f join_wait_s=%.6f hidden_s=%.6f\n",
+            g.profile.deferred_lifetime_s, g.profile.deferred_join_wait_s,
+            g.profile.deferred_hidden_s);
+    for (int e = 0; e < 2; e++) {
+        assert(g53_cuda_run(&g, 0, e, b, x, sg, su, 0.5f, clamp_ref));
+        for (int d = 0; d < D; d++) assert(a[e][d] == b[d]);
+    }
+    g53_cuda_heat(&g, 1, 0, 2);
+    g53_cuda_promote(&g, 1, 0, pieces);
+    assert(g.experts[4].owner == 2 && g.resident == 3); /* next-layer owner */
+    g53_cuda_close(&g);
+    fake_upload_delay = 0;
+    for (int failing = 0; failing < 2; failing++) {
+        memset(fake_device_upload_calls, 0, sizeof(fake_device_upload_calls));
+        fake_fail_upload_device = failing; fake_fail_upload_n = 1;
+        g53_cuda_init(&g, 2, 4, D, I, 1);
+        g53_cuda_profile_enable(&g, test_clock);
+        for (int e = 0; e < 2; e++) {
+            g53_cuda_heat(&g, 0, e, 2);
+            g53_cuda_promote_batched(&g, &batch, 0, e, pieces);
+        }
+        g53_cuda_batch_dispatch_end(&g, &batch);
+        assert(g.promotion_flight && !g.failed && !g.resident);
+        cpu_until = test_clock() + 0.002;
+        while (test_clock() < cpu_until) { }
+        assert(!g.failed); /* CPU-only work did not expose a worker fault. */
+        g53_cuda_join_pending(&g, G53_JOIN_NEXT_FFN);
+        assert(g.failed && g.errors == 1 && !g.promotion_flight);
+        assert(g.resident == (unsigned)failing && g.uploads == (uint64_t)failing);
+        assert(!g.experts[1].w[0] && live == 3 * failing);
+        assert(!g53_cuda_run(&g, 0, 0, b, x, sg, su, 0.5f, clamp_ref));
+        g53_cuda_close(&g); assert(!live && !fake_upload_active);
+    }
+    fake_fail_upload_device = -1;
+    g53_cuda_init(&g, 2, 4, D, I, 1);
+    for (int e = 0; e < 2; e++) {
+        g53_cuda_heat(&g, 0, e, 2);
+        g53_cuda_promote_batched(&g, &batch, 0, e, pieces);
+    }
+    g53_cuda_batch_dispatch_end(&g, &batch);
+    assert(g.promotion_flight && !g.resident);
+    g53_cuda_close(&g); /* joins before tensor/device teardown */
+    assert(!live && !fake_upload_active);
+    g53_cuda_init(&g, 2, 4, D, I, 1);
+    g53_cuda_profile_enable(&g, test_clock);
+    g53_cuda_heat(&g, 0, 0, 2);
+    g53_cuda_promote_batched(&g, &batch, 0, 0, pieces);
+    g53_cuda_batch_dispatch_end(&g, &batch);
+    assert(g.promotion_flight);
+    g53_cuda_profile_report(&g, "test");
+    assert(!g.promotion_flight && g.resident == 1 &&
+           g.profile.deferred_join_reason[G53_JOIN_PROFILE] == 1);
+    g53_cuda_close(&g);
+    select_devices("0,1");
+    unsetenv("GLM53_CUDA_PROMOTE_OVERLAP");
+
     /* A heat-ineligible attempt is a logical A event, but must leave the
      * independent device-0 upload queued for the device-1 candidate. */
     g53_cuda_init(&g, 1, 4, D, I, 1);
@@ -235,13 +326,15 @@ int main(void) {
     g53_cuda_close(&g);
     fake_fail_upload_device = -1;
 
+    setenv("GLM53_CUDA_PROMOTE_OVERLAP", "1", 1);
     select_devices("0");
     g53_cuda_init(&g, 1, 2, D, I, 1);
-    assert(!g.parallel_promote);
+    assert(!g.parallel_promote && !g.promote_overlap);
     g53_cuda_heat(&g, 0, 0, 2);
     g53_cuda_promote_batched(&g, &batch, 0, 0, pieces);
     assert(g.uploads == 1 && !batch.n);
     g53_cuda_close(&g);
+    unsetenv("GLM53_CUDA_PROMOTE_OVERLAP");
     puts("PASS GLM53 concurrent promotion planning, lifetime, failure, eviction, one-device fallback");
     return 0;
 }

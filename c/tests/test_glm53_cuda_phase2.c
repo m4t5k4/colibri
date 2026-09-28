@@ -178,6 +178,156 @@ static void case_integrated_heat_noop(void) {
     unsetenv("GLM53_CUDA_PARALLEL_PROMOTE");
     unsetenv("GLM53_CUDA_PROFILE");
 }
+static void case_integrated_overlap_barrier(void) {
+    FixtureModel f;
+    setenv("GLM53_CUDA_PARALLEL_PROMOTE", "1", 1);
+    setenv("GLM53_CUDA_PROMOTE_OVERLAP", "1", 1);
+    setenv("GLM53_CUDA_PROFILE", "1", 1);
+    model_fixture(&f, "0,1");
+    assert(f.m.cuda.promote_overlap);
+    /* Keep index 0 non-final so its singleton end batch may defer. The next
+     * FFN invocation is the mandatory barrier before any residency scan. */
+    f.m.layer_end = 2;
+    f.m.cuda.decode_call = 1;
+    float x[ORACLE_D], reference[ORACLE_D] = {0}, first[ORACLE_D] = {0}, got[ORACLE_D] = {0};
+    for (int d = 0; d < ORACLE_D; d++) x[d] = ((d * 7) % 19 - 9) * 0.09f;
+    ffn_layer(&f.m, &f.layer, 0, x, 1, reference);
+    g53_cuda_drop(&f.m.cuda, &f.m.cuda.experts[0]);
+    f.m.cuda.experts[2].heat = 0;
+    g53_cuda_profile_enable(&f.m.cuda, now_s);
+    ffn_layer(&f.m, &f.layer, 0, x, 1, first);
+    compare_projection("overlap first FFN vs serial", first, reference, ORACLE_D);
+    assert(f.m.cuda.promotion_flight && !f.m.cuda.experts[0].w[0]);
+    int before = (int)f.m.cuda.executed;
+    ffn_layer(&f.m, &f.layer, 0, x, 1, got);
+    compare_projection("overlap next FFN resident parity", got, reference, ORACLE_D);
+    assert(!f.m.cuda.promotion_flight && f.m.cuda.experts[0].w[0]);
+    assert(f.m.cuda.profile.deferred_join_reason[G53_JOIN_NEXT_FFN] == 1);
+    assert(f.m.cuda.executed > (uint64_t)before && !f.m.cuda.failed);
+    model_fixture_close(&f);
+    unsetenv("GLM53_CUDA_PARALLEL_PROMOTE");
+    unsetenv("GLM53_CUDA_PROMOTE_OVERLAP");
+    unsetenv("GLM53_CUDA_PROFILE");
+}
+static void case_integrated_overlap_failure(void) {
+    FixtureModel f;
+    setenv("GLM53_CUDA_PARALLEL_PROMOTE", "1", 1);
+    setenv("GLM53_CUDA_PROMOTE_OVERLAP", "1", 1);
+    model_fixture(&f, "0,1");
+    f.m.layer_end = 2;
+    f.m.cuda.decode_call = 1;
+    float x[ORACLE_D], reference[ORACLE_D] = {0}, first[ORACLE_D] = {0}, got[ORACLE_D] = {0};
+    for (int d = 0; d < ORACLE_D; d++) x[d] = ((d * 7) % 19 - 9) * 0.09f;
+    ffn_layer(&f.m, &f.layer, 0, x, 1, reference);
+    g53_cuda_drop(&f.m.cuda, &f.m.cuda.experts[0]);
+    f.m.cuda.experts[2].heat = 0;
+    memset(fake_device_upload_calls, 0, sizeof(fake_device_upload_calls));
+    fake_fail_upload_device = 0; fake_fail_upload_n = 1;
+    ffn_layer(&f.m, &f.layer, 0, x, 1, first);
+    assert(f.m.cuda.promotion_flight && !f.m.cuda.failed);
+    compare_projection("overlap before delayed failure", first, reference, ORACLE_D);
+    /* CPU-only work can finish, but the next FFN entry exposes the failure
+     * before any resident group can be issued. */
+    volatile float cpu_work = 0;
+    for (int i = 0; i < 10000; i++) cpu_work += x[i % ORACLE_D];
+    (void)cpu_work;
+    int issue_before = group_issue_calls;
+    ffn_layer(&f.m, &f.layer, 0, x, 1, got);
+    compare_projection("overlap delayed failure CPU fallback", got, reference, ORACLE_D);
+    assert(f.m.cuda.failed && f.m.cuda.errors == 1 && !f.m.cuda.promotion_flight);
+    assert(group_issue_calls == issue_before && !f.m.cuda.experts[0].w[0]);
+    assert(f.m.cuda.fallback >= 3 && !fake_upload_active);
+    fake_fail_upload_device = -1;
+    model_fixture_close(&f);
+    unsetenv("GLM53_CUDA_PARALLEL_PROMOTE");
+    unsetenv("GLM53_CUDA_PROMOTE_OVERLAP");
+}
+static void case_overlap_prefill_and_final_sync(void) {
+    FixtureModel f;
+    setenv("GLM53_CUDA_PARALLEL_PROMOTE", "1", 1);
+    setenv("GLM53_CUDA_PROMOTE_OVERLAP", "1", 1);
+    model_fixture(&f, "0,1");
+    float x[2 * ORACLE_D], out[2 * ORACLE_D] = {0};
+    for (int d = 0; d < 2 * ORACLE_D; d++) x[d] = ((d * 7) % 19 - 9) * 0.09f;
+    g53_cuda_drop(&f.m.cuda, &f.m.cuda.experts[0]);
+    f.m.cuda.experts[2].heat = 0;
+    f.m.cuda.decode_call = 1;
+    ffn_layer(&f.m, &f.layer, 0, x, 1, out); /* final owned layer */
+    assert(!f.m.cuda.promotion_flight && f.m.cuda.experts[0].w[0]);
+    g53_cuda_drop(&f.m.cuda, &f.m.cuda.experts[0]);
+    f.m.layer_end = 2;
+    f.m.cuda.decode_call = 0;
+    ffn_layer(&f.m, &f.layer, 0, x, 1, out); /* one-token prefill */
+    assert(!f.m.cuda.promotion_flight && f.m.cuda.experts[0].w[0]);
+    g53_cuda_drop(&f.m.cuda, &f.m.cuda.experts[0]);
+    ffn_layer(&f.m, &f.layer, 0, x, 2, out); /* generic prefill */
+    assert(!f.m.cuda.promotion_flight);
+    model_fixture_close(&f);
+    unsetenv("GLM53_CUDA_PARALLEL_PROMOTE");
+    unsetenv("GLM53_CUDA_PROMOTE_OVERLAP");
+}
+typedef struct {
+    float out[ORACLE_D];
+    uint64_t executed, fallback, uploads, evictions, heat[ORACLE_EXPERTS];
+    unsigned resident;
+    int owner[ORACLE_EXPERTS];
+    G53CudaLayerCache cache;
+    char trace[4096];
+} OverlapSnapshot;
+static OverlapSnapshot overlap_snapshot(int enabled) {
+    FixtureModel f;
+    setenv("GLM53_CUDA_PARALLEL_PROMOTE", "1", 1);
+    setenv("GLM53_CUDA_PROMOTE_OVERLAP", enabled ? "1" : "0", 1);
+    setenv("GLM53_CUDA_PROFILE", "1", 1);
+    model_fixture(&f, "0,1");
+    f.m.layer_end = 2;
+    f.m.cuda.decode_call = 1;
+    g53_cuda_drop(&f.m.cuda, &f.m.cuda.experts[0]);
+    f.m.cuda.experts[2].heat = 0;
+    g53_cuda_profile_enable(&f.m.cuda, now_s);
+    f.m.cuda.profile.selection_trace = tmpfile();
+    assert(f.m.cuda.profile.selection_trace);
+    float x[ORACLE_D], first[ORACLE_D] = {0};
+    for (int d = 0; d < ORACLE_D; d++) x[d] = ((d * 7) % 19 - 9) * 0.09f;
+    ffn_layer(&f.m, &f.layer, 0, x, 1, first);
+    OverlapSnapshot s = {0};
+    ffn_layer(&f.m, &f.layer, 0, x, 1, s.out);
+    g53_cuda_join_pending(&f.m.cuda, G53_JOIN_PROFILE);
+    s.executed = f.m.cuda.executed; s.fallback = f.m.cuda.fallback;
+    s.uploads = f.m.cuda.uploads; s.evictions = f.m.cuda.profile.evictions;
+    s.resident = f.m.cuda.resident; s.cache = f.m.cuda.profile.cache_layer[0];
+    for (int e = 0; e < ORACLE_EXPERTS; e++) {
+        s.heat[e] = f.m.cuda.experts[e].heat;
+        s.owner[e] = f.m.cuda.experts[e].w[0] ? f.m.cuda.experts[e].owner : -1;
+    }
+    fflush(f.m.cuda.profile.selection_trace);
+    rewind(f.m.cuda.profile.selection_trace);
+    char line[256]; size_t at = 0;
+    while (fgets(line, sizeof(line), f.m.cuda.profile.selection_trace))
+        if (line[0] == 'S' || line[0] == 'A' || line[0] == 'P' || line[0] == 'E') {
+            size_t n = strlen(line);
+            assert(at + n < sizeof(s.trace));
+            memcpy(s.trace + at, line, n); at += n;
+        }
+    model_fixture_close(&f);
+    unsetenv("GLM53_CUDA_PARALLEL_PROMOTE");
+    unsetenv("GLM53_CUDA_PROMOTE_OVERLAP");
+    unsetenv("GLM53_CUDA_PROFILE");
+    return s;
+}
+static void case_overlap_exact_counters_and_trace(void) {
+    OverlapSnapshot serial = overlap_snapshot(0);
+    OverlapSnapshot deferred = overlap_snapshot(1);
+    compare_projection("overlap OFF/ON exact output", serial.out, deferred.out, ORACLE_D);
+    assert(!memcmp(serial.out, deferred.out, sizeof(serial.out)));
+    assert(serial.executed == deferred.executed && serial.fallback == deferred.fallback &&
+           serial.uploads == deferred.uploads && serial.evictions == deferred.evictions &&
+           serial.resident == deferred.resident);
+    assert(!memcmp(serial.heat, deferred.heat, sizeof(serial.heat)) &&
+           !memcmp(serial.owner, deferred.owner, sizeof(serial.owner)));
+    assert(!memcmp(&serial.cache, &deferred.cache, sizeof(serial.cache)));
+    assert(!strcmp(serial.trace, deferred.trace));
+}
 static void case_diagnostic_value_types(void) {
     const float values[] = {1.5f, NAN, INFINITY, -INFINITY, -2.0f};
     G53DiagValues s = g53_diag_values(values, sizeof(values) / sizeof(values[0]));
@@ -242,6 +392,10 @@ int main(void) {
     case_shutdown_pending();
     case_integrated_parallel_fill();
     case_integrated_heat_noop();
+    case_integrated_overlap_barrier();
+    case_integrated_overlap_failure();
+    case_overlap_prefill_and_final_sync();
+    case_overlap_exact_counters_and_trace();
     puts("PASS GLM53 phase-2 groups: completion order, misses, failure, eviction, teardown");
     return 0;
 }

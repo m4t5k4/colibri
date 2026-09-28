@@ -2529,6 +2529,7 @@ static int g53_cuda_ffn_grouped(GModel *m, const GLayer *l, int index,
                                 const int *chosen, const float *weight,
                                 float *sg, float *su) {
     G53Cuda *g = &m->cuda;
+    g53_cuda_join_pending(g, G53_JOIN_NEXT_FFN);
     const Cfg *c = &m->c;
     if (!g->active || g->failed || g->ndev < 2 || n_union < 1 || n_union > 8 ||
         !isfinite(c->swiglu_limit) || c->swiglu_limit <= 0)
@@ -2677,7 +2678,9 @@ static int g53_cuda_ffn_grouped(GModel *m, const GLayer *l, int index,
         if (!slot) slot = expert_slot(m, index, union_ids[i]);
         g53_cuda_promote_batched(g, &promotions, index, union_ids[i], slot->piece);
     }
-    g53_cuda_batch_flush(g, &promotions);
+    if (g->promote_overlap && g->decode_call && index != m->layer_end - 1)
+        g53_cuda_batch_dispatch_end(g, &promotions);
+    else g53_cuda_batch_flush(g, &promotions);
     for (int di = 0; di < g->ndev; di++) free(group[di].input);
     free(result);
     return 1;
@@ -2727,6 +2730,11 @@ static int g53_scale_audit_cli(const char *dir, int audit, int scan_all) {
  * serve a piu' token del blocco si legge una volta sola. */
 static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                       int tokens, float *out) {
+#ifdef COLI_CUDA
+    /* The preceding layer's uploads may run through CPU mHC/attention, but
+     * no FFN may inspect residency or failure before ordered publication. */
+    g53_cuda_join_pending(&m->cuda, G53_JOIN_NEXT_FFN);
+#endif
     const Cfg *c = &m->c;
     const int wide = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
 
@@ -3602,6 +3610,9 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
 
     streams = run_layers(m, s, streams, next, n, start,
                          m->layer_begin, m->layer_end);
+#ifdef COLI_CUDA
+    g53_cuda_join_pending(&m->cuda, G53_JOIN_PROFILE);
+#endif
 
     float *collapsed = malloc((size_t)n * D * sizeof(float));
     float *normed = malloc((size_t)n * D * sizeof(float));
@@ -3661,11 +3672,13 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
  * Timing covers forward_span, excluding sampling, text output and this report. */
 static float *forward_decode(GModel *m, GSession *s, const int *token) {
 #ifdef COLI_CUDA
+    m->cuda.decode_call = 1;
     if (m->cuda.profile.clock) m->cuda.profile.decode = 1;
 #endif
     float *logits = forward_span(m, s, token, 1, NULL, 0);
 #ifdef COLI_CUDA
     if (m->cuda.profile.clock) m->cuda.profile.decode = 0;
+    m->cuda.decode_call = 0;
 #endif
     return logits;
 }

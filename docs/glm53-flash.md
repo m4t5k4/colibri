@@ -149,6 +149,16 @@ then publishes in logical order. An eviction boundary drains the batch and
 uses the unchanged serial victim path. A worker failure drains the batch and
 enables the existing model-wide host fallback. Single-device runs remain serial.
 
+`GLM53_CUDA_PROMOTE_OVERLAP=1` is a separate opt-in (default off) and only
+applies when parallel promotion is enabled. An eviction-free, non-full batch
+at the end of a grouped one-token **decode** FFN starts its upload workers but keeps the
+tensors unpublished while the model computes CPU mHC and KDA/MLA work. The
+model joins before the next FFN reads CUDA residency or failure state. Final
+owned layers, prefill, full batches, eviction/owner boundaries, and serial
+replacements still join immediately. Teardown also joins before freeing CUDA
+state. Even a one-token prefill chunk stays synchronous. No CUDA attention or
+dense operation is overlapped by this path.
+
 `CUDA_EXPERT_GB` is a total decimal-GB cap across all selected devices, or
 `auto` (default): the sum of free VRAM minus 2 GB of runtime headroom on each
 device, floored at zero per device. A numeric cap is clamped to that total;
@@ -247,6 +257,18 @@ all batches, rather than counting distinct devices across the run.
 not total evictions; `flush_capacity_or_eviction` gives the same drain count.
 The inactive/failed fast path does not drain a batch in the current call graph,
 so `flush_failure_or_disabled` normally stays zero.
+`[glm53-cuda-promotion-overlap]` reports deferred end batches/experts,
+caller dispatch time, dispatch-to-join lifetime, mandatory join wait, and
+hidden time measured as the union of worker-active intervals overlapping
+CPU-only work after dispatch and before the mandatory join. It excludes idle
+gaps and does not sum concurrent workers.
+`deferred_already_complete_at_join` samples whether every worker had finished
+before the barrier; `join_next_ffn` and the `forced_*` fields identify barrier
+reasons. Per-device worker active time remains in the existing device lines.
+With overlap enabled, `promotion_s` counts caller-blocked planning, dispatch,
+serial work, and join time; `batch_wall_s` includes deferred dispatch-to-join
+lifetimes and can overlap attention time. Neither should be summed with other
+phase timings as an exclusive elapsed interval.
 
 At shutdown, profiling also prints `[glm53-cuda-cache]` totals and a
 `[glm53-cuda-cache-layer]` row for each selected sparse layer: resident

@@ -16,6 +16,14 @@
 #include <limits.h>
 #include <errno.h>
 #include <stdint.h>
+#include <pthread.h>
+
+typedef struct G53CudaPromotionFlight G53CudaPromotionFlight;
+typedef struct G53Cuda G53Cuda;
+static void g53_cuda_join_pending(G53Cuda *g, int reason);
+enum { G53_JOIN_NEXT_FFN, G53_JOIN_LAST_LAYER, G53_JOIN_PROFILE,
+       G53_JOIN_CLOSE, G53_JOIN_BEFORE_DISPATCH, G53_JOIN_POLICY_OR_DROP,
+       G53_JOIN_REASONS };
 
 typedef struct {
     ColiCudaTensor *w[3];
@@ -56,11 +64,14 @@ typedef struct {
     uint64_t flush_batch_full, flush_failure_or_disabled, flush_staging_failure;
     uint64_t flush_other_serial;
     uint64_t heat_noop_passthrough, batch_size_hist[COLI_CUDA_MAX_DEVICES + 1];
+    uint64_t deferred_end_batches, deferred_end_experts, deferred_already_complete_at_join;
+    uint64_t deferred_join_reason[G53_JOIN_REASONS];
+    double deferred_dispatch_s, deferred_lifetime_s, deferred_join_wait_s, deferred_hidden_s;
     double promotion_plan_s, promotion_dispatch_wait_s, promotion_join_s;
     double promotion_batch_wall_s, promotion_worker_s[COLI_CUDA_MAX_DEVICES];
     double promotion_expert_upload_min_s, promotion_expert_upload_max_s;
 } G53CudaProfile;
-typedef struct {
+struct G53Cuda {
     G53CudaExpert *experts;
     int device, D, I, ne, count, active, failed;
     int ndev, devices[COLI_CUDA_MAX_DEVICES];
@@ -71,10 +82,13 @@ typedef struct {
     size_t budget, bytes, expert_bytes;
     uint64_t heat_min, heat_margin;
     int parallel_promote;
+    int promote_overlap;
+    int decode_call;
+    G53CudaPromotionFlight *promotion_flight;
     unsigned resident;
     uint64_t executed, fallback, uploads, errors;
     G53CudaProfile profile;
-} G53Cuda;
+};
 
 static double g53_cuda_profile_now(const G53Cuda *g) {
     return g->profile.clock ? g->profile.clock() : 0;
@@ -151,7 +165,8 @@ static void g53_cuda_cache_report(const G53Cuda *g) {
                 s->evictions ? (double)s->victim_heat_sum / s->evictions : 0);
     }
 }
-static void g53_cuda_profile_report(const G53Cuda *g, const char *phase) {
+static void g53_cuda_profile_report(G53Cuda *g, const char *phase) {
+    g53_cuda_join_pending(g, G53_JOIN_PROFILE);
     const G53CudaProfile *p = &g->profile;
     if (!p->clock) return;
     int full = g->expert_bytes && g->budget >= g->expert_bytes &&
@@ -190,6 +205,17 @@ static void g53_cuda_profile_report(const G53Cuda *g, const char *phase) {
             p->promotion_plan_s, p->promotion_dispatch_wait_s, p->promotion_join_s,
             p->promotion_batch_wall_s, p->seconds[G53_UPLOAD],
             p->promotion_expert_upload_min_s, p->promotion_expert_upload_max_s);
+    fprintf(stderr, "[glm53-cuda-promotion-overlap] phase=%s deferred_end_batches=%llu deferred_end_experts=%llu deferred_dispatch_s=%.6f deferred_lifetime_s=%.6f deferred_join_wait_s=%.6f deferred_hidden_s=%.6f deferred_already_complete_at_join=%llu join_next_ffn=%llu forced_last_layer=%llu forced_profile=%llu forced_close=%llu forced_before_dispatch=%llu forced_policy_or_drop=%llu\n",
+            phase, (unsigned long long)p->deferred_end_batches,
+            (unsigned long long)p->deferred_end_experts, p->deferred_dispatch_s,
+            p->deferred_lifetime_s, p->deferred_join_wait_s, p->deferred_hidden_s,
+            (unsigned long long)p->deferred_already_complete_at_join,
+            (unsigned long long)p->deferred_join_reason[G53_JOIN_NEXT_FFN],
+            (unsigned long long)p->deferred_join_reason[G53_JOIN_LAST_LAYER],
+            (unsigned long long)p->deferred_join_reason[G53_JOIN_PROFILE],
+            (unsigned long long)p->deferred_join_reason[G53_JOIN_CLOSE],
+            (unsigned long long)p->deferred_join_reason[G53_JOIN_BEFORE_DISPATCH],
+            (unsigned long long)p->deferred_join_reason[G53_JOIN_POLICY_OR_DROP]);
     fprintf(stderr, "[glm53-cuda-promotion-flush] phase=%s flush_end_boundary=%llu flush_owner_busy=%llu flush_capacity_or_eviction=%llu flush_batch_full=%llu flush_failure_or_disabled=%llu flush_staging_failure=%llu flush_other_serial=%llu heat_noop_passthrough=%llu\n",
             phase, (unsigned long long)p->flush_end_boundary,
             (unsigned long long)p->flush_owner_busy,
@@ -208,7 +234,8 @@ static void g53_cuda_profile_report(const G53Cuda *g, const char *phase) {
                 phase, g->devices[i], p->promotion_worker_s[i]);
 }
 
-static void g53_cuda_stats(const G53Cuda *g) {
+static void g53_cuda_stats(G53Cuda *g) {
+    g53_cuda_join_pending(g, G53_JOIN_PROFILE);
     if (g->active) fprintf(stderr,
         "[glm53-cuda] resident=%u vram_bytes=%zu executed=%llu fallback=%llu uploads=%llu errors=%llu\n",
         g->resident, g->bytes, (unsigned long long)g->executed,
@@ -216,6 +243,7 @@ static void g53_cuda_stats(const G53Cuda *g) {
         (unsigned long long)g->errors);
 }
 static void g53_cuda_drop(G53Cuda *g, G53CudaExpert *e) {
+    g53_cuda_join_pending(g, G53_JOIN_POLICY_OR_DROP);
     if (!e->w[0]) return;
     if (g->group_pending[e->owner]) {
         /* Defensive lifetime guard. The FFN path normally drains before it
@@ -238,6 +266,7 @@ static void g53_cuda_drop(G53Cuda *g, G53CudaExpert *e) {
 }
 static void g53_cuda_device_stats(const G53Cuda *g);
 static void g53_cuda_close(G53Cuda *g) {
+    g53_cuda_join_pending(g, G53_JOIN_CLOSE);
     if (!g->active) return;
     for (int i = 0; i < g->ndev; i++) if (g->group_pending[i]) {
         const float *result = coli_cuda_expert_group_take(g->devices[i]);
@@ -360,6 +389,8 @@ static void g53_cuda_init(G53Cuda *g, int nl, int ne, int D, int I, int streamin
     g->active = 1;
     g->parallel_promote = g->ndev > 1 && getenv("GLM53_CUDA_PARALLEL_PROMOTE") &&
                           !strcmp(getenv("GLM53_CUDA_PARALLEL_PROMOTE"), "1");
+    g->promote_overlap = g->parallel_promote && getenv("GLM53_CUDA_PROMOTE_OVERLAP") &&
+                         !strcmp(getenv("GLM53_CUDA_PROMOTE_OVERLAP"), "1");
     fprintf(stderr, "[glm53-cuda] device=%d budget_bytes=%zu gs=64 host_clamp=1 group_clamp=%d heat_min=%llu heat_margin=%llu devices=",
             g->device, g->budget, g->ndev > 1,
             (unsigned long long)g->heat_min, (unsigned long long)g->heat_margin);
@@ -368,11 +399,13 @@ static void g53_cuda_init(G53Cuda *g, int nl, int ne, int D, int I, int streamin
                 g->capacity[i] < g->budget ? g->capacity[i] : g->budget,
                 (g->capacity[i] < g->budget ? g->capacity[i] : g->budget) / g->expert_bytes);
     fputc('\n', stderr);
-    fprintf(stderr, "[glm53-cuda] parallel_promotion=%d\n", g->parallel_promote);
+    fprintf(stderr, "[glm53-cuda] parallel_promotion=%d promotion_overlap=%d\n",
+            g->parallel_promote, g->promote_overlap);
     g53_cuda_stats(g);
 }
 /* Called once per routed expert union, with its actual selected-row count. */
 static void g53_cuda_heat(G53Cuda *g, int layer, int eid, int rows) {
+    g53_cuda_join_pending(g, G53_JOIN_NEXT_FFN);
     if (!g->active) return;
     int index = layer * g->ne + eid;
     G53CudaExpert *e = &g->experts[index];
@@ -504,6 +537,7 @@ static void g53_cuda_promote_impl(G53Cuda *g, int layer, int eid, uint8_t *const
     g53_cuda_publish(g, layer, eid, owner, w);
 }
 static void g53_cuda_promote(G53Cuda *g, int layer, int eid, uint8_t *const *pieces) {
+    g53_cuda_join_pending(g, G53_JOIN_POLICY_OR_DROP);
     double start = g53_cuda_profile_now(g);
     uint64_t uploads_before = g->uploads, errors_before = g->errors;
     if (g->profile.selection_trace)
@@ -524,7 +558,7 @@ typedef struct {
     ColiCudaTensor *w[3];
     int ok, device, D, I;
     double (*clock)(void);
-    double dispatched, start_wait, active_s;
+    double dispatched, completed, start_wait, active_s;
 } G53CudaPromotionTask;
 typedef struct {
     G53CudaPromotionTask task[COLI_CUDA_MAX_DEVICES];
@@ -548,13 +582,31 @@ static void g53_cuda_upload_task(G53CudaPromotionTask *t) {
     if (!coli_cuda_tensor_upload_complete(t->device) && t->ok) {
         t->ok = 0; t->failed_k = 3;
     }
-    t->active_s = t->clock ? t->clock() - start : 0;
+    t->completed = t->clock ? t->clock() : 0;
+    t->active_s = t->clock ? t->completed - start : 0;
+}
+typedef struct { G53CudaPromotionFlight *flight; int index; } G53CudaWorkerArg;
+struct G53CudaPromotionFlight {
+    G53CudaPromotionBatch batch;
+    pthread_t worker[COLI_CUDA_MAX_DEVICES];
+    G53CudaWorkerArg arg[COLI_CUDA_MAX_DEVICES];
+    int started, finished;
+    double dispatched, dispatch_done;
+};
+static void *g53_cuda_upload_worker(void *arg) {
+    G53CudaWorkerArg *a = arg;
+    g53_cuda_upload_task(&a->flight->batch.task[a->index]);
+    __atomic_add_fetch(&a->flight->finished, 1, __ATOMIC_RELEASE);
+    return NULL;
 }
 typedef enum {
     G53_FLUSH_END_BOUNDARY, G53_FLUSH_OWNER_BUSY, G53_FLUSH_CAPACITY_OR_EVICTION,
     G53_FLUSH_BATCH_FULL, G53_FLUSH_FAILURE_OR_DISABLED, G53_FLUSH_STAGING_FAILURE,
     G53_FLUSH_OTHER_SERIAL
 } G53CudaFlushReason;
+static void g53_cuda_batch_finish(G53Cuda *g, G53CudaPromotionBatch *b,
+                                  double wall, double joined, double join_wait,
+                                  double blocked);
 static void g53_cuda_batch_flush_reason(G53Cuda *g, G53CudaPromotionBatch *b,
                                          G53CudaFlushReason reason) {
     if (!b->n) return;
@@ -585,6 +637,11 @@ static void g53_cuda_batch_flush_reason(G53Cuda *g, G53CudaPromotionBatch *b,
         for (int i = 0; i < b->n; i++) g53_cuda_upload_task(&b->task[i]);
     }
     double joined = g53_cuda_profile_now(g);
+    g53_cuda_batch_finish(g, b, wall, joined, joined - wall, joined - wall);
+}
+static void g53_cuda_batch_finish(G53Cuda *g, G53CudaPromotionBatch *b,
+                                  double wall, double joined, double join_wait,
+                                  double blocked) {
     if (g->profile.clock) {
         G53CudaProfile *p = &g->profile;
         p->promotion_batches++;
@@ -593,9 +650,9 @@ static void g53_cuda_batch_flush_reason(G53Cuda *g, G53CudaPromotionBatch *b,
         p->batch_devices += (uint64_t)b->n;
         if (b->n > 1) p->concurrent_promotions += (uint64_t)b->n;
         else p->serial_promotions++;
-        p->promotion_join_s += joined - wall;
+        p->promotion_join_s += join_wait;
         p->promotion_batch_wall_s += joined - wall;
-        p->seconds[G53_PROMOTION] += joined - wall;
+        p->seconds[G53_PROMOTION] += blocked;
         for (int i = 0; i < b->n; i++) {
             G53CudaPromotionTask *t = &b->task[i];
             p->promotion_dispatch_wait_s += t->start_wait;
@@ -637,6 +694,98 @@ static void g53_cuda_batch_flush_reason(G53Cuda *g, G53CudaPromotionBatch *b,
 static void g53_cuda_batch_flush(G53Cuda *g, G53CudaPromotionBatch *b) {
     g53_cuda_batch_flush_reason(g, b, G53_FLUSH_END_BOUNDARY);
 }
+static void g53_cuda_join_pending(G53Cuda *g, int reason) {
+    G53CudaPromotionFlight *f = g->promotion_flight;
+    if (!f) return;
+    double wait_start = g53_cuda_profile_now(g);
+    int complete = __atomic_load_n(&f->finished, __ATOMIC_ACQUIRE) == f->batch.n;
+    for (int i = 0; i < f->started; i++) pthread_join(f->worker[i], NULL);
+    double joined = g53_cuda_profile_now(g);
+    double wait = joined - wait_start;
+    double dispatch = f->dispatch_done - f->dispatched;
+    if (g->profile.clock) {
+        G53CudaProfile *p = &g->profile;
+        p->deferred_join_reason[reason]++;
+        p->deferred_already_complete_at_join += complete;
+        p->deferred_lifetime_s += joined - f->dispatched;
+        p->deferred_join_wait_s += wait;
+        /* Union of worker-active intervals clipped to caller CPU work. This
+         * excludes both join blocking and gaps where no upload was active. */
+        double starts[COLI_CUDA_MAX_DEVICES], ends[COLI_CUDA_MAX_DEVICES];
+        int intervals = 0;
+        for (int i = 0; i < f->batch.n; i++) {
+            G53CudaPromotionTask *t = &f->batch.task[i];
+            double start = t->dispatched + t->start_wait;
+            double end = t->completed;
+            if (start < f->dispatch_done) start = f->dispatch_done;
+            if (end > wait_start) end = wait_start;
+            if (end <= start) continue;
+            int j = intervals++;
+            while (j && starts[j-1] > start) {
+                starts[j] = starts[j-1]; ends[j] = ends[j-1]; j--;
+            }
+            starts[j] = start; ends[j] = end;
+        }
+        double hidden = 0, until = 0;
+        for (int i = 0; i < intervals; i++) {
+            double begin = starts[i] > until ? starts[i] : until;
+            if (ends[i] > begin) hidden += ends[i] - begin;
+            if (ends[i] > until) until = ends[i];
+        }
+        p->deferred_hidden_s += hidden;
+    }
+    g->promotion_flight = NULL;
+    g53_cuda_batch_finish(g, &f->batch, f->dispatched, joined,
+                          wait, dispatch + wait);
+    free(f);
+}
+/* Only the completed grouped decode FFN may use this path. Its planning and
+ * host copies are finished; no model/cache state is touched by a worker. */
+static void g53_cuda_batch_dispatch_end(G53Cuda *g, G53CudaPromotionBatch *b) {
+    if (!b->n) return;
+    g53_cuda_join_pending(g, G53_JOIN_BEFORE_DISPATCH);
+    if (!g->promote_overlap || g->failed || !g->active) {
+        g53_cuda_batch_flush(g, b); return;
+    }
+    if (b->n >= g->ndev) {
+        g53_cuda_batch_flush_reason(g, b, G53_FLUSH_BATCH_FULL); return;
+    }
+    G53CudaPromotionFlight *f = calloc(1, sizeof(*f));
+    if (!f) { g53_cuda_batch_flush(g, b); return; }
+    f->batch = *b;
+    memset(b, 0, sizeof(*b));
+    f->dispatched = g53_cuda_profile_now(g);
+    for (int i = 0; i < f->batch.n; i++) {
+        G53CudaPromotionTask *t = &f->batch.task[i];
+        t->clock = g->profile.clock;
+        t->dispatched = f->dispatched;
+        f->arg[i] = (G53CudaWorkerArg){f, i};
+        if (pthread_create(&f->worker[i], NULL, g53_cuda_upload_worker,
+                           &f->arg[i]) != 0) break;
+        f->started++;
+    }
+    f->dispatch_done = g53_cuda_profile_now(g);
+    if (f->started != f->batch.n) {
+        /* Thread creation refusal is a synchronous end-boundary fallback. */
+        for (int i = 0; i < f->started; i++) pthread_join(f->worker[i], NULL);
+        for (int i = f->started; i < f->batch.n; i++)
+            g53_cuda_upload_task(&f->batch.task[i]);
+        if (g->profile.clock) g->profile.flush_end_boundary++;
+        double done = g53_cuda_profile_now(g);
+        g53_cuda_batch_finish(g, &f->batch, f->dispatched, done,
+                              done - f->dispatched, done - f->dispatched);
+        free(f);
+        return;
+    }
+    g->promotion_flight = f;
+    if (g->profile.clock) {
+        G53CudaProfile *p = &g->profile;
+        p->flush_end_boundary++;
+        p->deferred_end_batches++;
+        p->deferred_end_experts += (uint64_t)f->batch.n;
+        p->deferred_dispatch_s += f->dispatch_done - f->dispatched;
+    }
+}
 static int g53_cuda_batch_owner(const G53Cuda *g, const G53CudaPromotionBatch *b) {
     int owner = -1;
     for (int i = 0; i < g->ndev; i++)
@@ -651,6 +800,7 @@ static void g53_cuda_batch_reset(const G53Cuda *g, G53CudaPromotionBatch *b) {
 }
 static void g53_cuda_promote_batched(G53Cuda *g, G53CudaPromotionBatch *b,
                                      int layer, int eid, uint8_t *const *pieces) {
+    g53_cuda_join_pending(g, G53_JOIN_POLICY_OR_DROP);
     if (!g->parallel_promote || g->failed || !g->active) {
         g53_cuda_promote(g, layer, eid, pieces); return;
     }
@@ -727,6 +877,7 @@ static int g53_cuda_profile_matmul(G53Cuda *g, G53CudaExpert *e, int k,
 static int g53_cuda_run(G53Cuda *g, int layer, int eid, float *y, const float *x,
                        float *sg, float *su, float limit,
                        void (*clamp)(float *, const float *, int, float)) {
+    g53_cuda_join_pending(g, G53_JOIN_NEXT_FFN);
     G53CudaExpert *e = &g->experts[layer * g->ne + eid];
     if (g->failed || !e->w[0]) return 0;
     int ok = g53_cuda_profile_matmul(g, e, 0, sg, x) &&
@@ -749,6 +900,7 @@ static int g53_cuda_run(G53Cuda *g, int layer, int eid, float *y, const float *x
 static int g53_cuda_group_issue(G53Cuda *g, int di, ColiCudaTensor *const *gate,
                                ColiCudaTensor *const *up, ColiCudaTensor *const *down,
                                const int *rows, int count, const float *x, float limit) {
+    g53_cuda_join_pending(g, G53_JOIN_NEXT_FFN);
     if (g->failed || g->group_pending[di]) return 0;
     double start = g53_cuda_profile_now(g);
     int ok = coli_cuda_expert_group_issue_clamped(gate, up, down, rows, count, x, limit);
