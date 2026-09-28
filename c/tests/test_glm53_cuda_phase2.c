@@ -198,11 +198,24 @@ static void case_integrated_overlap_barrier(void) {
     ffn_layer(&f.m, &f.layer, 0, x, 1, first);
     compare_projection("overlap first FFN vs serial", first, reference, ORACLE_D);
     assert(f.m.cuda.promotion_flight && !f.m.cuda.experts[0].w[0]);
+    assert(f.m.cuda.profile.late_join_opportunities == 0);
     int before = (int)f.m.cuda.executed;
     ffn_layer(&f.m, &f.layer, 0, x, 1, got);
     compare_projection("overlap next FFN resident parity", got, reference, ORACLE_D);
     assert(!f.m.cuda.promotion_flight && f.m.cuda.experts[0].w[0]);
     assert(f.m.cuda.profile.deferred_join_reason[G53_JOIN_NEXT_FFN] == 1);
+    assert(f.m.cuda.profile.late_join_opportunities == 1);
+    assert(f.m.cuda.profile.late_join_prelude_s > 0);
+    assert(f.m.cuda.profile.late_join_router_s > 0 &&
+           f.m.cuda.profile.late_join_topk_s > 0 &&
+           f.m.cuda.profile.late_join_shared_s > 0 &&
+           f.m.cuda.profile.late_join_union_s > 0);
+    assert(f.m.cuda.profile.late_join_current_wait_s ==
+           f.m.cuda.profile.deferred_join_wait_s);
+    assert(f.m.cuda.profile.late_join_hideable_upper_s <=
+           f.m.cuda.profile.late_join_current_wait_s &&
+           f.m.cuda.profile.late_join_hideable_upper_s <=
+           f.m.cuda.profile.late_join_prelude_s);
     assert(f.m.cuda.executed > (uint64_t)before && !f.m.cuda.failed);
     model_fixture_close(&f);
     unsetenv("GLM53_CUDA_PARALLEL_PROMOTE");
@@ -335,6 +348,40 @@ static void case_diagnostic_value_types(void) {
     assert(s.first_bad == 1 && isnan(s.first_value));
     assert(s.has_finite && s.min == -2.0f && s.max == 1.5f && s.max_abs == 2.0f);
 }
+static void case_decode_window_deltas(void) {
+    GModel m = {0};
+    G53CudaProfile *p = &m.cuda.profile;
+    p->clock = now_s;
+    m.t_disk = 20; m.t_attn = 30; m.t_ffn = 40; m.t_head = 50;
+    m.t_kda_qkv = 3; m.t_mla_score = 4;
+    p->seconds[G53_FALLBACK] = 2; p->seconds[G53_PROMOTION] = 5;
+    p->seconds[G53_GATE] = 1; p->promotion_plan_s = 6;
+    p->promotion_join_s = 7; p->deferred_join_wait_s = 8;
+    g53_decode_capture(&m, &m.decode_base); /* end of prefill */
+    m.t_disk += 3; m.t_attn += 4; m.t_ffn += 5; m.t_head += 6;
+    m.t_kda_qkv += 0.25; m.t_mla_score += 0.5;
+    p->seconds[G53_FALLBACK] += 7; p->seconds[G53_PROMOTION] += 8;
+    p->seconds[G53_GATE] += 1.5; p->promotion_plan_s += 2;
+    p->promotion_join_s += 3; p->deferred_join_wait_s += 1;
+    G53DecodeBase end;
+    g53_decode_capture(&m, &end);
+    g53_decode_accumulate(&m.decode_total, &end, &m.decode_base);
+    assert(m.decode_total.disk == 3 && m.decode_total.attn == 4 &&
+           m.decode_total.ffn == 5 && m.decode_total.head == 6);
+    assert(m.decode_total.cuda_seconds[G53_FALLBACK] == 7 &&
+           m.decode_total.cuda_seconds[G53_PROMOTION] == 8 &&
+           m.decode_total.cuda_seconds[G53_GATE] == 1.5);
+    assert(m.decode_total.planning == 2 && m.decode_total.join_wait == 3 &&
+           m.decode_total.deferred_join_wait == 1);
+    assert(m.decode_total.kda_qkv == 0.25 && m.decode_total.mla_score == 0.5);
+    m.t_disk += 10; p->seconds[G53_PROMOTION] += 10; /* intervening prefill */
+    g53_decode_capture(&m, &m.decode_base);
+    m.t_disk += 2; p->seconds[G53_PROMOTION] += 1;
+    g53_decode_capture(&m, &end);
+    g53_decode_accumulate(&m.decode_total, &end, &m.decode_base);
+    assert(m.decode_total.disk == 5 &&
+           m.decode_total.cuda_seconds[G53_PROMOTION] == 9);
+}
 static void case_scale_pread_and_scan(void) {
     FILE *file = tmpfile();
     assert(file);
@@ -380,6 +427,7 @@ static void case_scale_pread_and_scan(void) {
 }
 int main(void) {
     fixture();
+    case_decode_window_deltas();
     case_diagnostic_value_types();
     case_scale_pread_and_scan();
     case_group("0,1", 1, -1, -1, -1); /* device 1 completes first */

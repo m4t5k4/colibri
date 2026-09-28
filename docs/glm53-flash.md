@@ -265,6 +265,20 @@ gaps and does not sum concurrent workers.
 `deferred_already_complete_at_join` samples whether every worker had finished
 before the barrier; `join_next_ffn` and the `forced_*` fields identify barrier
 reasons. Per-device worker active time remains in the existing device lines.
+`[glm53-cuda-late-join-opportunity]` measures only FFNs entered with a pending
+deferred batch. The current join still happens at FFN entry. `late_join_current_wait_s`
+is the caller time blocked there; `late_join_prelude_s` is the subsequent CPU
+router, top-k, shared-expert MLP, union, and miscellaneous setup through the
+first CUDA-tier branch. The component fields partition that measured prelude.
+`late_join_hideable_upper_s` sums `min(join wait, prelude)` per opportunity.
+It is a counterfactual upper estimate, **not** elapsed time saved: concurrent
+uploads could slow the prelude. No upload is left in flight through it today.
+`[glm53-cuda-decode-profile]` reports decode-only deltas for the named phase,
+promotion, and KDA/MLA substage timers. It snapshots each explicit decode
+forward separately, so prefill before or between decode calls is excluded.
+The original cumulative lines and their field meanings are unchanged. Worker
+`upload_s` is summed worker time; `promotion_s` and join waits measure caller
+blocking, and the phase/substage fields are nested rather than exclusive.
 With overlap enabled, `promotion_s` counts caller-blocked planning, dispatch,
 serial work, and join time; `batch_wall_s` includes deferred dispatch-to-join
 lifetimes and can overlap attention time. Neither should be summed with other

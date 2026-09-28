@@ -70,6 +70,10 @@ typedef struct {
     double promotion_plan_s, promotion_dispatch_wait_s, promotion_join_s;
     double promotion_batch_wall_s, promotion_worker_s[COLI_CUDA_MAX_DEVICES];
     double promotion_expert_upload_min_s, promotion_expert_upload_max_s;
+    uint64_t late_join_opportunities;
+    double late_join_prelude_s, late_join_current_wait_s, late_join_hideable_upper_s;
+    double late_join_router_s, late_join_topk_s, late_join_shared_s;
+    double late_join_union_s, late_join_misc_s;
 } G53CudaProfile;
 struct G53Cuda {
     G53CudaExpert *experts;
@@ -95,6 +99,23 @@ static double g53_cuda_profile_now(const G53Cuda *g) {
 }
 static void g53_cuda_profile_add(G53Cuda *g, int field, double start) {
     if (g->profile.clock) g->profile.seconds[field] += g->profile.clock() - start;
+}
+/* Counterfactual only: the real join has already finished before this CPU work. */
+static void g53_cuda_profile_late_join(G53Cuda *g, double wait, double prelude,
+                                       double router, double topk, double shared,
+                                       double union_time) {
+    G53CudaProfile *p = &g->profile;
+    if (!p->clock) return;
+    p->late_join_opportunities++;
+    p->late_join_current_wait_s += wait;
+    p->late_join_prelude_s += prelude;
+    p->late_join_hideable_upper_s += wait < prelude ? wait : prelude;
+    p->late_join_router_s += router;
+    p->late_join_topk_s += topk;
+    p->late_join_shared_s += shared;
+    p->late_join_union_s += union_time;
+    double misc = prelude - router - topk - shared - union_time;
+    p->late_join_misc_s += misc > 0 ? misc : 0;
 }
 static void g53_cuda_profile_enable(G53Cuda *g, double (*clock)(void)) {
     const char *env = getenv("GLM53_CUDA_PROFILE");
@@ -216,6 +237,12 @@ static void g53_cuda_profile_report(G53Cuda *g, const char *phase) {
             (unsigned long long)p->deferred_join_reason[G53_JOIN_CLOSE],
             (unsigned long long)p->deferred_join_reason[G53_JOIN_BEFORE_DISPATCH],
             (unsigned long long)p->deferred_join_reason[G53_JOIN_POLICY_OR_DROP]);
+    fprintf(stderr, "[glm53-cuda-late-join-opportunity] phase=%s late_join_opportunities=%llu late_join_prelude_s=%.6f late_join_current_wait_s=%.6f late_join_hideable_upper_s=%.6f router_s=%.6f topk_s=%.6f shared_s=%.6f union_s=%.6f misc_s=%.6f\n",
+            phase, (unsigned long long)p->late_join_opportunities,
+            p->late_join_prelude_s, p->late_join_current_wait_s,
+            p->late_join_hideable_upper_s, p->late_join_router_s,
+            p->late_join_topk_s, p->late_join_shared_s,
+            p->late_join_union_s, p->late_join_misc_s);
     fprintf(stderr, "[glm53-cuda-promotion-flush] phase=%s flush_end_boundary=%llu flush_owner_busy=%llu flush_capacity_or_eviction=%llu flush_batch_full=%llu flush_failure_or_disabled=%llu flush_staging_failure=%llu flush_other_serial=%llu heat_noop_passthrough=%llu\n",
             phase, (unsigned long long)p->flush_end_boundary,
             (unsigned long long)p->flush_owner_busy,

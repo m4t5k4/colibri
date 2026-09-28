@@ -696,6 +696,16 @@ typedef struct {
     int cap;
 } GSession;
 
+#ifdef COLI_CUDA
+typedef struct {
+    int valid;
+    double cuda_seconds[G53_PROFILE_TIMES], planning, join_wait, deferred_join_wait;
+    double disk, attn, ffn, head;
+    double kda_proj, kda_qkv, kda_decay, kda_beta, kda_core;
+    double kda_out, kda_gateproj, kda_normgate, kda_ko;
+    double mla_proj, mla_index, mla_core, mla_score, mla_value, mla_out;
+} G53DecodeBase;
+#endif
 typedef struct {
     Cfg c;
     shards S;
@@ -712,6 +722,7 @@ typedef struct {
     int streaming;
 #ifdef COLI_CUDA
     G53Cuda cuda;
+    G53DecodeBase decode_base, decode_total;
 #endif
     struct ERef *eref;
     struct LCache *ecache;
@@ -734,6 +745,69 @@ typedef struct {
     ColiVisionTower vision;
     ColiVisionBlock *vblocks;
 } GModel;
+
+#ifdef COLI_CUDA
+/* Snapshot immediately around each explicit decode forward. Summing these
+ * deltas excludes prefill even if a caller interleaves prefill and decode. */
+static void g53_decode_capture(const GModel *m, G53DecodeBase *s) {
+    const G53CudaProfile *p = &m->cuda.profile;
+    s->valid = 1;
+    memcpy(s->cuda_seconds, p->seconds, sizeof(s->cuda_seconds));
+    s->planning = p->promotion_plan_s;
+    s->join_wait = p->promotion_join_s;
+    s->deferred_join_wait = p->deferred_join_wait_s;
+    s->disk = m->t_disk; s->attn = m->t_attn;
+    s->ffn = m->t_ffn; s->head = m->t_head;
+    s->kda_proj = m->t_kda_proj;
+    s->kda_qkv = m->t_kda_qkv; s->kda_decay = m->t_kda_decay;
+    s->kda_beta = m->t_kda_beta; s->kda_core = m->t_kda_core;
+    s->kda_out = m->t_kda_out;
+    s->kda_gateproj = m->t_kda_gateproj;
+    s->kda_normgate = m->t_kda_normgate; s->kda_ko = m->t_kda_ko;
+    s->mla_proj = m->t_mla_proj; s->mla_index = m->t_mla_index;
+    s->mla_core = m->t_mla_core;
+    s->mla_score = m->t_mla_score; s->mla_value = m->t_mla_value;
+    s->mla_out = m->t_mla_out;
+}
+static void g53_decode_accumulate(G53DecodeBase *total, const G53DecodeBase *end,
+                                  const G53DecodeBase *start) {
+    if (!start->valid) return;
+    total->valid = 1;
+    for (int i = 0; i < G53_PROFILE_TIMES; i++)
+        total->cuda_seconds[i] += end->cuda_seconds[i] - start->cuda_seconds[i];
+#define G53_DECODE_DELTA(field) total->field += end->field - start->field
+    G53_DECODE_DELTA(planning); G53_DECODE_DELTA(join_wait);
+    G53_DECODE_DELTA(deferred_join_wait);
+    G53_DECODE_DELTA(disk); G53_DECODE_DELTA(attn);
+    G53_DECODE_DELTA(ffn); G53_DECODE_DELTA(head);
+    G53_DECODE_DELTA(kda_proj); G53_DECODE_DELTA(kda_qkv);
+    G53_DECODE_DELTA(kda_decay);
+    G53_DECODE_DELTA(kda_beta); G53_DECODE_DELTA(kda_core);
+    G53_DECODE_DELTA(kda_out);
+    G53_DECODE_DELTA(kda_gateproj); G53_DECODE_DELTA(kda_normgate);
+    G53_DECODE_DELTA(kda_ko); G53_DECODE_DELTA(mla_proj);
+    G53_DECODE_DELTA(mla_index); G53_DECODE_DELTA(mla_core);
+    G53_DECODE_DELTA(mla_score);
+    G53_DECODE_DELTA(mla_value); G53_DECODE_DELTA(mla_out);
+#undef G53_DECODE_DELTA
+}
+static void g53_decode_report(const GModel *m) {
+    const G53DecodeBase *d = &m->decode_total;
+    if (!d->valid) return;
+    const double *s = d->cuda_seconds;
+    double cuda_expert = s[G53_GATE] + s[G53_UP] + s[G53_CLAMP] + s[G53_DOWN]
+                       + s[G53_GROUP_ISSUE] + s[G53_GROUP_TAKE];
+    fprintf(stderr, "[glm53-cuda-decode-profile] decode_tokens=%llu disk_s=%.6f attn_s=%.6f ffn_s=%.6f fallback_compute_s=%.6f promotion_s=%.6f planning_s=%.6f join_wait_s=%.6f deferred_join_wait_s=%.6f cuda_expert_s=%.6f head_s=%.6f kda_proj_s=%.6f kda_qkv_s=%.6f kda_decay_s=%.6f kda_beta_s=%.6f kda_core_s=%.6f kda_out_s=%.6f kda_gateproj_s=%.6f kda_normgate_s=%.6f kda_ko_s=%.6f mla_proj_s=%.6f mla_index_s=%.6f mla_core_s=%.6f mla_score_s=%.6f mla_value_s=%.6f mla_out_s=%.6f\n",
+            (unsigned long long)m->cuda.profile.decode_tokens,
+            d->disk, d->attn, d->ffn, s[G53_FALLBACK], s[G53_PROMOTION],
+            d->planning, d->join_wait, d->deferred_join_wait, cuda_expert, d->head,
+            d->kda_proj, d->kda_qkv, d->kda_decay, d->kda_beta, d->kda_core,
+            d->kda_out,
+            d->kda_gateproj, d->kda_normgate, d->kda_ko,
+            d->mla_proj, d->mla_index, d->mla_core,
+            d->mla_score, d->mla_value, d->mla_out);
+}
+#endif
 
 static const float *load_f32(GModel *m, const char *fmt, ...) {
     char name[512];
@@ -2731,9 +2805,16 @@ static int g53_scale_audit_cli(const char *dir, int audit, int scan_all) {
 static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                       int tokens, float *out) {
 #ifdef COLI_CUDA
+    const int late_opportunity = m->cuda.profile.clock && m->cuda.promotion_flight &&
+                                 tokens == 1 && index >= m->c.first_dense && m->streaming;
+    const double join_before = late_opportunity ? m->cuda.profile.deferred_join_wait_s : 0;
     /* The preceding layer's uploads may run through CPU mHC/attention, but
      * no FFN may inspect residency or failure before ordered publication. */
     g53_cuda_join_pending(&m->cuda, G53_JOIN_NEXT_FFN);
+    const double late_wait = late_opportunity ?
+        m->cuda.profile.deferred_join_wait_s - join_before : 0;
+    const double late_start = late_opportunity ? now_s() : 0;
+    double late_router = 0, late_topk = 0, late_shared = 0, late_union = 0;
 #endif
     const Cfg *c = &m->c;
     const int wide = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
@@ -2757,12 +2838,19 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     /* --- primo tempo: il router, per ogni token --- */
     for (int t = 0; t < tokens; t++) {
         const float *row = x + (size_t)t * c->hidden;
+#ifdef COLI_CUDA
+        const double score_start = late_opportunity ? now_s() : 0;
+#endif
         for (int e = 0; e < c->n_experts; e++) {
             const float *w = l->router + (size_t)e * c->hidden;
             float sum = 0.0f;
             for (int d = 0; d < c->hidden; d++) sum += w[d] * row[d];
             score[e] = sigmoidf_(sum);
         }
+#ifdef COLI_CUDA
+        if (late_opportunity) late_router += now_s() - score_start;
+        const double topk_start = late_opportunity ? now_s() : 0;
+#endif
         /* la selezione usa score+bias, il PESO usa lo score puro: la
          * distinzione e' sottile e sbagliarla cambia quali esperti contano
          * quanto. */
@@ -2783,6 +2871,9 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         }
         for (int k = 0; k < topk; k++)
             mine_w[k] = mine_w[k] / (total + 1e-20f) * c->routed_scale;
+#ifdef COLI_CUDA
+        if (late_opportunity) late_topk += now_s() - topk_start;
+#endif
 
         /* Record the exact experts and post-normalisation gates applied by
          * this layer. The shared helper also bumps .coli_usage counters. */
@@ -2806,9 +2897,15 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     if (!sg || !su || !tmp) { fprintf(stderr, "OOM in MoE\n"); exit(1); }
 
     /* l'esperto condiviso e' sempre attivo e non passa dalla cache */
+#ifdef COLI_CUDA
+    const double shared_start = late_opportunity ? now_s() : 0;
+#endif
     for (int t = 0; t < tokens; t++)
         mlp3(out + (size_t)t * c->hidden, x + (size_t)t * c->hidden,
              &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
+#ifdef COLI_CUDA
+    if (late_opportunity) late_shared = now_s() - shared_start;
+#endif
 
     if (!m->streaming) {
         for (int t = 0; t < tokens; t++)
@@ -2825,6 +2922,9 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     }
 
     /* unione dei distinti, nell'ordine in cui compaiono */
+#ifdef COLI_CUDA
+    const double union_start = late_opportunity ? now_s() : 0;
+#endif
     int *union_ids = malloc((size_t)tokens * topk * sizeof(int));
     int n_union = 0;
     if (!union_ids) { fprintf(stderr, "OOM building expert union\n"); exit(1); }
@@ -2835,6 +2935,11 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     }
 
 #ifdef COLI_CUDA
+    if (late_opportunity) {
+        late_union = now_s() - union_start;
+        g53_cuda_profile_late_join(&m->cuda, late_wait, now_s() - late_start,
+                                   late_router, late_topk, late_shared, late_union);
+    }
     if (tokens == 1 && m->cuda.active && m->cuda.ndev > 1 &&
         g53_cuda_ffn_grouped(m, l, index, x, out, union_ids, n_union,
                              chosen, weight, sg, su)) {
@@ -3646,7 +3751,14 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
         if (p->decode) { p->decode_tokens += (uint64_t)n; p->decode_forward_s += elapsed; }
         p->disk_s = m->t_disk; p->attn_s = m->t_attn;
         p->ffn_s = m->t_ffn; p->head_s = m->t_head;
+        if (p->decode) {
+            G53DecodeBase end;
+            g53_decode_capture(m, &end);
+            g53_decode_accumulate(&m->decode_total, &end, &m->decode_base);
+            m->decode_base.valid = 0;
+        }
         g53_cuda_profile_report(&m->cuda, p->decode ? "decode" : "prefill");
+        if (p->decode) g53_decode_report(m);
         if (p->decode)
             fprintf(stderr,
                     "[glm53-attn-split] decode_tokens=%llu "
@@ -3672,6 +3784,7 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
  * Timing covers forward_span, excluding sampling, text output and this report. */
 static float *forward_decode(GModel *m, GSession *s, const int *token) {
 #ifdef COLI_CUDA
+    if (m->cuda.profile.clock) g53_decode_capture(m, &m->decode_base);
     m->cuda.decode_call = 1;
     if (m->cuda.profile.clock) m->cuda.profile.decode = 1;
 #endif
