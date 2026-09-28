@@ -209,7 +209,7 @@ int main(void) {
     compare_projection("clamped-down", y, expected, D);
     memcpy(weights[0], saved, sizeof(saved));
     assert(g.executed == 1);
-    g53_cuda_heat(&g, 0, 1, 3); g53_cuda_promote(&g, 0, 1, pieces);
+    g53_cuda_heat(&g, 0, 1, 4); g53_cuda_promote(&g, 0, 1, pieces);
     assert(!g.experts[0].w[0] && g.experts[1].w[0] && g.resident == 1);
 #ifndef G53_REAL_CUDA
     fail_mat = mat_calls + 3; /* down fails after gate/up succeeded */

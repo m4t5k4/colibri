@@ -291,7 +291,7 @@ static void g53_cuda_init(G53Cuda *g, int nl, int ne, int D, int I, int streamin
         coli_cuda_shutdown(); fprintf(stderr, "GLM53 CUDA device count mismatch\n"); exit(1);
     }
     if (!g53_cuda_heat_setting(getenv("GLM53_CUDA_HEAT_MIN"), 2, 0, &g->heat_min) ||
-        !g53_cuda_heat_setting(getenv("GLM53_CUDA_HEAT_MARGIN"), 0, 1, &g->heat_margin)) {
+        !g53_cuda_heat_setting(getenv("GLM53_CUDA_HEAT_MARGIN"), 1, 1, &g->heat_margin)) {
         coli_cuda_shutdown();
         fprintf(stderr, "invalid GLM53_CUDA_HEAT_MIN or GLM53_CUDA_HEAT_MARGIN\n");
         exit(1);

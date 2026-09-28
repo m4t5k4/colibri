@@ -28,7 +28,7 @@ int main(void) {
     assert(!memcmp(reference, y, sizeof(y)));
     assert(g.profile.seconds[G53_GATE] == 1 && g.profile.seconds[G53_UP] == 1);
     assert(g.profile.seconds[G53_CLAMP] == 1 && g.profile.seconds[G53_DOWN] == 1);
-    g53_cuda_heat(&g, 0, 1, 3); g53_cuda_promote(&g, 0, 1, pieces);
+    g53_cuda_heat(&g, 0, 1, 4); g53_cuda_promote(&g, 0, 1, pieces);
     assert(g.profile.evictions == 1 && g.uploads == 2 && g.resident == 1);
     assert(g.profile.seconds[G53_UPLOAD] == 1 && g.profile.seconds[G53_EVICT] == 1);
     assert(g.profile.seconds[G53_PROMOTION] == 5);
@@ -47,13 +47,13 @@ int main(void) {
     g53_cuda_heat(&cache, 0, 0, 2); g53_cuda_promote(&cache, 0, 0, pieces);
     g53_cuda_heat(&cache, 0, 0, 1); /* resident selection after upload */
     cache.profile.decode_tokens++;
-    g53_cuda_heat(&cache, 0, 1, 4); g53_cuda_promote(&cache, 0, 1, pieces);
+    g53_cuda_heat(&cache, 0, 1, 5); g53_cuda_promote(&cache, 0, 1, pieces);
     cache.profile.decode_tokens++;
     g53_cuda_heat(&cache, 0, 0, 10); g53_cuda_promote(&cache, 0, 0, pieces);
     assert(cache.profile.cache_layer[0].hit == 1);
     assert(cache.profile.cache_layer[0].miss == 3);
     assert(cache.profile.cache_layer[0].hit_rows == 1);
-    assert(cache.profile.cache_layer[0].miss_rows == 16);
+    assert(cache.profile.cache_layer[0].miss_rows == 17);
     assert(cache.profile.cache_layer[0].promotions == 3);
     assert(cache.profile.cache_layer[0].evictions == 2);
     assert(cache.profile.cache_layer[0].repromotions == 1);

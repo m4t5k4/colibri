@@ -16,7 +16,7 @@ int main(void) {
     unsetenv("GLM53_CUDA_HEAT_MARGIN");
     uint64_t parsed = 0;
     assert(g53_cuda_heat_setting(NULL, 2, 0, &parsed) && parsed == 2);
-    assert(g53_cuda_heat_setting(NULL, 0, 1, &parsed) && parsed == 0);
+    assert(g53_cuda_heat_setting(NULL, 1, 1, &parsed) && parsed == 1);
     assert(g53_cuda_heat_setting("18446744073709551615", 0, 1, &parsed) &&
            parsed == UINT64_MAX);
     const char *bad_heat[] = {"", "-1", "+1", " 1", "1x",
@@ -38,6 +38,8 @@ int main(void) {
     assert(!g53_cuda_devices(NULL, "0,1", devices));
     setenv("COLI_CUDA", "1", 1); setenv("COLI_GPU", "9", 1);
     setenv("COLI_GPUS", "0,1", 1);
+    /* The explicit zero override retains the original replacement policy. */
+    setenv("GLM53_CUDA_HEAT_MARGIN", "0", 1);
     /* Four experts total, not four per device (each expert is 6912 bytes). */
     setenv("CUDA_EXPERT_GB", "0.000027648", 1);
     G53Cuda g = {0};
@@ -68,23 +70,25 @@ int main(void) {
     g53_cuda_close(&g); g53_cuda_close(&g);
     assert(!live_device[0] && !live_device[1] && shutdown_calls == 1);
 
-    /* A one-point heat advantage replaces at the default margin, but not
-     * under the experimental margin of one. Two points still replace. */
-    setenv("GLM53_CUDA_HEAT_MARGIN", "1", 1);
-    g53_cuda_init(&g, 1, 2, 64, 64, 1);
-    assert(g.heat_min == 2 && g.heat_margin == 1);
-    g.budget = g.expert_bytes;
-    g53_cuda_heat(&g, 0, 0, 2); g53_cuda_promote(&g, 0, 0, pieces);
-    g53_cuda_heat(&g, 0, 1, 3); g53_cuda_promote(&g, 0, 1, pieces);
-    assert(g.experts[0].w[0] && !g.experts[1].w[0] && g.uploads == 1);
-    g53_cuda_heat(&g, 0, 1, 1); g53_cuda_promote(&g, 0, 1, pieces);
-    assert(!g.experts[0].w[0] && g.experts[1].w[0] && g.uploads == 2);
-    g53_cuda_close(&g);
+    /* Unset and explicit one must make identical replacement decisions. */
+    unsetenv("GLM53_CUDA_HEAT_MARGIN");
+    for (int mode = 0; mode < 2; mode++) {
+        if (mode) setenv("GLM53_CUDA_HEAT_MARGIN", "1", 1);
+        g53_cuda_init(&g, 1, 2, 64, 64, 1);
+        assert(g.heat_min == 2 && g.heat_margin == 1);
+        g.budget = g.expert_bytes;
+        g53_cuda_heat(&g, 0, 0, 2); g53_cuda_promote(&g, 0, 0, pieces);
+        g53_cuda_heat(&g, 0, 1, 3); g53_cuda_promote(&g, 0, 1, pieces);
+        assert(g.experts[0].w[0] && !g.experts[1].w[0] && g.uploads == 1);
+        g53_cuda_heat(&g, 0, 1, 1); g53_cuda_promote(&g, 0, 1, pieces);
+        assert(!g.experts[0].w[0] && g.experts[1].w[0] && g.uploads == 2);
+        g53_cuda_close(&g);
+    }
     unsetenv("GLM53_CUDA_HEAT_MARGIN");
 
     setenv("GLM53_CUDA_HEAT_MIN", "3", 1);
     g53_cuda_init(&g, 1, 2, 64, 64, 1);
-    assert(g.heat_min == 3 && g.heat_margin == 0);
+    assert(g.heat_min == 3 && g.heat_margin == 1);
     g53_cuda_heat(&g, 0, 0, 2); g53_cuda_promote(&g, 0, 0, pieces);
     assert(!g.experts[0].w[0] && g.uploads == 0);
     g53_cuda_heat(&g, 0, 0, 1); g53_cuda_promote(&g, 0, 0, pieces);
@@ -103,7 +107,7 @@ int main(void) {
     }
     assert(g.experts[0].owner == 0 && g.experts[1].owner == 1 && g.experts[2].owner == 1);
     assert(g.resident == 3 && g.used[0] <= g.capacity[0] && g.used[1] <= g.capacity[1]);
-    g53_cuda_heat(&g, 0, 3, 1); g53_cuda_promote(&g, 0, 3, pieces);
+    g53_cuda_heat(&g, 0, 3, 4); g53_cuda_promote(&g, 0, 3, pieces);
     assert(g.experts[3].owner == 0 && g.resident == 3);
     g53_cuda_close(&g);
 
