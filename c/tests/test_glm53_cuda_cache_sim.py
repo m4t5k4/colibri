@@ -18,6 +18,7 @@ class CacheSimulationTests(unittest.TestCase):
             trace.write_text("""S,1,1,0,0,2,0
 A,1,0,0
 P,1,0,0,0,0
+U,1,0,0,0,0.018700000,1
 S,2,2,0,1,2,0
 A,2,0,1
 P,2,0,1,1,1

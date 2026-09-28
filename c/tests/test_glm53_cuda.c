@@ -2,6 +2,9 @@
  * The latter links backend_cuda.o and MUST execute device tensor matmuls. */
 #include <assert.h>
 #include "../glm53_cuda.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* Report observed errors, not just a token match. The fixed acceptance envelope
  * is provisional until measured on NVIDIA hardware; never learn a tolerance
@@ -43,6 +46,9 @@ static void project(float *y, const float *x, const unsigned char *w,
 #ifndef G53_REAL_CUDA
 struct ColiCudaTensor { unsigned char *w; float *s; int I, O, device; };
 static int live, upload_calls, fail_upload, mat_calls, fail_mat, init_calls, shutdown_calls;
+static int fake_upload_active, fake_upload_peak, fake_upload_delay;
+static int fake_fail_upload_device = -1, fake_fail_upload_n;
+static int fake_device_upload_calls[COLI_CUDA_MAX_DEVICES];
 static int fake_ndev, fake_devices[COLI_CUDA_MAX_DEVICES], live_device[COLI_CUDA_MAX_DEVICES];
 static size_t fake_free[COLI_CUDA_MAX_DEVICES];
 static int fail_mem_device = -1;
@@ -78,8 +84,8 @@ size_t coli_cuda_alloc_footprint(size_t b) { return b; }
 size_t coli_cuda_tensor_vram(const ColiCudaTensor *t) { return (size_t)t->I * t->O * 9 / 16; }
 void coli_cuda_tensor_free(ColiCudaTensor *t) {
     if (t) { assert(!fake_group[t->device].pending);
-        assert(live_device[t->device] > 0); live_device[t->device]--;
-        free(t->w); free(t->s); free(t); live--; }
+        assert(live_device[t->device] > 0); __sync_sub_and_fetch(&live_device[t->device], 1);
+        free(t->w); free(t->s); free(t); __sync_sub_and_fetch(&live, 1); }
 }
 int coli_cuda_tensor_upload_g(ColiCudaTensor **t, const void *w, const float *s,
                              int fmt, int I, int O, int d, int gs) {
@@ -87,12 +93,28 @@ int coli_cuda_tensor_upload_g(ColiCudaTensor **t, const void *w, const float *s,
     int found = 0;
     for (int i = 0; i < fake_ndev; i++) if (fake_devices[i] == d) found = 1;
     assert(found);
-    if (++upload_calls == fail_upload) return 0;
+    int call = __sync_add_and_fetch(&upload_calls, 1);
+    if (fake_upload_delay) {
+        int active = __sync_add_and_fetch(&fake_upload_active, 1);
+        int peak;
+        do { peak = __atomic_load_n(&fake_upload_peak, __ATOMIC_RELAXED);
+             if (peak >= active) break; }
+        while (!__sync_bool_compare_and_swap(&fake_upload_peak, peak, active));
+#ifdef _OPENMP
+        double until = omp_get_wtime() + 0.005;
+        while (omp_get_wtime() < until) { }
+#endif
+        __sync_sub_and_fetch(&fake_upload_active, 1);
+    }
+    int device_call = __sync_add_and_fetch(&fake_device_upload_calls[d], 1);
+    if (call == fail_upload ||
+        (d == fake_fail_upload_device && device_call == fake_fail_upload_n)) return 0;
     *t = calloc(1, sizeof(**t)); (*t)->I = I; (*t)->O = O; (*t)->device = d;
     (*t)->w = malloc((size_t)I * O / 2); (*t)->s = malloc((size_t)I * O / 16);
     memcpy((*t)->w, w, (size_t)I * O / 2); memcpy((*t)->s, s, (size_t)I * O / 16);
-    live++; live_device[d]++; return 1;
+    __sync_add_and_fetch(&live, 1); __sync_add_and_fetch(&live_device[d], 1); return 1;
 }
+int coli_cuda_tensor_upload_complete(int d) { (void)d; return 1; }
 int coli_cuda_matmul(ColiCudaTensor **t, float *y, const float *x, const void *w,
                      const float *s, int fmt, int S, int I, int O, int d, int gs) {
     (void)w; (void)s; assert(fmt == 4 && S == 1 && gs == 64);

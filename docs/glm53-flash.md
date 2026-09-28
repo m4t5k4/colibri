@@ -135,10 +135,19 @@ and replacement. At full capacity, replacement requires incoming heat greater
 than victim heat plus the margin. Setting the margin to `0` restores the prior
 replacement policy. Invalid values fail initialization. The effective values
 appear once on the CUDA startup line. Heat remains cumulative for this
-model lifetime. Uploads are synchronous after the normal disk-to-RAM read and
+model lifetime. Uploads follow the normal disk-to-RAM read and
 own their device memory independently of
 RAM-slot eviction. Resident hits bypass disk and RAM reads. Cold misses use
 the existing host path and become eligible for subsequent CUDA execution.
+
+`GLM53_CUDA_PARALLEL_PROMOTE=1` enables an experimental, bounded cache-fill
+prototype on multi-GPU runs (default off). It plans only consecutive promotions
+that need no eviction, reserving budget and least-allocated owners in logical
+order. It copies each expert's host pieces before the RAM slot can be reused,
+uploads at most one expert per device at a time, waits for upload completion,
+then publishes in logical order. An eviction boundary drains the batch and
+uses the unchanged serial victim path. A worker failure drains the batch and
+enables the existing model-wide host fallback. Single-device runs remain serial.
 
 `CUDA_EXPERT_GB` is a total decimal-GB cap across all selected devices, or
 `auto` (default): the sum of free VRAM minus 2 GB of runtime headroom on each
@@ -207,13 +216,22 @@ hardware before claiming performance.
 
 Set `GLM53_CUDA_PROFILE=1` with the CUDA tier. The profiler is off
 by default. It uses GLM53's monotonic host clock, adds no CUDA events or
-synchronization, and emits cumulative `[glm53-cuda-profile]` records at
+synchronization beyond the upload completion required by the parallel-promotion
+prototype, and emits cumulative `[glm53-cuda-profile]` records at
 startup (`phase=start`), after each prefill chunk or decode forward, and before
 shutdown (`phase=final`). `phase=decode` labels an actual one-token decode
 forward, even when prefill chunks also contain one token. The timing checks
 avoid clock calls when profiling is off. The normal `[glm53-cuda]` diagnostics
 remain independent of this opt-in. Startup model loading and CUDA initialization
 finish before `phase=start`; their time is outside this profile.
+
+With parallel promotion enabled, `[glm53-cuda-promotion]` reports planned batch
+size/device totals, planning time, summed per-worker dispatch-to-start wait, caller join wait,
+batch wall time, and concurrent versus serial promotions. Per-device worker
+active time appears in `[glm53-cuda-promotion-device]`. `upload_s` remains the
+sum of per-expert upload work durations; these durations can overlap and must
+not be read as elapsed wall time. The batch wall field is elapsed time. The
+optional selection trace adds `U` records with each expert's upload duration.
 
 At shutdown, profiling also prints `[glm53-cuda-cache]` totals and a
 `[glm53-cuda-cache-layer]` row for each selected sparse layer: resident

@@ -26,6 +26,10 @@ def events(path):
                 continue
             fields = line.strip().split(",")
             kind = fields[0]
+            # Optional per-expert upload timing is diagnostic, not a cache
+            # policy event. Keep old and new traces replayable alike.
+            if kind == "U" and len(fields) == 7:
+                continue
             if kind not in lengths or len(fields) != lengths[kind]:
                 raise ValueError(f"malformed trace event on line {number}: {line.rstrip()}")
             try:

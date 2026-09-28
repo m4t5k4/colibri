@@ -2671,11 +2671,13 @@ static int g53_cuda_ffn_grouped(GModel *m, const GLayer *l, int index,
                 if (resident[i] && !g->failed) ehit_mark(m, index, union_ids[i]);
             }
     /* Promotions can evict tensors; they occur only after every take. */
+    G53CudaPromotionBatch promotions = {0};
     if (!g->failed) for (int i = 0; i < n_union; i++) if (!resident[i]) {
         Slot *slot = slot_find(m, index, union_ids[i]);
         if (!slot) slot = expert_slot(m, index, union_ids[i]);
-        g53_cuda_promote(g, index, union_ids[i], slot->piece);
+        g53_cuda_promote_batched(g, &promotions, index, union_ids[i], slot->piece);
     }
+    g53_cuda_batch_flush(g, &promotions);
     for (int di = 0; di < g->ndev; di++) free(group[di].input);
     free(result);
     return 1;
@@ -2903,8 +2905,11 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         }
         m->t_disk += now_s() - t_batch0;  /* fuori dalla regione omp: e' il muro del batch */
 #ifdef COLI_CUDA
+        G53CudaPromotionBatch promotions = {0};
         for (int i = 0; i < here; i++)
-            g53_cuda_promote(&m->cuda, index, union_ids[base + i], cache->s[slot_of[i]].piece);
+            g53_cuda_promote_batched(&m->cuda, &promotions, index,
+                                     union_ids[base + i], cache->s[slot_of[i]].piece);
+        g53_cuda_batch_flush(&m->cuda, &promotions);
 #endif
 
         /* Try all experts in this cache-sized block as one Metal command buffer.

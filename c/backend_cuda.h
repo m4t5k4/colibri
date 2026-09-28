@@ -137,8 +137,11 @@ COLI_CUDA_DLLEXPORT int coli_cuda_fp8_set_lut(const float *lut);
 
 /* Upload without executing, so capacity failures happen during model startup. */
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
-        const void *weights, const float *scales,
-        int fmt, int I, int O, int device, int gs);
+                                         const void *weights, const float *scales,
+                                         int fmt, int I, int O, int device, int gs);
+/* Complete default-stream tensor uploads before a tensor is published to a
+ * nonblocking expert execution stream. Safe to call from its upload thread. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_complete(int device);
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                             const void *weights, const float *scales,
                             int fmt, int I, int O, int device);

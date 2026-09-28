@@ -1,10 +1,10 @@
-/* Multi-device, synchronous hot-expert tier. No host pointers survive upload.
- * Caller serializes placement/execution; disk workers never call this API.
+/* Multi-device hot-expert tier. No host pointers survive upload.
+ * The model thread owns placement/publication; upload workers own private tensors.
  * Only the full-model CLI/SERVE loader may init this process-global backend;
  * Segment/Edge/range loaders leave G53Cuda zero-initialized and inactive.
  * Like qwen36_tier.c's Qwen3.8 streaming mode, promotion occurs while streamed
  * bytes are live and owns copies independent of RAM slots. Here the copy is
- * synchronous (no staging queue) and execution keeps GLM53's host clamp.
+ * synchronous per device (no staging queue) and execution keeps GLM53's host clamp.
  * See docs/glm53-flash.md for the placement/residency comparison. */
 #ifndef GLM53_CUDA_H
 #define GLM53_CUDA_H
@@ -50,6 +50,11 @@ typedef struct {
     FILE *selection_trace, *eviction_records;
     uint64_t selection_tick, repromotions, dead_on_arrival, eviction_record_count;
     int decode;
+    uint64_t promotion_batches, concurrent_promotions, serial_promotions;
+    uint64_t eviction_batch_boundaries, batch_experts, batch_devices;
+    double promotion_plan_s, promotion_dispatch_wait_s, promotion_join_s;
+    double promotion_batch_wall_s, promotion_worker_s[COLI_CUDA_MAX_DEVICES];
+    double promotion_expert_upload_min_s, promotion_expert_upload_max_s;
 } G53CudaProfile;
 typedef struct {
     G53CudaExpert *experts;
@@ -61,6 +66,7 @@ typedef struct {
     int failure_stage;
     size_t budget, bytes, expert_bytes;
     uint64_t heat_min, heat_margin;
+    int parallel_promote;
     unsigned resident;
     uint64_t executed, fallback, uploads, errors;
     G53CudaProfile profile;
@@ -91,7 +97,7 @@ static void g53_cuda_profile_enable(G53Cuda *g, double (*clock)(void)) {
             g->profile.selection_trace = fopen(path, "w");
             if (g->profile.selection_trace)
                 fprintf(g->profile.selection_trace,
-                        "# S,tick,decode_token,layer,eid,rows,resident_before | A,tick,layer,eid | P,tick,layer,eid,owner_index,device_id | E,tick,in_layer,in_eid,victim_layer,victim_eid,in_heat,victim_heat,victim_residence_age,victim_last_use_distance\n");
+                        "# S,tick,decode_token,layer,eid,rows,resident_before | A,tick,layer,eid | P,tick,layer,eid,owner_index,device_id | E,tick,in_layer,in_eid,victim_layer,victim_eid,in_heat,victim_heat,victim_residence_age,victim_last_use_distance | U,tick,layer,eid,device_id,upload_seconds,ok\n");
             else fprintf(stderr, "[glm53-cuda-cache] cannot open trace %s: %s\n", path, strerror(errno));
         }
         if (!g->profile.cache_layer || !g->profile.cache_expert)
@@ -171,6 +177,18 @@ static void g53_cuda_profile_report(const G53Cuda *g, const char *phase) {
         p->seconds[G53_GATE]+p->seconds[G53_UP]+p->seconds[G53_CLAMP]+p->seconds[G53_DOWN]
             +p->seconds[G53_GROUP_ISSUE]+p->seconds[G53_GROUP_TAKE],
         p->disk_s, p->attn_s, p->ffn_s, p->head_s, p->forward_s, p->decode_forward_s);
+    fprintf(stderr, "[glm53-cuda-promotion] phase=%s batches=%llu batch_experts=%llu batch_devices=%llu concurrent=%llu serial=%llu eviction_boundaries=%llu planning_s=%.6f worker_dispatch_wait_sum_s=%.6f join_wait_s=%.6f batch_wall_s=%.6f expert_upload_sum_s=%.6f expert_upload_min_s=%.6f expert_upload_max_s=%.6f\n",
+            phase, (unsigned long long)p->promotion_batches,
+            (unsigned long long)p->batch_experts, (unsigned long long)p->batch_devices,
+            (unsigned long long)p->concurrent_promotions,
+            (unsigned long long)p->serial_promotions,
+            (unsigned long long)p->eviction_batch_boundaries,
+            p->promotion_plan_s, p->promotion_dispatch_wait_s, p->promotion_join_s,
+            p->promotion_batch_wall_s, p->seconds[G53_UPLOAD],
+            p->promotion_expert_upload_min_s, p->promotion_expert_upload_max_s);
+    for (int i = 0; i < g->ndev; i++)
+        fprintf(stderr, "[glm53-cuda-promotion-device] phase=%s device=%d worker_active_s=%.6f\n",
+                phase, g->devices[i], p->promotion_worker_s[i]);
 }
 
 static void g53_cuda_stats(const G53Cuda *g) {
@@ -323,6 +341,8 @@ static void g53_cuda_init(G53Cuda *g, int nl, int ne, int D, int I, int streamin
     g->experts = calloc((size_t)g->count, sizeof(*g->experts));
     if (!g->experts) { coli_cuda_shutdown(); fprintf(stderr, "OOM CUDA expert table\n"); exit(1); }
     g->active = 1;
+    g->parallel_promote = g->ndev > 1 && getenv("GLM53_CUDA_PARALLEL_PROMOTE") &&
+                          !strcmp(getenv("GLM53_CUDA_PARALLEL_PROMOTE"), "1");
     fprintf(stderr, "[glm53-cuda] device=%d budget_bytes=%zu gs=64 host_clamp=1 group_clamp=%d heat_min=%llu heat_margin=%llu devices=",
             g->device, g->budget, g->ndev > 1,
             (unsigned long long)g->heat_min, (unsigned long long)g->heat_margin);
@@ -331,6 +351,7 @@ static void g53_cuda_init(G53Cuda *g, int nl, int ne, int D, int I, int streamin
                 g->capacity[i] < g->budget ? g->capacity[i] : g->budget,
                 (g->capacity[i] < g->budget ? g->capacity[i] : g->budget) / g->expert_bytes);
     fputc('\n', stderr);
+    fprintf(stderr, "[glm53-cuda] parallel_promotion=%d\n", g->parallel_promote);
     g53_cuda_stats(g);
 }
 /* Called once per routed expert union, with its actual selected-row count. */
@@ -364,6 +385,31 @@ static int g53_cuda_place(const G53Cuda *g) {
             g->used[i] <= g->capacity[i] - g->expert_bytes &&
             (owner < 0 || g->used[i] < g->used[owner])) owner = i;
     return owner;
+}
+static void g53_cuda_publish(G53Cuda *g, int layer, int eid, int owner,
+                             ColiCudaTensor *const w[3]) {
+    G53CudaExpert *e = &g->experts[layer * g->ne + eid];
+    e->owner = owner;
+    for (int k = 0; k < 3; k++) {
+        e->w[k] = w[k];
+        size_t bytes = coli_cuda_tensor_vram(w[k]);
+        g->bytes += bytes; g->used[owner] += bytes;
+    }
+    g->resident++; g->uploads++;
+    if (g->profile.selection_trace)
+        fprintf(g->profile.selection_trace, "P,%llu,%d,%d,%d,%d\n",
+                (unsigned long long)g->profile.selection_tick, layer, eid,
+                owner, g->devices[owner]);
+    if (g->profile.clock && g->profile.cache_layer && g->profile.cache_expert) {
+        G53CudaProfile *p = &g->profile;
+        G53CudaExpertCache *ec = &p->cache_expert[layer * g->ne + eid];
+        p->cache_layer[layer].promotions++;
+        if (ec->promotions) { p->repromotions++; p->cache_layer[layer].repromotions++; }
+        ec->promotions++;
+        ec->hits_since_upload = 0;
+        ec->last_use_tick = 0;
+        ec->upload_tick = p->selection_tick;
+    }
 }
 /* A miss executes on host this time. Promote only after its host buffers are
  * available, and only once selected at least twice. No RAM cache ownership. */
@@ -438,35 +484,188 @@ static void g53_cuda_promote_impl(G53Cuda *g, int layer, int eid, uint8_t *const
                 g->devices[owner], (const char *const[]){"gate", "up", "down"}[failed_k]);
         return;
     }
-    e->owner = owner;
-    for (int k = 0; k < 3; k++) {
-        e->w[k] = w[k];
-        size_t bytes = coli_cuda_tensor_vram(w[k]);
-        g->bytes += bytes; g->used[owner] += bytes;
-    }
-    g->resident++; g->uploads++;
-    if (g->profile.selection_trace)
-        fprintf(g->profile.selection_trace, "P,%llu,%d,%d,%d,%d\n",
-                (unsigned long long)g->profile.selection_tick, layer, eid,
-                owner, g->devices[owner]);
-    if (g->profile.clock && g->profile.cache_layer && g->profile.cache_expert) {
-        G53CudaProfile *p = &g->profile;
-        G53CudaExpertCache *ec = &p->cache_expert[layer * g->ne + eid];
-        p->cache_layer[layer].promotions++;
-        if (ec->promotions) { p->repromotions++; p->cache_layer[layer].repromotions++; }
-        ec->promotions++;
-        ec->hits_since_upload = 0;
-        ec->last_use_tick = 0;
-        ec->upload_tick = p->selection_tick;
-    }
+    g53_cuda_publish(g, layer, eid, owner, w);
 }
 static void g53_cuda_promote(G53Cuda *g, int layer, int eid, uint8_t *const *pieces) {
     double start = g53_cuda_profile_now(g);
+    uint64_t uploads_before = g->uploads, errors_before = g->errors;
     if (g->profile.selection_trace)
         fprintf(g->profile.selection_trace, "A,%llu,%d,%d\n",
                 (unsigned long long)g->profile.selection_tick, layer, eid);
     g53_cuda_promote_impl(g, layer, eid, pieces);
+    if (g->profile.clock && (g->uploads != uploads_before || g->errors != errors_before))
+        g->profile.serial_promotions++;
     g53_cuda_profile_add(g, G53_PROMOTION, start);
+}
+
+/* The batch owns copied host bytes and unpublished tensors. Only the model
+ * thread chooses owners or changes residency; a worker touches one backend
+ * DeviceContext, then synchronizes its default upload stream before return. */
+typedef struct {
+    int layer, eid, owner, failed_k;
+    uint8_t *host, *piece[6];
+    ColiCudaTensor *w[3];
+    int ok, device, D, I;
+    double (*clock)(void);
+    double dispatched, start_wait, active_s;
+} G53CudaPromotionTask;
+typedef struct {
+    G53CudaPromotionTask task[COLI_CUDA_MAX_DEVICES];
+    size_t planned_used[COLI_CUDA_MAX_DEVICES], planned_bytes;
+    int n, owner_busy[COLI_CUDA_MAX_DEVICES];
+} G53CudaPromotionBatch;
+static void g53_cuda_upload_task(G53CudaPromotionTask *t) {
+    double start = t->clock ? t->clock() : 0;
+    t->start_wait = t->clock ? start - t->dispatched : 0;
+    t->ok = 1; t->failed_k = -1;
+    for (int k = 0; k < 3; k++) {
+        if (!coli_cuda_tensor_upload_g(&t->w[k], t->piece[2*k],
+                                       (const float *)t->piece[2*k+1], 4,
+                                       k == 2 ? t->I : t->D,
+                                       k == 2 ? t->D : t->I, t->device, 64)) {
+            t->ok = 0; t->failed_k = k; break;
+        }
+    }
+    /* cudaMemcpy from pageable RAM need not finish device DMA before return.
+     * The group's nonblocking stream does not inherit default-stream order. */
+    if (!coli_cuda_tensor_upload_complete(t->device) && t->ok) {
+        t->ok = 0; t->failed_k = 3;
+    }
+    t->active_s = t->clock ? t->clock() - start : 0;
+}
+static void g53_cuda_batch_flush(G53Cuda *g, G53CudaPromotionBatch *b) {
+    if (!b->n) return;
+    double wall = g53_cuda_profile_now(g);
+    for (int i = 0; i < b->n; i++) {
+        G53CudaPromotionTask *t = &b->task[i];
+        t->clock = g->profile.clock;
+        t->dispatched = wall;
+        if (g->profile.selection_trace)
+            fprintf(g->profile.selection_trace, "A,%llu,%d,%d\n",
+                    (unsigned long long)g->profile.selection_tick, t->layer, t->eid);
+    }
+    if (b->n == 1) g53_cuda_upload_task(&b->task[0]);
+    else {
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(b->n) schedule(static, 1)
+#endif
+        for (int i = 0; i < b->n; i++) g53_cuda_upload_task(&b->task[i]);
+    }
+    double joined = g53_cuda_profile_now(g);
+    if (g->profile.clock) {
+        G53CudaProfile *p = &g->profile;
+        p->promotion_batches++;
+        p->batch_experts += (uint64_t)b->n;
+        p->batch_devices += (uint64_t)b->n;
+        if (b->n > 1) p->concurrent_promotions += (uint64_t)b->n;
+        else p->serial_promotions++;
+        p->promotion_join_s += joined - wall;
+        p->promotion_batch_wall_s += joined - wall;
+        p->seconds[G53_PROMOTION] += joined - wall;
+        for (int i = 0; i < b->n; i++) {
+            G53CudaPromotionTask *t = &b->task[i];
+            p->promotion_dispatch_wait_s += t->start_wait;
+            p->promotion_worker_s[t->owner] += t->active_s;
+            p->seconds[G53_UPLOAD] += t->active_s;
+            if (!p->promotion_expert_upload_min_s ||
+                t->active_s < p->promotion_expert_upload_min_s)
+                p->promotion_expert_upload_min_s = t->active_s;
+            if (t->active_s > p->promotion_expert_upload_max_s)
+                p->promotion_expert_upload_max_s = t->active_s;
+            if (p->selection_trace)
+                fprintf(p->selection_trace, "U,%llu,%d,%d,%d,%.9f,%d\n",
+                        (unsigned long long)p->selection_tick, t->layer, t->eid,
+                        t->device, t->active_s, t->ok);
+        }
+    }
+    /* Serial failure semantics: commit only the successful logical prefix.
+     * Later workers may have completed speculatively, but never publish. */
+    int first_bad = b->n;
+    for (int i = 0; i < b->n; i++) if (!b->task[i].ok) { first_bad = i; break; }
+    for (int i = 0; i < first_bad; i++) {
+        G53CudaPromotionTask *t = &b->task[i];
+        g53_cuda_publish(g, t->layer, t->eid, t->owner, t->w);
+        for (int k = 0; k < 3; k++) t->w[k] = NULL;
+    }
+    for (int i = 0; i < b->n; i++) {
+        G53CudaPromotionTask *t = &b->task[i];
+        for (int k = 0; k < 3; k++) coli_cuda_tensor_free(t->w[k]);
+        free(t->host);
+    }
+    if (first_bad < b->n) {
+        G53CudaPromotionTask *t = &b->task[first_bad];
+        g->errors++; g->failed = 1;
+        fprintf(stderr, "[glm53-cuda] upload failed device=%d stage=%s; host fallback enabled\n",
+                t->device, (const char *const[]){"gate", "up", "down", "complete"}[t->failed_k]);
+    }
+    memset(b, 0, sizeof(*b));
+}
+static int g53_cuda_batch_owner(const G53Cuda *g, const G53CudaPromotionBatch *b) {
+    int owner = -1;
+    for (int i = 0; i < g->ndev; i++)
+        if (g->capacity[i] >= g->expert_bytes &&
+            b->planned_used[i] <= g->capacity[i] - g->expert_bytes &&
+            (owner < 0 || b->planned_used[i] < b->planned_used[owner])) owner = i;
+    return owner;
+}
+static void g53_cuda_batch_reset(const G53Cuda *g, G53CudaPromotionBatch *b) {
+    b->planned_bytes = g->bytes;
+    for (int i = 0; i < g->ndev; i++) b->planned_used[i] = g->used[i];
+}
+static void g53_cuda_promote_batched(G53Cuda *g, G53CudaPromotionBatch *b,
+                                     int layer, int eid, uint8_t *const *pieces) {
+    if (!g->parallel_promote || g->failed || !g->active) {
+        g53_cuda_promote(g, layer, eid, pieces); return;
+    }
+    double plan = g53_cuda_profile_now(g);
+    G53CudaExpert *e = &g->experts[layer * g->ne + eid];
+    if (g->expert_bytes > g->budget || e->w[0] || e->heat < g->heat_min) {
+        g53_cuda_batch_flush(g, b);
+        g53_cuda_promote(g, layer, eid, pieces); return;
+    }
+    if (!b->n) g53_cuda_batch_reset(g, b);
+    int owner = g53_cuda_batch_owner(g, b);
+    if (owner < 0 || b->planned_bytes > g->budget - g->expert_bytes) {
+        if (b->n && g->profile.clock) g->profile.eviction_batch_boundaries++;
+        g53_cuda_batch_flush(g, b);
+        g53_cuda_promote(g, layer, eid, pieces); return;
+    }
+    if (b->owner_busy[owner]) {
+        g53_cuda_batch_flush(g, b);
+        if (g->failed) { g53_cuda_promote(g, layer, eid, pieces); return; }
+        g53_cuda_batch_reset(g, b);
+        owner = g53_cuda_batch_owner(g, b);
+        if (owner < 0 || g->bytes > g->budget - g->expert_bytes) {
+            g53_cuda_promote(g, layer, eid, pieces); return;
+        }
+    }
+    /* Copy while the caller still owns this reusable host-cache slot. */
+    size_t wb = (size_t)g->D * (size_t)g->I / 2;
+    size_t sb = (size_t)g->D * (size_t)g->I / 64 * sizeof(float);
+    size_t host_bytes = 3 * (wb + sb);
+    uint8_t *host = malloc(host_bytes);
+    if (!host) {
+        g53_cuda_batch_flush(g, b);
+        g53_cuda_promote(g, layer, eid, pieces); return;
+    }
+    G53CudaPromotionTask *t = &b->task[b->n++];
+    t->layer = layer; t->eid = eid; t->owner = owner;
+    t->device = g->devices[owner]; t->D = g->D; t->I = g->I; t->host = host;
+    for (int k = 0; k < 6; k++) {
+        size_t n = k & 1 ? sb : wb;
+        t->piece[k] = host;
+        memcpy(host, pieces[k], n);
+        host += n;
+    }
+    b->owner_busy[owner] = 1;
+    b->planned_used[owner] += g->expert_bytes;
+    b->planned_bytes += g->expert_bytes;
+    if (g->profile.clock) {
+        double elapsed = g->profile.clock() - plan;
+        g->profile.promotion_plan_s += elapsed;
+        g->profile.seconds[G53_PROMOTION] += elapsed;
+    }
+    if (b->n == g->ndev) g53_cuda_batch_flush(g, b);
 }
 /* Each existing matmul already copies y back synchronously. This measures
  * the whole API call, NOT kernel-only time, and adds no device synchronization. */

@@ -8,7 +8,7 @@
 static int cpu_miss_during_issue;
 static void glm53_cuda_test_cpu_miss_pending(const G53Cuda *g) {
     if (g->group_pending[0] || g->group_pending[1]) cpu_miss_during_issue++;
-    else assert(g->failed); /* first issue can fail before any device launches */
+    else assert(g->failed || g->resident == 0); /* no resident groups, or first issue failed */
 }
 #include "../glm53.c"
 #define G53_ORACLE_NO_MAIN
@@ -132,6 +132,28 @@ static void case_shutdown_pending(void) {
     model_fixture_close(&f);
     assert(group_take_calls - before == 2);
 }
+static void case_integrated_parallel_fill(void) {
+    FixtureModel f;
+    setenv("GLM53_CUDA_PARALLEL_PROMOTE", "1", 1);
+    setenv("GLM53_CUDA_PROFILE", "1", 1);
+    model_fixture(&f, "0,1");
+    assert(f.m.cuda.parallel_promote);
+    float x[ORACLE_D], reference[ORACLE_D] = {0}, got[ORACLE_D] = {0};
+    for (int d = 0; d < ORACLE_D; d++) x[d] = ((d * 7) % 19 - 9) * 0.09f;
+    ffn_layer(&f.m, &f.layer, 0, x, 1, reference);
+    g53_cuda_drop(&f.m.cuda, &f.m.cuda.experts[0]);
+    g53_cuda_drop(&f.m.cuda, &f.m.cuda.experts[1]);
+    f.m.cuda.budget = 4 * f.m.cuda.expert_bytes;
+    g53_cuda_profile_enable(&f.m.cuda, now_s);
+    g53_cuda_heat(&f.m.cuda, 0, 2, 1);
+    ffn_layer(&f.m, &f.layer, 0, x, 1, got);
+    compare_projection("integrated parallel fill vs serial FFN", got, reference, ORACLE_D);
+    assert(f.m.cuda.resident == 3 && f.m.cuda.profile.concurrent_promotions >= 2);
+    assert(!f.m.cuda.failed && !fake_upload_active);
+    model_fixture_close(&f);
+    unsetenv("GLM53_CUDA_PARALLEL_PROMOTE");
+    unsetenv("GLM53_CUDA_PROFILE");
+}
 static void case_diagnostic_value_types(void) {
     const float values[] = {1.5f, NAN, INFINITY, -INFINITY, -2.0f};
     G53DiagValues s = g53_diag_values(values, sizeof(values) / sizeof(values[0]));
@@ -194,6 +216,7 @@ int main(void) {
     case_group("0,1", 0, 0, -1, -1); /* first issue fails before dispatch */
     case_group("0,1", 0, -1, -1, 1); /* nonfinite result never publishes */
     case_shutdown_pending();
+    case_integrated_parallel_fill();
     puts("PASS GLM53 phase-2 groups: completion order, misses, failure, eviction, teardown");
     return 0;
 }

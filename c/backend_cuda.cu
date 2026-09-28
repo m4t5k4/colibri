@@ -1561,6 +1561,10 @@ extern "C" int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
     g_upload_gs = 0;
     return r;
 }
+extern "C" int coli_cuda_tensor_upload_complete(int device) {
+    DeviceContext *ctx = find_ctx(device);
+    return select_ctx(ctx) && cuda_ok(cudaStreamSynchronize(0), "tensor upload complete");
+}
 
 #ifdef COLI_ANS
 struct AnsSidecarHeader {
