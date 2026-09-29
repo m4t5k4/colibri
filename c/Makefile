@@ -1319,7 +1319,7 @@ glm53$(EXE): glm53.c sse41_kernels.h decode_batch.h pin_pool.h cli_args.h st.h j
 	$(CC) $(CFLAGS) glm53.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
 .PHONY: glm53-cuda-tier-check glm53-cuda-check glm53-cuda-multidev-check
-glm53-cuda-tier-check: tests/test_glm53_cuda_adapters$(EXE) tests/test_glm53_cuda_profile$(EXE) tests/test_glm53_cuda_multidev$(EXE) tests/test_glm53_cuda_multidev_oracle$(EXE) tests/test_glm53_cuda_prodshape$(EXE) tests/test_glm53_cuda_scatter$(EXE) tests/test_glm53_cuda_phase2$(EXE) tests/test_glm53_cuda_promotion$(EXE) tests/test_glm53_mla_rows4$(EXE) tests/test_glm53_mla_profile$(EXE)
+glm53-cuda-tier-check: tests/test_glm53_cuda_adapters$(EXE) tests/test_glm53_cuda_profile$(EXE) tests/test_glm53_cuda_multidev$(EXE) tests/test_glm53_cuda_multidev_oracle$(EXE) tests/test_glm53_cuda_prodshape$(EXE) tests/test_glm53_cuda_scatter$(EXE) tests/test_glm53_cuda_phase2$(EXE) tests/test_glm53_cuda_promotion$(EXE) tests/test_glm53_mla_rows4$(EXE) tests/test_glm53_mla_profile$(EXE) tests/test_glm53_mla_absorbed_batch$(EXE)
 	$(CC) $(NOCUDA_CFLAGS) tests/test_glm53_cuda.c -o tests/test_glm53_cuda$(EXE) $(NOCUDA_LDFLAGS)
 	COLI_CUDA=1 COLI_GPU=0 COLI_GPUS= CUDA_EXPERT_GB=auto ./tests/test_glm53_cuda$(EXE)
 	./tests/test_glm53_cuda_adapters$(EXE)
@@ -1332,11 +1332,15 @@ glm53-cuda-tier-check: tests/test_glm53_cuda_adapters$(EXE) tests/test_glm53_cud
 	./tests/test_glm53_cuda_promotion$(EXE)
 	./tests/test_glm53_mla_rows4$(EXE)
 	./tests/test_glm53_mla_profile$(EXE)
+	./tests/test_glm53_mla_absorbed_batch$(EXE)
 
 tests/test_glm53_mla_rows4$(EXE): tests/test_glm53_mla_rows4.c glm53.c quant.h segment_runtime.c edge_runtime.c
 	$(CC) $(filter-out -DCOLI_METAL -DCOLI_VULKAN,$(NOCUDA_CFLAGS)) $< segment_runtime.c edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_glm53_mla_profile$(EXE): tests/test_glm53_mla_profile.c tests/test_glm53_mla_rows4.c tests/test_glm53_cuda.c glm53.c glm53_cuda.h segment_runtime.c edge_runtime.c
+	$(CC) $(filter-out -DCOLI_METAL -DCOLI_VULKAN,$(NOCUDA_CFLAGS)) -DCOLI_CUDA $< segment_runtime.c edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_glm53_mla_absorbed_batch$(EXE): tests/test_glm53_mla_absorbed_batch.c tests/bench_glm53_mla_absorbed.c tests/test_glm53_cuda.c glm53.c quant.h glm53_cuda.h segment_runtime.c edge_runtime.c
 	$(CC) $(filter-out -DCOLI_METAL -DCOLI_VULKAN,$(NOCUDA_CFLAGS)) -DCOLI_CUDA $< segment_runtime.c edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
 
 .PHONY: glm53-mla-absorbed-bench

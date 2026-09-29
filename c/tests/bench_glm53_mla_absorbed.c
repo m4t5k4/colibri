@@ -95,6 +95,10 @@ static void bench_batched(float *out, const Mat *w, const float *x) {
     }
 }
 
+static void bench_production_batch(float *out, const Mat *w, const float *x) {
+    (void)mla_absorbed_queries(out, w, x, BH, BR, BI, 1, 1);
+}
+
 /* Diagnostic control: the same row body as BATCHED, but 64 parallel regions.
  * A difference between CURRENT and this control is benchmark codegen, not
  * evidence that team creation caused the entire CURRENT/BATCHED gap. */
@@ -114,15 +118,17 @@ static void bench_same_row_64_regions(float *out, const Mat *w, const float *x) 
 }
 
 static void bench_parity(Mat *w, float *x, float *current, float *batched,
-                         float *same_row) {
+                         float *same_row, float *production) {
     for (unsigned pattern = 0; pattern < 4; pattern++) {
         bench_fill(w, x, pattern);
         bench_current(current, w, x);
         bench_batched(batched, w, x);
         bench_same_row_64_regions(same_row, w, x);
+        bench_production_batch(production, w, x);
         for (int i = 0; i < BO; i++) {
             if (memcmp(current + i, batched + i, sizeof(float)) ||
-                memcmp(current + i, same_row + i, sizeof(float))) {
+                memcmp(current + i, same_row + i, sizeof(float)) ||
+                memcmp(current + i, production + i, sizeof(float))) {
                 uint32_t old_bits, new_bits, control_bits;
                 memcpy(&old_bits, current + i, sizeof old_bits);
                 memcpy(&new_bits, batched + i, sizeof new_bits);
@@ -133,8 +139,16 @@ static void bench_parity(Mat *w, float *x, float *current, float *batched,
             }
             assert(isfinite(current[i]));
         }
+        if (getenv("GLM53_ABSORBED_BENCH_HASH")) {
+            uint64_t hash = UINT64_C(1469598103934665603);
+            const uint8_t *bytes = (const uint8_t *)current;
+            for (size_t i = 0; i < (size_t)BO * sizeof(float); i++)
+                hash = (hash ^ bytes[i]) * UINT64_C(1099511628211);
+            printf("absorbed legacy hash pattern=%u fnv64=%016llx\n",
+                   pattern, (unsigned long long)hash);
+        }
     }
-    puts("absorbed parity: PASS (4 patterns, all 32768 output bits each, both prototypes)");
+    puts("absorbed parity: PASS (4 patterns, all 32768 output bits each, prototypes and production)");
 }
 
 static double bench_elapsed(void (*fn)(float *, const Mat *, const float *),
@@ -151,6 +165,7 @@ static double bench_median3(double a, double b, double c) {
     return b;
 }
 
+#ifndef GLM53_ABSORBED_BENCH_NO_MAIN
 int main(int argc, char **argv) {
     int parity_only = argc > 1 && !strcmp(argv[1], "--parity-only");
     int iterations = 1024;
@@ -171,40 +186,49 @@ int main(int argc, char **argv) {
     float *current = malloc((size_t)BO * sizeof(float));
     float *batched = malloc((size_t)BO * sizeof(float));
     float *same_row = malloc((size_t)BO * sizeof(float));
-    if (!w.q4 || !w.s || !x || !current || !batched || !same_row) {
+    float *production = malloc((size_t)BO * sizeof(float));
+    if (!w.q4 || !w.s || !x || !current || !batched || !same_row || !production) {
         fprintf(stderr, "absorbed benchmark: allocation failed\n");
         return 2;
     }
-    bench_parity(&w, x, current, batched, same_row);
+    bench_parity(&w, x, current, batched, same_row, production);
     if (!parity_only) {
         bench_fill(&w, x, 0);
         for (int i = 0; i < 4; i++) {
             bench_current(current, &w, x);
             bench_batched(batched, &w, x);
             bench_same_row_64_regions(same_row, &w, x);
+            bench_production_batch(production, &w, x);
         }
-        double times_current[BTRIALS], times_batched[BTRIALS], times_same_row[BTRIALS];
+        const int production_fast_path = mla_absorbed_queries(
+            production, &w, x, BH, BR, BI, 1, 1);
+        double times_current[BTRIALS], times_batched[BTRIALS];
+        double times_same_row[BTRIALS], times_production[BTRIALS];
         for (int trial = 0; trial < BTRIALS; trial++) {
             if (trial & 1) {
                 times_batched[trial] = bench_elapsed(bench_batched, batched, &w, x, iterations);
+                times_production[trial] = bench_elapsed(bench_production_batch, production, &w, x, iterations);
                 times_same_row[trial] = bench_elapsed(bench_same_row_64_regions, same_row, &w, x, iterations);
                 times_current[trial] = bench_elapsed(bench_current, current, &w, x, iterations);
             } else {
                 times_current[trial] = bench_elapsed(bench_current, current, &w, x, iterations);
                 times_same_row[trial] = bench_elapsed(bench_same_row_64_regions, same_row, &w, x, iterations);
+                times_production[trial] = bench_elapsed(bench_production_batch, production, &w, x, iterations);
                 times_batched[trial] = bench_elapsed(bench_batched, batched, &w, x, iterations);
             }
         }
         const double tc = bench_median3(times_current[0], times_current[1], times_current[2]);
         const double tb = bench_median3(times_batched[0], times_batched[1], times_batched[2]);
         const double ts = bench_median3(times_same_row[0], times_same_row[1], times_same_row[2]);
+        const double tp = bench_median3(times_production[0], times_production[1], times_production[2]);
         const int single_iterations = iterations * 16;
         const double single_start = now_s();
         for (int i = 0; i < single_iterations; i++)
             mv_rows(current, &w, x, 0, BR);
         const double single_s = now_s() - single_start;
         if (memcmp(current, batched, (size_t)BO * sizeof(float)) ||
-            memcmp(current, same_row, (size_t)BO * sizeof(float))) {
+            memcmp(current, same_row, (size_t)BO * sizeof(float)) ||
+            memcmp(current, production, (size_t)BO * sizeof(float))) {
             fprintf(stderr, "absorbed benchmark: timed results changed\n");
             return 1;
         }
@@ -216,6 +240,7 @@ int main(int argc, char **argv) {
                "current_1408_s=%.6f batched_1408_s=%.6f "
                "single_head_us=%.3f current_64_heads_ms=%.6f "
                "same_row_64_regions_total_s=%.6f same_row_vs_batched=%.4fx "
+               "production_batch_total_s=%.6f production_fast_path=%d "
                "parity=bitwise\n",
 #ifdef _OPENMP
                omp_get_max_threads(),
@@ -226,8 +251,10 @@ int main(int argc, char **argv) {
                100.0 * (1.0 - tb / tc), 1000.0 * tc / iterations,
                1000.0 * tb / iterations, 1408.0 * tc / iterations,
                1408.0 * tb / iterations, 1e6 * single_s / single_iterations,
-               1000.0 * tc / iterations, ts, ts / tb);
+               1000.0 * tc / iterations, ts, ts / tb, tp,
+               production_fast_path);
     }
-    free(same_row); free(batched); free(current); free(x); mat_release(&w);
+    free(production); free(same_row); free(batched); free(current); free(x); mat_release(&w);
     return 0;
 }
+#endif

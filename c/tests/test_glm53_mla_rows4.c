@@ -115,6 +115,8 @@ static void one_token_mla_case(int profiled, int qb_experiment) {
     GModel baseline = {0}, experimental = {0};
     experimental.mla_out_rows4 = 1;
     experimental.mla_qb_rows4 = qb_experiment;
+    experimental.mla_absorbed_batch = 1; /* Tiny geometry must keep mv_rows. */
+    experimental.mla_decode_call = 1;
 #ifdef COLI_CUDA
     if (profiled) experimental.cuda.profile.clock = now_s;
 #else
@@ -143,13 +145,14 @@ static void one_token_mla_case(int profiled, int qb_experiment) {
         assert(experimental.t_mla_proj >= child);
         assert(experimental.t_mla_proj - child < 0.01);
         G53DecodeBase start, end;
-        g53_decode_capture(&experimental, &start); /* one prefill MLA already ran */
+        g53_decode_capture(&experimental, &start); /* first synthetic MLA already ran */
         mla_layer(&experimental, &c, &l, x, 1, fast, &st, 0);
         assert(memcmp(generic, fast, sizeof(generic)) == 0);
         g53_decode_capture(&experimental, &end);
         g53_decode_accumulate(&experimental.decode_total, &end, &start);
         const G53DecodeBase *d = &experimental.decode_total;
         assert(d->valid && d->mla_absorbed_q_calls == 3 && d->mla_absorbed_q_rows == 3 * 64);
+        assert(d->mla_absorbed_batch_calls == 0 && d->mla_absorbed_legacy_calls == 1);
         assert(d->mla_query_path == end.mla_query_path - start.mla_query_path);
         assert(d->mla_qa == end.mla_qa - start.mla_qa);
         assert(d->mla_qnorm == end.mla_qnorm - start.mla_qnorm);
@@ -180,9 +183,12 @@ static void one_token_mla_case(int profiled, int qb_experiment) {
         assert(experimental.mla_absorbed_q_rows == 0);
     }
     assert(baseline.mla_out_generic_calls == 1);
+    assert(baseline.mla_absorbed_batch_calls == 0 && baseline.mla_absorbed_legacy_calls == 1);
     assert(baseline.mla_qb_rows4_calls == 0);
     assert(baseline.mla_qb_generic_calls == 1);
     const int calls = profiled ? 2 : 1;
+    assert(experimental.mla_absorbed_batch_calls == 0);
+    assert(experimental.mla_absorbed_legacy_calls == (uint64_t)calls);
     assert(experimental.mla_out_rows4_calls == (uint64_t)calls * EXPECT_ROWS4);
     assert(experimental.mla_out_generic_calls == (uint64_t)calls * !EXPECT_ROWS4);
     assert(experimental.mla_qb_rows4_calls ==

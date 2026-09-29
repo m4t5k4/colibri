@@ -708,6 +708,7 @@ typedef struct {
     double mla_qa, mla_qnorm, mla_qb;
     uint64_t mla_qb_rows4_calls, mla_qb_generic_calls;
     uint64_t mla_absorbed_q_calls, mla_absorbed_q_rows;
+    uint64_t mla_absorbed_batch_calls, mla_absorbed_legacy_calls;
 } G53DecodeBase;
 #endif
 typedef struct {
@@ -745,6 +746,9 @@ typedef struct {
     double t_mla_query_path, t_mla_latent_path, t_mla_absorbed_q, t_mla_index_path;
     double t_mla_qa, t_mla_qnorm, t_mla_qb;
     uint64_t mla_absorbed_q_calls, mla_absorbed_q_rows;
+    int mla_absorbed_batch;
+    int mla_decode_call;
+    uint64_t mla_absorbed_batch_calls, mla_absorbed_legacy_calls;
     int mla_qb_rows4;
     uint64_t mla_qb_rows4_calls, mla_qb_generic_calls;
     int mla_out_rows4;
@@ -789,6 +793,8 @@ static void g53_decode_capture(const GModel *m, G53DecodeBase *s) {
     s->mla_qb_generic_calls = m->mla_qb_generic_calls;
     s->mla_absorbed_q_calls = m->mla_absorbed_q_calls;
     s->mla_absorbed_q_rows = m->mla_absorbed_q_rows;
+    s->mla_absorbed_batch_calls = m->mla_absorbed_batch_calls;
+    s->mla_absorbed_legacy_calls = m->mla_absorbed_legacy_calls;
 }
 static void g53_decode_accumulate(G53DecodeBase *total, const G53DecodeBase *end,
                                   const G53DecodeBase *start) {
@@ -815,6 +821,7 @@ static void g53_decode_accumulate(G53DecodeBase *total, const G53DecodeBase *end
     G53_DECODE_DELTA(mla_qa); G53_DECODE_DELTA(mla_qnorm); G53_DECODE_DELTA(mla_qb);
     G53_DECODE_DELTA(mla_qb_rows4_calls); G53_DECODE_DELTA(mla_qb_generic_calls);
     G53_DECODE_DELTA(mla_absorbed_q_calls); G53_DECODE_DELTA(mla_absorbed_q_rows);
+    G53_DECODE_DELTA(mla_absorbed_batch_calls); G53_DECODE_DELTA(mla_absorbed_legacy_calls);
 #undef G53_DECODE_DELTA
 }
 static void g53_decode_report(const GModel *m) {
@@ -823,7 +830,7 @@ static void g53_decode_report(const GModel *m) {
     const double *s = d->cuda_seconds;
     double cuda_expert = s[G53_GATE] + s[G53_UP] + s[G53_CLAMP] + s[G53_DOWN]
                        + s[G53_GROUP_ISSUE] + s[G53_GROUP_TAKE];
-    fprintf(stderr, "[glm53-cuda-decode-profile] decode_tokens=%llu disk_s=%.6f attn_s=%.6f ffn_s=%.6f fallback_compute_s=%.6f promotion_s=%.6f planning_s=%.6f join_wait_s=%.6f deferred_join_wait_s=%.6f cuda_expert_s=%.6f head_s=%.6f kda_proj_s=%.6f kda_qkv_s=%.6f kda_decay_s=%.6f kda_beta_s=%.6f kda_core_s=%.6f kda_out_s=%.6f kda_gateproj_s=%.6f kda_normgate_s=%.6f kda_ko_s=%.6f mla_proj_s=%.6f mla_index_s=%.6f mla_core_s=%.6f mla_score_s=%.6f mla_value_s=%.6f mla_out_s=%.6f mla_query_path_s=%.6f mla_latent_path_s=%.6f mla_absorbed_q_s=%.6f mla_index_path_s=%.6f mla_proj_residual_s=%.6f mla_absorbed_q_calls=%llu mla_absorbed_q_rows=%llu mla_qa_s=%.6f mla_qnorm_s=%.6f mla_qb_s=%.6f mla_query_residual_s=%.6f mla_qb_rows4_calls=%llu mla_qb_generic_calls=%llu\n",
+    fprintf(stderr, "[glm53-cuda-decode-profile] decode_tokens=%llu disk_s=%.6f attn_s=%.6f ffn_s=%.6f fallback_compute_s=%.6f promotion_s=%.6f planning_s=%.6f join_wait_s=%.6f deferred_join_wait_s=%.6f cuda_expert_s=%.6f head_s=%.6f kda_proj_s=%.6f kda_qkv_s=%.6f kda_decay_s=%.6f kda_beta_s=%.6f kda_core_s=%.6f kda_out_s=%.6f kda_gateproj_s=%.6f kda_normgate_s=%.6f kda_ko_s=%.6f mla_proj_s=%.6f mla_index_s=%.6f mla_core_s=%.6f mla_score_s=%.6f mla_value_s=%.6f mla_out_s=%.6f mla_query_path_s=%.6f mla_latent_path_s=%.6f mla_absorbed_q_s=%.6f mla_index_path_s=%.6f mla_proj_residual_s=%.6f mla_absorbed_q_calls=%llu mla_absorbed_q_rows=%llu mla_qa_s=%.6f mla_qnorm_s=%.6f mla_qb_s=%.6f mla_query_residual_s=%.6f mla_qb_rows4_calls=%llu mla_qb_generic_calls=%llu mla_absorbed_batch_calls=%llu mla_absorbed_legacy_calls=%llu\n",
             (unsigned long long)m->cuda.profile.decode_tokens,
             d->disk, d->attn, d->ffn, s[G53_FALLBACK], s[G53_PROMOTION],
             d->planning, d->join_wait, d->deferred_join_wait, cuda_expert, d->head,
@@ -841,7 +848,9 @@ static void g53_decode_report(const GModel *m) {
             d->mla_qa, d->mla_qnorm, d->mla_qb,
             d->mla_query_path - d->mla_qa - d->mla_qnorm - d->mla_qb,
             (unsigned long long)d->mla_qb_rows4_calls,
-            (unsigned long long)d->mla_qb_generic_calls);
+            (unsigned long long)d->mla_qb_generic_calls,
+            (unsigned long long)d->mla_absorbed_batch_calls,
+            (unsigned long long)d->mla_absorbed_legacy_calls);
 }
 #endif
 
@@ -1642,6 +1651,50 @@ static void kda_layer(GModel *m, const Cfg *c, const GLayer *l, const float *x, 
 }
 
 /* ---------- MLA + indexer con k-pool ---------- */
+static int mla_absorbed_queries(float *out, const Mat *w, const float *queries,
+                                int heads, int latent, int qk, int tokens, int enabled) {
+#if defined(__AVX2__) && defined(_OPENMP) && !defined(COLI_METAL) && !defined(COLI_VULKAN)
+    /* Keep this first experiment on the measured GLM-5.3-Flash geometry. */
+    if (enabled && !omp_in_parallel() && tokens == 1 &&
+        heads == 64 && latent == 512 && qk == 256 &&
+        w->fmt == 4 && w->gs == 64 && w->rows == heads * latent &&
+        w->columns == qk && w->q4 && w->s) {
+        const int packed = (qk + 1) / 2, groups = (qk + w->gs - 1) / w->gs;
+        #pragma omp parallel for schedule(static)
+        for (int flat = 0; flat < heads * latent; flat++) {
+            const int h = flat / latent;
+            out[flat] = matmul_i4_grouped_row(
+                queries + (size_t)h * qk,
+                w->q4 + (size_t)flat * packed,
+                w->s + (size_t)flat * groups, qk, w->gs);
+        }
+        return 1;
+    }
+#else
+    (void)enabled;
+#endif
+    for (int h = 0; h < heads; h++)
+        mv_rows(out + (size_t)h * latent, w, queries + (size_t)h * qk,
+                h * latent, latent);
+    return 0;
+}
+
+static void mla_absorbed_project(GModel *m, float *out, const Mat *w,
+                                 const float *queries, int heads, int latent,
+                                 int qk, int tokens, int profile_proj) {
+    const double started = profile_proj ? now_s() : 0;
+    const int batched = mla_absorbed_queries(out, w, queries, heads, latent, qk,
+                                             tokens, m->mla_absorbed_batch &&
+                                             m->mla_decode_call);
+    if (profile_proj) {
+        m->t_mla_absorbed_q += now_s() - started;
+        m->mla_absorbed_q_calls += (uint64_t)heads;
+        m->mla_absorbed_q_rows += (uint64_t)heads * (uint64_t)latent;
+    }
+    if (batched) m->mla_absorbed_batch_calls++;
+    else m->mla_absorbed_legacy_calls++;
+}
+
 static void mla_layer(GModel *m, const Cfg *c, const GLayer *l, const float *x, int tokens,
                       float *out, GLayerState *st, int base) {
     const int H = c->n_heads, QK = c->qk_nope, V = c->v_head;
@@ -1692,15 +1745,9 @@ static void mla_layer(GModel *m, const Cfg *c, const GLayer *l, const float *x, 
 
         /* la query entra nello spazio del latente una volta per testa, invece
          * che il latente nello spazio della query una volta per posizione */
-        const double t_absorbed0 = profile_proj ? now_s() : 0;
-        for (int h = 0; h < H; h++)
-            mv_rows(absorbed + ((size_t)t * H + h) * L, &l->kvb_kt,
-                    queries + ((size_t)t * H + h) * QK, h * L, L);
-        if (profile_proj) {
-            m->t_mla_absorbed_q += now_s() - t_absorbed0;
-            m->mla_absorbed_q_calls += (uint64_t)H;
-            m->mla_absorbed_q_rows += (uint64_t)H * (uint64_t)L;
-        }
+        mla_absorbed_project(m, absorbed + (size_t)t * H * L, &l->kvb_kt,
+                             queries + (size_t)t * H * QK, H, L, QK, tokens,
+                             profile_proj);
 
         /* indexer: le query vengono dal q_a normalizzato, le chiavi dall'hidden
          * con LayerNorm (con bias), e i pesi per testa sono scalati da IH^-0.5 */
@@ -3274,11 +3321,17 @@ static int glm53_mla_qb_rows4_env(void) {
     return setting && !strcmp(setting, "1");
 }
 
+static int glm53_mla_absorbed_batch_env(void) {
+    const char *setting = getenv("GLM53_MLA_ABSORBED_BATCH");
+    return setting && !strcmp(setting, "1");
+}
+
 static void model_load_range(GModel *m, const char *dir, int layer_begin,
                              int layer_end, int load_io) {
     load_cfg(&m->c, dir);
     m->mla_out_rows4 = glm53_mla_out_rows4_env();
     m->mla_qb_rows4 = glm53_mla_qb_rows4_env();
+    m->mla_absorbed_batch = glm53_mla_absorbed_batch_env();
     st_init(&m->S, dir);
     glm53_mirror_setup(m, dir);
     /* Il checkpoint reale annida il modello testuale sotto il wrapper vision;
@@ -3918,7 +3971,8 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
                     "mla_out_rows4_calls=%llu mla_out_generic_calls=%llu "
                     "attn_s=%.6f mla_qa_s=%.6f mla_qnorm_s=%.6f "
                     "mla_qb_s=%.6f mla_query_residual_s=%.6f "
-                    "mla_qb_rows4_calls=%llu mla_qb_generic_calls=%llu\n",
+                    "mla_qb_rows4_calls=%llu mla_qb_generic_calls=%llu "
+                    "mla_absorbed_batch_calls=%llu mla_absorbed_legacy_calls=%llu\n",
                     (unsigned long long)p->decode_tokens,
                     m->t_kda, m->t_kda_proj, m->t_kda_core, m->t_kda_out,
                     m->t_kda_qkv, m->t_kda_decay, m->t_kda_beta,
@@ -3931,7 +3985,9 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
                     m->t_mla_qa, m->t_mla_qnorm, m->t_mla_qb,
                     m->t_mla_query_path - m->t_mla_qa - m->t_mla_qnorm - m->t_mla_qb,
                     (unsigned long long)m->mla_qb_rows4_calls,
-                    (unsigned long long)m->mla_qb_generic_calls);
+                    (unsigned long long)m->mla_qb_generic_calls,
+                    (unsigned long long)m->mla_absorbed_batch_calls,
+                    (unsigned long long)m->mla_absorbed_legacy_calls);
     }
 #endif
     return logits;
@@ -3940,12 +3996,14 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
 /* Label actual decode calls explicitly: a one-token prefill is still prefill.
  * Timing covers forward_span, excluding sampling, text output and this report. */
 static float *forward_decode(GModel *m, GSession *s, const int *token) {
+    m->mla_decode_call = 1;
 #ifdef COLI_CUDA
     if (m->cuda.profile.clock) g53_decode_capture(m, &m->decode_base);
     m->cuda.decode_call = 1;
     if (m->cuda.profile.clock) m->cuda.profile.decode = 1;
 #endif
     float *logits = forward_span(m, s, token, 1, NULL, 0);
+    m->mla_decode_call = 0;
 #ifdef COLI_CUDA
     if (m->cuda.profile.clock) m->cuda.profile.decode = 0;
     m->cuda.decode_call = 0;

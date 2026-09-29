@@ -141,6 +141,37 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
             y[(int64_t)s*O+o]=a*sc; } }
 }
 
+/* One grouped-int4 output row. Keep its operation order shared by the normal
+ * matvec and MLA's optional per-head batch; neither combines output rows. */
+static inline float matmul_i4_grouped_row(const float *xs, const uint8_t *w,
+                                          const float *scl, int I, int gs) {
+    float a=0;
+    for(int g=0; g*gs<I; g++){
+        int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base;
+        float sc=scl[g];
+        int i=base;
+#ifdef __AVX2__
+        const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
+        __m256 acc=_mm256_setzero_ps();
+        for(; i+16<=base+glen; i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
+            __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+            __m128i nib=_mm_unpacklo_epi8(lo,hi);
+            __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
+            __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
+            acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
+            acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
+        /* Keep the explicit FMA that fixes the grouped reduction's rounding. */
+        a=fmaf(hsum256(acc),sc,a);
+#endif
+        for(; i<base+glen; i+=2){
+            if(i+1<base+glen){ uint8_t byte=w[i>>1];
+                a+=(xs[i]*(float)((int)(byte&0xF)-8)+xs[i+1]*(float)((int)(byte>>4)-8))*sc; }
+            else { uint8_t byte=w[i>>1]; a+=xs[i]*(float)((int)(byte&0xF)-8)*sc; }
+        }
+    }
+    return a;
+}
+
 /* ---- y[S,O] = x[S,I] @ W^T, W int4 packed + per-GROUP scales (fmt=4) ----- */
 static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
                               int S, int I, int O, int gs){
@@ -159,37 +190,8 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
         const uint8_t *w=q4+(int64_t)o*rb;
         const float *scl=scale+(int64_t)o*ng;
         for(int s=0;s<S;s++){
-            const float *xs=x+(int64_t)s*I; float a=0;
-            for(int g=0; g*gs<I; g++){
-                int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base;
-                float sc=scl[g];
-                int i=base;
-#ifdef __AVX2__
-                const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
-                __m256 acc=_mm256_setzero_ps();
-                for(; i+16<=base+glen; i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
-                    __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-                    __m128i nib=_mm_unpacklo_epi8(lo,hi);
-                    __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
-                    __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
-                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
-                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
-                /* Pinned as an fma in the SOURCE. With the default
-                 * -ffp-contract=fast the compiler may fuse this multiply-add
-                 * (one rounding) or not (two), so the same source produced
-                 * different bits depending on the flag -- see the PR for a
-                 * reproduction. That made every bit-exactness gate, including
-                 * the glm_tiny token oracle, depend on build flags rather than
-                 * on the code. */
-                a=fmaf(hsum256(acc),sc,a);
-#endif
-                for(; i<base+glen; i+=2){
-                    if(i+1<base+glen){ uint8_t byte=w[i>>1];
-                        a+=(xs[i]*(float)((int)(byte&0xF)-8)+xs[i+1]*(float)((int)(byte>>4)-8))*sc; }
-                    else { uint8_t byte=w[i>>1]; a+=xs[i]*(float)((int)(byte&0xF)-8)*sc; }
-                }
-            }
-            y[(int64_t)s*O+o]=a;
+            const float *xs=x+(int64_t)s*I;
+            y[(int64_t)s*O+o]=matmul_i4_grouped_row(xs,w,scl,I,gs);
         }
     }
 }

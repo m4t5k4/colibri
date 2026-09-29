@@ -187,6 +187,21 @@ and decode-window `[glm53-cuda-decode-profile]` lines report
 `mla_qb_rows4_calls` and `mla_qb_generic_calls`; existing projection timers
 keep their previous boundaries.
 
+`GLM53_MLA_ABSORBED_BATCH=1` is a separate, default-off CPU MLA experiment.
+For explicit one-token decode (one-token prefill stays legacy) with the
+GLM-5.3-Flash absorbed-query geometry (64 heads,
+512 latent rows per head, 256 input columns) and fmt4/gs64 weights, AVX2/OpenMP
+builds compute all head/row outputs in one static OpenMP region. Each row
+uses the same grouped-int4 arithmetic as the generic matvec; unsupported
+geometry, formats, builds, nested OpenMP calls, and multi-token calls keep the per-head `mv_rows`
+loop. The existing `mla_absorbed_q_s` timer still encloses this projection.
+`mla_absorbed_batch_calls` counts eligible one-token MLA projections, while
+`mla_absorbed_legacy_calls` counts projections using the original loop; each
+is one MLA layer/token, not one head. Both counters appear in the cumulative
+`[glm53-attn-split]` and decode-only `[glm53-cuda-decode-profile]` lines.
+The synthetic production-shape parity/throughput fixture is available with
+`make glm53-mla-absorbed-bench` from `c/`.
+
 `CUDA_EXPERT_GB` is a total decimal-GB cap across all selected devices, or
 `auto` (default): the sum of free VRAM minus 2 GB of runtime headroom on each
 device, floored at zero per device. A numeric cap is clamped to that total;
