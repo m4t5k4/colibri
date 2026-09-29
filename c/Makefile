@@ -1384,6 +1384,14 @@ glm53-cuda-check: $(CUDA_OBJ)
 	$(CC) $(CFLAGS) -DG53_REAL_CUDA tests/test_glm53_cuda.c $(CUDA_OBJ) -o tests/test_glm53_cuda_real$(EXE) $(LDFLAGS)
 	COLI_CUDA=1 COLI_GPU=0 COLI_GPUS= CUDA_EXPERT_GB=auto ./tests/test_glm53_cuda_real$(EXE)
 
+# Standalone Phase 2F1: compile the existing CUDA GEMV in the test translation
+# unit; neither glm53 nor the production backend gains a KDA call path.
+.PHONY: glm53-kda-cuda-proto-check
+glm53-kda-cuda-proto-check: tests/test_glm53_kda_cuda.cu backend_cuda.cu delta_attention.h
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) tests/test_glm53_kda_cuda.cu -o tests/test_glm53_kda_cuda$(EXE)
+	./tests/test_glm53_kda_cuda$(EXE)
+
 # Synthetic two-device numerical oracle. Skip cleanly when CUDA reports <2 devices.
 glm53-cuda-multidev-check: $(CUDA_OBJ)
 	@test -n "$(CUDA_OBJ)" || { echo "requires CUDA=1" >&2; exit 1; }
