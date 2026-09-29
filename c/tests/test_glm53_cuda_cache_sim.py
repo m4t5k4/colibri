@@ -242,6 +242,17 @@ A,6,0,1
         self.assertEqual(output(), output())
         self.assertIn("oracle_not_deployable", output())
 
+    def test_warm_trace_markers_are_separate_from_runtime_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trace = Path(directory) / "warm.trace"
+            trace.write_text("W,0,2,0,0\nW,0,1,1,1\nB,2,2\nS,1,1,0,2,1,1\n")
+            parsed = list(SIM.events(trace))
+            self.assertEqual(SIM.warm_trace_prefix(parsed), ([(0, 2, 0, 0), (0, 1, 1, 1)], (2, 2)))
+            with self.assertRaisesRegex(ValueError, "cold trace"):
+                SIM.replay(parsed, (1, 1))
+            with self.assertRaisesRegex(ValueError, "start cold"):
+                SIM.replay_warm(parsed, (1, 1), 2, 2, 1, {"baseline": []})
+
     def test_command_output_and_device_log_are_deterministic(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)

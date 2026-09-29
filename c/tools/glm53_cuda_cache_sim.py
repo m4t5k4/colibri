@@ -24,7 +24,7 @@ POLICIES = (("current_t2_m1", 2, 1), ("margin_0", 2, 0),
 
 
 def events(path):
-    lengths = {"S": 7, "A": 4, "P": 6, "E": 10}
+    lengths = {"S": 7, "A": 4, "P": 6, "E": 10, "W": 5, "B": 3}
     with Path(path).open(encoding="utf-8") as stream:
         for number, line in enumerate(stream, 1):
             if not line.strip() or line.startswith("#"):
@@ -52,6 +52,27 @@ def selections(path):
         if kind == "S":
             tick, token, layer, eid, rows, resident = values
             yield tick, token, (layer, eid), rows, resident
+
+
+def warm_trace_prefix(trace):
+    """Extract preload publications and the transition to normal inference."""
+    placed = []
+    boundary = None
+    inference = False
+    for kind, values in trace:
+        if kind == "W":
+            if inference or boundary is not None:
+                raise ValueError("warm publication after inference boundary")
+            placed.append(values)
+        elif kind == "B":
+            if boundary is not None or inference or values != (len(placed), len(placed)):
+                raise ValueError("inconsistent warm inference boundary")
+            boundary = values
+        elif kind == "S":
+            inference = True
+            if placed and boundary is None:
+                raise ValueError("warm trace lacks inference boundary")
+    return placed, boundary
 
 
 @dataclass
@@ -197,6 +218,8 @@ def replay(trace, capacities, heat_min=2, heat_margin=1):
         pending = []
 
     for kind, value in trace:
+        if kind in ("W", "B"):
+            raise ValueError("dynamic replay requires a cold trace; inspect warm placement with warm_trace_prefix")
         if kind == "S":
             tick, token, layer, eid, rows, observed_resident = value
             if rows < 0 or token < 0 or observed_resident not in (0, 1):
@@ -408,12 +431,15 @@ def event_mismatch(actual, simulated):
 
 def replay_warm(trace, capacities, capacity, heat_min, heat_margin, warm_sets, devices=None):
     """Replay one complete profiled run; observed events validate the cold baseline."""
+    trace = list(trace)
     if not capacities or any(cap < 1 for cap in capacities) or capacity < 1:
         raise ValueError("positive ordered per-device and shared capacities are required")
     if heat_min < 1 or heat_margin < 0:
         raise ValueError("invalid heat policy")
     if capacity > sum(capacities):
         raise ValueError("shared capacity exceeds physical device slots")
+    if any(kind in ("W", "B") for kind, _ in trace):
+        raise ValueError("counterfactual baseline trace must start cold; use warm_trace_prefix to inspect warm publications")
     states = {name: PolicyState(tuple(capacities), heat_min, heat_margin,
                                 shared_capacity=capacity) for name in warm_sets}
     for name, keys in warm_sets.items():

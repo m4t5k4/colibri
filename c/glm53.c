@@ -132,6 +132,7 @@ typedef struct {
 } Cfg;
 
 static char g_glm53_usage[2100];
+static int64_t g_glm53_usage_history;
 
 /* Routing telemetry belongs to the standalone/serve lifecycle. Segment may
  * host multiple engines in one process, while route_trace.h owns one process-
@@ -145,10 +146,10 @@ static void glm53_telemetry_init(const char *snap, const Cfg *c) {
     if (up && *up) snprintf(g_glm53_usage, sizeof g_glm53_usage, "%s", up);
     else snprintf(g_glm53_usage, sizeof g_glm53_usage, "%s/.coli_usage", snap);
 
-    int64_t history = rt_load(g_glm53_usage);
-    if (history > 0)
+    g_glm53_usage_history = rt_load(g_glm53_usage);
+    if (g_glm53_usage_history > 0)
         fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n",
-                (long long)history, g_glm53_usage);
+                (long long)g_glm53_usage_history, g_glm53_usage);
 }
 
 static void glm53_telemetry_save(void) {
@@ -2431,6 +2432,44 @@ static Slot *expert_slot(GModel *m, int layer, int eid) {
     slot->used = ++m->clock;
     return slot;
 }
+#ifdef COLI_CUDA
+/* The shared usage loader has already validated and accumulated history. This
+ * reusable slot is only an upload source; device tensors own their bytes. */
+static void glm53_cuda_warm_start(GModel *m) {
+    G53Cuda *g = &m->cuda;
+    if (!g->warm_enabled) return;
+    double start = now_s();
+    int n = 0;
+    G53CudaWarmCandidate *ranked = NULL;
+    if (g_glm53_usage_history > 0)
+        ranked = g53_cuda_warm_rank(g, rt_counts_all(), m->c.first_dense, &n);
+    g->warm_candidates = (size_t)n;
+    if (g_glm53_usage_history > 0 && !ranked) {
+        g->warm_failed++;
+        fprintf(stderr, "[glm53-cuda-warm] ranking unavailable; using dynamic cache\n");
+    }
+    Slot slot = {.eid = -1};
+    long miss_before = m->miss;
+    uint64_t bytes_before = m->ebytes;
+    size_t target = g->warm_requested < (size_t)n ? g->warm_requested : (size_t)n;
+    for (size_t i = 0; i < target && !g->failed; i++) {
+        int layer = ranked[i].layer, eid = ranked[i].eid;
+        if (g->expert_bytes > g->budget || g->bytes > g->budget - g->expert_bytes ||
+            g53_cuda_place(g) < 0) break;
+        double read_start = now_s();
+        expert_read(m, layer, eid, &slot);
+        g->warm_read_s += now_s() - read_start;
+        if (!g53_cuda_warm_upload(g, layer, eid, slot.piece, now_s)) break;
+    }
+    m->miss = miss_before;
+    m->ebytes = bytes_before;
+    free(slot.own);
+    free(ranked);
+    g->warm_total_s = now_s() - start;
+    g53_cuda_warm_boundary(g);
+    g53_cuda_warm_report(g, "startup");
+}
+#endif
 
 /* Le tre matrici di un esperto, che puntano dentro al suo slot. */
 static void expert_mats(const GModel *m, const Slot *slot, Mat *gate, Mat *up, Mat *down) {
@@ -3869,6 +3908,12 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
                            const float *vision, int n_vision) {
 #ifdef COLI_CUDA
     const double profile_start = g53_cuda_profile_now(&m->cuda);
+    if (m->cuda.warm_enabled) {
+        if (m->cuda.warm_first_forward_resident < 0)
+            m->cuda.warm_first_forward_resident = (int)m->cuda.resident;
+        if (m->cuda.decode_call && m->cuda.warm_first_decode_resident < 0)
+            m->cuda.warm_first_decode_resident = (int)m->cuda.resident;
+    }
 #endif
     const Cfg *c = &m->c;
     const int H = c->hc_mult;
@@ -4990,6 +5035,9 @@ int main(int argc, char **argv) {
         memset(&served, 0, sizeof(served));
         model_load(&served, snap);
         glm53_telemetry_init(snap, &served.c);
+#ifdef COLI_CUDA
+        glm53_cuda_warm_start(&served);
+#endif
         Tok serve_tok;
         char tokenizer_path[1024];
         snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", snap);
@@ -5061,6 +5109,9 @@ int main(int argc, char **argv) {
     const double load_start = now_s();
     model_load(&model, dir);
     glm53_telemetry_init(dir, &model.c);
+#ifdef COLI_CUDA
+    glm53_cuda_warm_start(&model);
+#endif
     const double load_seconds = now_s() - load_start;
     if (getenv("GLM53_VERBOSE")) cfg_report(&model.c);
 

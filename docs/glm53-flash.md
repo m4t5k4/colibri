@@ -167,6 +167,28 @@ may run while uploads finish. The model still joins and publishes in logical
 order before reading tier residency or failure state; prefill and every other
 join/flush path retain their previous location.
 
+`GLM53_CUDA_WARM_RESIDENCY=1` enables an experimental historical preload (default
+off). `GLM53_CUDA_WARM_FRACTION` defaults to `0.50` when enabled and must be
+greater than zero and at most one. The fraction is applied to the lesser of the
+shared expert-byte budget and the sum of measured per-device whole-expert slots,
+rounding half up. The full-model loader first initializes CUDA and its measured
+capacities; CLI/SERVE then loads `COLI_USAGE` or the model-local `.coli_usage`,
+ranks positive historical counts by descending count and ascending layer/expert,
+and synchronously reads and uploads the chosen experts before the first forward.
+One reusable host slot supplies the uploads. Warm residents start with runtime
+heat zero and can be evicted normally; missing history leaves the dynamic tier
+empty. `USAGE_SAVE=0` keeps a benchmark snapshot immutable.
+
+`[glm53-cuda-warm]` and `[glm53-cuda-warm-device]` report preload work separately.
+Warm uploads do not increment runtime `uploads`, `upload_s`, or `promotion_s`.
+`warm_hits` counts selections of still-resident preload entries; `warm_misses`
+counts selections of those same entries after eviction, not all cold misses.
+Warm `read_s` and `upload_s` are components of warm `total_s`, not additive
+elapsed times. With `GLM53_CUDA_TRACE`, `W,layer,eid,owner_index,device_id`
+records each warm publication and `B,warm_loaded,resident_before_inference`
+marks the transition to normal `S/A/P/E/U` events. Preload is serial; it does
+not use the runtime parallel-promotion workers.
+
 `GLM53_MLA_OUT_ROWS4=1` is a separate, default-off CPU attention experiment.
 For a one-token MLA output projection it reuses KDA KO's AVX2 rows4 int4
 kernel only when the output matrix is fmt4/gs64, has a row count divisible by

@@ -21,6 +21,7 @@
 typedef struct G53CudaPromotionFlight G53CudaPromotionFlight;
 typedef struct G53Cuda G53Cuda;
 static void g53_cuda_join_pending(G53Cuda *g, int reason);
+static void g53_cuda_warm_report(const G53Cuda *g, const char *phase);
 enum { G53_JOIN_NEXT_FFN, G53_JOIN_LAST_LAYER, G53_JOIN_PROFILE,
        G53_JOIN_CLOSE, G53_JOIN_BEFORE_DISPATCH, G53_JOIN_POLICY_OR_DROP,
        G53_JOIN_REASONS };
@@ -29,7 +30,9 @@ typedef struct {
     ColiCudaTensor *w[3];
     uint64_t heat;
     int owner; /* index in G53Cuda.devices; all three tensors share it */
+    unsigned char warm_state; /* 0 other, 1 warm unhit, 2 warm hit, 3/4 evicted */
 } G53CudaExpert;
+typedef struct { int layer, eid; uint32_t count; } G53CudaWarmCandidate;
 /* Host wall-clock envelopes, using the engine's existing monotonic clock.
  * No clock calls or environment lookups on hot paths when clock is NULL. */
 enum { G53_UPLOAD, G53_GATE, G53_UP, G53_CLAMP, G53_DOWN, G53_FALLBACK,
@@ -103,6 +106,12 @@ struct G53Cuda {
     G53CudaLateWindow late_window; /* model-thread-only profiling around the late barrier */
     unsigned resident;
     uint64_t executed, fallback, uploads, errors;
+    int warm_enabled, warm_first_forward_resident, warm_first_decode_resident;
+    int warm_teardown;
+    size_t warm_requested, warm_candidates, warm_loaded, warm_failed, warm_bytes;
+    unsigned warm_placed[COLI_CUDA_MAX_DEVICES];
+    uint64_t warm_hits, warm_misses, warm_evicted, warm_evicted_before_first_hit;
+    double warm_fraction, warm_read_s, warm_upload_s, warm_total_s;
     G53CudaProfile profile;
 };
 
@@ -151,7 +160,7 @@ static void g53_cuda_profile_enable(G53Cuda *g, double (*clock)(void)) {
             g->profile.selection_trace = fopen(path, "w");
             if (g->profile.selection_trace)
                 fprintf(g->profile.selection_trace,
-                        "# S,tick,decode_token,layer,eid,rows,resident_before | A,tick,layer,eid | P,tick,layer,eid,owner_index,device_id | E,tick,in_layer,in_eid,victim_layer,victim_eid,in_heat,victim_heat,victim_residence_age,victim_last_use_distance | U,tick,layer,eid,device_id,upload_seconds,ok\n");
+                        "# W,layer,eid,owner_index,device_id | B,warm_loaded,resident_before_inference | S,tick,decode_token,layer,eid,rows,resident_before | A,tick,layer,eid | P,tick,layer,eid,owner_index,device_id | E,tick,in_layer,in_eid,victim_layer,victim_eid,in_heat,victim_heat,victim_residence_age,victim_last_use_distance | U,tick,layer,eid,device_id,upload_seconds,ok\n");
             else fprintf(stderr, "[glm53-cuda-cache] cannot open trace %s: %s\n", path, strerror(errno));
         }
         if (!g->profile.cache_layer || !g->profile.cache_expert)
@@ -295,6 +304,11 @@ static void g53_cuda_stats(G53Cuda *g) {
 static void g53_cuda_drop(G53Cuda *g, G53CudaExpert *e) {
     g53_cuda_join_pending(g, G53_JOIN_POLICY_OR_DROP);
     if (!e->w[0]) return;
+    if (!g->warm_teardown && (e->warm_state == 1 || e->warm_state == 2)) {
+        g->warm_evicted++;
+        if (e->warm_state == 1) g->warm_evicted_before_first_hit++;
+        e->warm_state += 2;
+    }
     if (g->group_pending[e->owner]) {
         /* Defensive lifetime guard. The FFN path normally drains before it
          * can promote/evict, but teardown and future callers must also be safe. */
@@ -331,6 +345,8 @@ static void g53_cuda_close(G53Cuda *g) {
     g53_cuda_device_stats(g);
     g53_cuda_profile_report(g, "final"); /* before teardown, not an eviction */
     g53_cuda_cache_report(g);
+    g53_cuda_warm_report(g, "final");
+    g->warm_teardown = 1;
     for (int i = 0; i < g->count; i++) g53_cuda_drop(g, &g->experts[i]);
     if (g->profile.selection_trace) fclose(g->profile.selection_trace);
     if (g->profile.eviction_records) fclose(g->profile.eviction_records);
@@ -371,6 +387,72 @@ static int g53_cuda_heat_setting(const char *value, uint64_t fallback,
     if (!allow_zero && !parsed) return 0;
     *result = parsed;
     return 1;
+}
+static int g53_cuda_warm_cmp(const void *a, const void *b) {
+    const G53CudaWarmCandidate *x = a, *y = b;
+    if (x->count != y->count) return x->count > y->count ? -1 : 1;
+    if (x->layer != y->layer) return x->layer < y->layer ? -1 : 1;
+    return x->eid < y->eid ? -1 : x->eid > y->eid;
+}
+static G53CudaWarmCandidate *g53_cuda_warm_rank(const G53Cuda *g, uint32_t *const *counts,
+                                                int first_dense, int *n) {
+    *n = 0;
+    if (!counts || first_dense < 0 || first_dense > g->count / g->ne) return NULL;
+    G53CudaWarmCandidate *ranked = malloc((size_t)g->count * sizeof(*ranked));
+    if (!ranked) return NULL;
+    for (int l = first_dense; l < g->count / g->ne; l++) {
+        if (!counts[l]) continue;
+        for (int e = 0; e < g->ne; e++) if (counts[l][e])
+            ranked[(*n)++] = (G53CudaWarmCandidate){l, e, counts[l][e]};
+    }
+    qsort(ranked, (size_t)*n, sizeof(*ranked), g53_cuda_warm_cmp);
+    return ranked;
+}
+static size_t g53_cuda_warm_capacity(const G53Cuda *g) {
+    if (!g->expert_bytes) return 0;
+    size_t slots = 0;
+    for (int i = 0; i < g->ndev; i++) slots += g->capacity[i] / g->expert_bytes;
+    size_t shared = g->budget / g->expert_bytes;
+    return slots < shared ? slots : shared;
+}
+static void g53_cuda_warm_config(G53Cuda *g) {
+    const char *enabled = getenv("GLM53_CUDA_WARM_RESIDENCY");
+    if (!enabled || !strcmp(enabled, "0")) return;
+    if (strcmp(enabled, "1")) {
+        fprintf(stderr, "invalid GLM53_CUDA_WARM_RESIDENCY (expected 0 or 1)\n"); exit(1);
+    }
+    g->warm_enabled = 1;
+    const char *value = getenv("GLM53_CUDA_WARM_FRACTION");
+    g->warm_fraction = 0.50;
+    if (value) {
+        char *end;
+        errno = 0;
+        double parsed = strtod(value, &end);
+        if (!*value || *end || errno == ERANGE || !isfinite(parsed) || parsed <= 0 || parsed > 1) {
+            fprintf(stderr, "invalid GLM53_CUDA_WARM_FRACTION (expected >0 and <=1)\n"); exit(1);
+        }
+        g->warm_fraction = parsed;
+    }
+    g->warm_requested = (size_t)floor((double)g53_cuda_warm_capacity(g) * g->warm_fraction + 0.5);
+    g->warm_first_forward_resident = -1;
+    g->warm_first_decode_resident = -1;
+}
+static void g53_cuda_warm_report(const G53Cuda *g, const char *phase) {
+    if (!g->warm_enabled) return;
+    size_t ever_hit = 0;
+    for (int i = 0; i < g->count; i++)
+        ever_hit += g->experts[i].warm_state == 2 || g->experts[i].warm_state == 4;
+    fprintf(stderr, "[glm53-cuda-warm] phase=%s requested=%zu candidates=%zu loaded=%zu failed=%zu bytes=%zu read_s=%.6f upload_s=%.6f total_s=%.6f warm_hits=%llu warm_misses=%llu warm_evicted=%llu warm_evicted_before_first_hit=%llu warm_never_hit=%zu resident_at_first_forward=%d resident_at_first_decode=%d\n",
+            phase, g->warm_requested, g->warm_candidates, g->warm_loaded, g->warm_failed,
+            g->warm_bytes, g->warm_read_s, g->warm_upload_s, g->warm_total_s,
+            (unsigned long long)g->warm_hits, (unsigned long long)g->warm_misses,
+            (unsigned long long)g->warm_evicted,
+            (unsigned long long)g->warm_evicted_before_first_hit,
+            g->warm_loaded - ever_hit, g->warm_first_forward_resident, g->warm_first_decode_resident);
+    for (int i = 0; i < g->ndev; i++)
+        fprintf(stderr, "[glm53-cuda-warm-device] phase=%s device=%d placed=%u bytes=%zu\n",
+                phase, g->devices[i], g->warm_placed[i],
+                (size_t)g->warm_placed[i] * g->expert_bytes);
 }
 /* Summary only at teardown; the aggregate line above keeps its existing
  * cadence and format for dashboards and profile parsers. */
@@ -436,6 +518,7 @@ static void g53_cuda_init(G53Cuda *g, int nl, int ne, int D, int I, int streamin
                           coli_cuda_alloc_footprint((size_t)D * I / 64 * sizeof(float)));
     g->experts = calloc((size_t)g->count, sizeof(*g->experts));
     if (!g->experts) { coli_cuda_shutdown(); fprintf(stderr, "OOM CUDA expert table\n"); exit(1); }
+    g53_cuda_warm_config(g);
     g->active = 1;
     g->parallel_promote = g->ndev > 1 && getenv("GLM53_CUDA_PARALLEL_PROMOTE") &&
                           !strcmp(getenv("GLM53_CUDA_PARALLEL_PROMOTE"), "1");
@@ -479,6 +562,12 @@ static void g53_cuda_heat(G53Cuda *g, int layer, int eid, int rows) {
                     layer, eid, rows, resident);
     }
     e->heat += (uint64_t)rows;
+    if (e->w[0] && (e->warm_state == 1 || e->warm_state == 2)) {
+        g->warm_hits++;
+        e->warm_state = 2;
+    } else if (!e->w[0] && (e->warm_state == 3 || e->warm_state == 4)) {
+        g->warm_misses++;
+    }
 }
 static int g53_cuda_place(const G53Cuda *g) {
     int owner = -1;
@@ -488,8 +577,8 @@ static int g53_cuda_place(const G53Cuda *g) {
             (owner < 0 || g->used[i] < g->used[owner])) owner = i;
     return owner;
 }
-static void g53_cuda_publish(G53Cuda *g, int layer, int eid, int owner,
-                             ColiCudaTensor *const w[3]) {
+static void g53_cuda_publish_ex(G53Cuda *g, int layer, int eid, int owner,
+                                ColiCudaTensor *const w[3], int warm) {
     G53CudaExpert *e = &g->experts[layer * g->ne + eid];
     e->owner = owner;
     for (int k = 0; k < 3; k++) {
@@ -497,12 +586,21 @@ static void g53_cuda_publish(G53Cuda *g, int layer, int eid, int owner,
         size_t bytes = coli_cuda_tensor_vram(w[k]);
         g->bytes += bytes; g->used[owner] += bytes;
     }
-    g->resident++; g->uploads++;
-    if (g->profile.selection_trace)
+    g->resident++;
+    if (warm) {
+        e->warm_state = 1;
+        g->warm_loaded++;
+        g->warm_placed[owner]++;
+        g->warm_bytes += g->expert_bytes;
+    } else g->uploads++;
+    if (warm && g->profile.selection_trace)
+        fprintf(g->profile.selection_trace, "W,%d,%d,%d,%d\n",
+                layer, eid, owner, g->devices[owner]);
+    if (!warm && g->profile.selection_trace)
         fprintf(g->profile.selection_trace, "P,%llu,%d,%d,%d,%d\n",
                 (unsigned long long)g->profile.selection_tick, layer, eid,
                 owner, g->devices[owner]);
-    if (g->profile.clock && g->profile.cache_layer && g->profile.cache_expert) {
+    if (!warm && g->profile.clock && g->profile.cache_layer && g->profile.cache_expert) {
         G53CudaProfile *p = &g->profile;
         G53CudaExpertCache *ec = &p->cache_expert[layer * g->ne + eid];
         p->cache_layer[layer].promotions++;
@@ -512,6 +610,45 @@ static void g53_cuda_publish(G53Cuda *g, int layer, int eid, int owner,
         ec->last_use_tick = 0;
         ec->upload_tick = p->selection_tick;
     }
+}
+static void g53_cuda_publish(G53Cuda *g, int layer, int eid, int owner,
+                             ColiCudaTensor *const w[3]) {
+    g53_cuda_publish_ex(g, layer, eid, owner, w, 0);
+}
+static int g53_cuda_warm_upload(G53Cuda *g, int layer, int eid,
+                                uint8_t *const *pieces, double (*clock)(void)) {
+    if (!g->active || g->failed || g->expert_bytes > g->budget ||
+        g->bytes > g->budget - g->expert_bytes) return 0;
+    int owner = g53_cuda_place(g);
+    if (owner < 0) return 0;
+    ColiCudaTensor *w[3] = {NULL, NULL, NULL};
+    int failed_k = -1;
+    double start = clock();
+    for (int k = 0; k < 3; k++) {
+        if (!coli_cuda_tensor_upload_g(&w[k], pieces[k*2], (const float *)pieces[k*2+1],
+                                       4, k == 2 ? g->I : g->D,
+                                       k == 2 ? g->D : g->I, g->devices[owner], 64)) {
+            failed_k = k;
+            break;
+        }
+    }
+    if (failed_k < 0 && !coli_cuda_tensor_upload_complete(g->devices[owner])) failed_k = 3;
+    g->warm_upload_s += clock() - start;
+    if (failed_k >= 0) {
+        for (int k = 0; k < 3; k++) coli_cuda_tensor_free(w[k]);
+        g->warm_failed++;
+        g->errors++;
+        g->failed = 1;
+        fprintf(stderr, "[glm53-cuda] warm upload failed device=%d stage=%s; host fallback enabled\n",
+                g->devices[owner], (const char *const[]){"gate", "up", "down", "complete"}[failed_k]);
+        return 0;
+    }
+    g53_cuda_publish_ex(g, layer, eid, owner, w, 1);
+    return 1;
+}
+static void g53_cuda_warm_boundary(G53Cuda *g) {
+    if (g->profile.selection_trace)
+        fprintf(g->profile.selection_trace, "B,%zu,%u\n", g->warm_loaded, g->resident);
 }
 /* A miss executes on host this time. Promote only after its host buffers are
  * available, and only once selected at least twice. No RAM cache ownership. */
