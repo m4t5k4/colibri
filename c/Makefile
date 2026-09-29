@@ -1339,6 +1339,14 @@ tests/test_glm53_mla_rows4$(EXE): tests/test_glm53_mla_rows4.c glm53.c quant.h s
 tests/test_glm53_mla_profile$(EXE): tests/test_glm53_mla_profile.c tests/test_glm53_mla_rows4.c tests/test_glm53_cuda.c glm53.c glm53_cuda.h segment_runtime.c edge_runtime.c
 	$(CC) $(filter-out -DCOLI_METAL -DCOLI_VULKAN,$(NOCUDA_CFLAGS)) -DCOLI_CUDA $< segment_runtime.c edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
 
+.PHONY: glm53-mla-absorbed-bench
+glm53-mla-absorbed-bench: tests/bench_glm53_mla_absorbed$(EXE)
+	OMP_NUM_THREADS=1 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close OMP_PLACES=cores ./tests/bench_glm53_mla_absorbed$(EXE)
+	OMP_NUM_THREADS=4 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close OMP_PLACES=cores ./tests/bench_glm53_mla_absorbed$(EXE)
+
+tests/bench_glm53_mla_absorbed$(EXE): tests/bench_glm53_mla_absorbed.c glm53.c quant.h segment_runtime.c edge_runtime.c
+	$(CC) $(filter-out -DCOLI_METAL -DCOLI_VULKAN,$(NOCUDA_CFLAGS)) $< segment_runtime.c edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_glm53_cuda_promotion$(EXE): tests/test_glm53_cuda_promotion.c tests/test_glm53_cuda.c glm53_cuda.h backend_cuda.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
