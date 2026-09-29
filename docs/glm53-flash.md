@@ -301,6 +301,15 @@ sum worker durations or imply an equal end-to-end wall-time saving.
 `[glm53-cuda-decode-profile]` reports decode-only deltas for the named phase,
 promotion, and KDA/MLA substage timers. It snapshots each explicit decode
 forward separately, so prefill before or between decode calls is excluded.
+Its `mla_proj_s` parent includes four sequential child intervals:
+`mla_query_path_s` (q_a, RMS, q_b), `mla_latent_path_s` (kv_a, RMS),
+`mla_absorbed_q_s` (the per-head kv_b key-transpose matvecs), and
+`mla_index_path_s` (indexer projections, key norm, and head-weight scaling).
+`mla_proj_residual_s` is the parent minus these children; it includes timer
+and loop overhead, not another kernel. `mla_absorbed_q_calls` and
+`mla_absorbed_q_rows` are decode-only counts of per-head matvec calls and
+their output rows. The child clocks and counts run only with
+`GLM53_CUDA_PROFILE=1`; no kernel or OpenMP dispatch changes.
 The original cumulative lines and their field meanings are unchanged. Worker
 `upload_s` is summed worker time; `promotion_s` and join waits measure caller
 blocking, and the phase/substage fields are nested rather than exclusive.

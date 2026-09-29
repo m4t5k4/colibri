@@ -62,18 +62,18 @@ static void projection_case(int rows, int columns, int gs, int fmt,
     mat_release(&w);
 }
 
-static void one_token_mla_case(void) {
+static void one_token_mla_case(int profiled) {
     Cfg c = {0};
-    c.hidden = 8; c.n_heads = 1; c.q_lora = 64; c.kv_lora = 64;
+    c.hidden = 8; c.n_heads = 3; c.q_lora = 64; c.kv_lora = 64;
     c.qk_nope = 64; c.v_head = 64;
     c.index_nh = 1; c.index_hd = 1; c.index_topk = 1; c.index_kpool = 1;
     c.eps = 1e-6f;
     GLayer l = {0};
-    l.qa = test_f32(64, 8); l.qb = test_f32(64, 64);
-    l.kva = test_f32(64, 8); l.kvb_kt = test_f32(64, 64);
+    l.qa = test_f32(64, 8); l.qb = test_f32(3 * 64, 64);
+    l.kva = test_f32(64, 8); l.kvb_kt = test_f32(3 * 64, 64);
     l.iwq = test_f32(1, 64); l.iwk = test_f32(1, 8);
     l.ikpg = test_f32(1, 8); l.iwp = test_f32(1, 8);
-    l.kvb_v = test_f32(64, 64); l.o = test_i4(8, 64, 64);
+    l.kvb_v = test_f32(3 * 64, 64); l.o = test_i4(8, 3 * 64, 64);
     ((float *)l.qa.f)[0] = 1.0f;
     ((float *)l.qb.f)[0] = 1.0f;
     ((float *)l.kva.f)[0] = 1.0f;
@@ -93,18 +93,63 @@ static void one_token_mla_case(void) {
     float generic[8], fast[8];
     GModel baseline = {0}, experimental = {0};
     experimental.mla_out_rows4 = 1;
+#ifdef COLI_CUDA
+    if (profiled) experimental.cuda.profile.clock = now_s;
+#else
+    (void)profiled;
+#endif
     mla_layer(&baseline, &c, &l, x, 1, generic, &st, 0);
     mla_layer(&experimental, &c, &l, x, 1, fast, &st, 0);
     assert(memcmp(generic, fast, sizeof(generic)) == 0);
+#ifdef COLI_CUDA
+    if (profiled) {
+        assert(experimental.t_mla_query_path > 0);
+        assert(experimental.t_mla_latent_path > 0);
+        assert(experimental.t_mla_absorbed_q > 0);
+        assert(experimental.t_mla_index_path > 0);
+        assert(experimental.mla_absorbed_q_calls == 3);
+        assert(experimental.mla_absorbed_q_rows == 3 * 64);
+        double child = experimental.t_mla_query_path + experimental.t_mla_latent_path +
+                       experimental.t_mla_absorbed_q + experimental.t_mla_index_path;
+        assert(experimental.t_mla_proj >= child);
+        assert(experimental.t_mla_proj - child < 0.01);
+        G53DecodeBase start, end;
+        g53_decode_capture(&experimental, &start); /* one prefill MLA already ran */
+        mla_layer(&experimental, &c, &l, x, 1, fast, &st, 0);
+        assert(memcmp(generic, fast, sizeof(generic)) == 0);
+        g53_decode_capture(&experimental, &end);
+        g53_decode_accumulate(&experimental.decode_total, &end, &start);
+        const G53DecodeBase *d = &experimental.decode_total;
+        assert(d->valid && d->mla_absorbed_q_calls == 3 && d->mla_absorbed_q_rows == 3 * 64);
+        assert(d->mla_query_path == end.mla_query_path - start.mla_query_path);
+        assert(d->mla_latent_path == end.mla_latent_path - start.mla_latent_path);
+        assert(d->mla_absorbed_q == end.mla_absorbed_q - start.mla_absorbed_q);
+        assert(d->mla_index_path == end.mla_index_path - start.mla_index_path);
+        assert(d->mla_proj == end.mla_proj - start.mla_proj);
+        assert(d->mla_query_path > 0 && d->mla_latent_path > 0);
+        assert(d->mla_absorbed_q > 0 && d->mla_index_path > 0);
+        assert(experimental.t_kda_proj == 0 && experimental.t_kda_qkv == 0);
+    } else
+#endif
+    {
+        assert(experimental.t_mla_query_path == 0);
+        assert(experimental.t_mla_latent_path == 0);
+        assert(experimental.t_mla_absorbed_q == 0);
+        assert(experimental.t_mla_index_path == 0);
+        assert(experimental.mla_absorbed_q_calls == 0);
+        assert(experimental.mla_absorbed_q_rows == 0);
+    }
     assert(baseline.mla_out_generic_calls == 1);
-    assert(experimental.mla_out_rows4_calls == EXPECT_ROWS4);
-    assert(experimental.mla_out_generic_calls == !EXPECT_ROWS4);
+    const int calls = profiled ? 2 : 1;
+    assert(experimental.mla_out_rows4_calls == (uint64_t)calls * EXPECT_ROWS4);
+    assert(experimental.mla_out_generic_calls == (uint64_t)calls * !EXPECT_ROWS4);
     mat_release(&l.qa); mat_release(&l.qb); mat_release(&l.kva);
     mat_release(&l.kvb_kt); mat_release(&l.iwq); mat_release(&l.iwk);
     mat_release(&l.ikpg); mat_release(&l.iwp); mat_release(&l.kvb_v);
     mat_release(&l.o);
 }
 
+#ifndef GLM53_MLA_NO_MAIN
 int main(void) {
     unsetenv("GLM53_MLA_OUT_ROWS4");
     assert(!glm53_mla_out_rows4_env());
@@ -119,7 +164,8 @@ int main(void) {
     projection_case(8, 64, 32, 4, 1, 0);     /* unsupported MLA group */
     projection_case(8, 64, 64, 0, 1, 0);     /* non-int4 */
     projection_case(8, 70, 64, 4, 1, 0);    /* input/group tail */
-    one_token_mla_case();
+    one_token_mla_case(0);
     puts("glm53 MLA output rows4: PASS");
     return 0;
 }
+#endif
