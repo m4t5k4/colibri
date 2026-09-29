@@ -157,9 +157,14 @@ static double ans_now_s(){
 }
 #endif
 
+static thread_local int g_current_device = -1;
+
 static int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
-    std::fprintf(stderr, "[CUDA] %s: %s\n", what, cudaGetErrorString(err));
+    int active = -1;
+    (void)cudaGetDevice(&active);
+    std::fprintf(stderr, "[cuda-backend-error] operation=%s intended_device=%d active_device=%d cuda_error=%d cuda_error_string=%s\n",
+                 what, g_current_device, active, (int)err, cudaGetErrorString(err));
     (void)cudaGetLastError();   /* consume the sticky error: a failed call must
                                    not poison the next launch's error check */
     return 0;
@@ -174,12 +179,26 @@ static DeviceContext *find_ctx(int device) {
  * serial expert loop alternates devices (measured on RTX 5090 + 4090: 14.3s
  * -> 25.4s per 32 tokens). The current device is per-thread in the CUDA
  * runtime, so a thread-local cache skips the redundant switches. */
-static thread_local int g_current_device = -1;
-
 static int select_ctx(DeviceContext *ctx) {
     if (!ctx) return 0;
-    if (g_current_device == ctx->device) return 1;
-    if (!cuda_ok(cudaSetDevice(ctx->device), "select device")) return 0;
+    if (g_current_device == ctx->device) {
+        int active = -1;
+        cudaError_t probe = cudaGetDevice(&active);
+        if (probe != cudaSuccess) return cuda_ok(probe, "query active device");
+        if (active == ctx->device) return 1;
+        std::fprintf(stderr, "[cuda-backend-error] operation=device_cache_mismatch intended_device=%d active_device=%d cuda_error=0 cuda_error_string=none\n",
+                     ctx->device, active);
+        g_current_device = -1;
+    }
+    cudaError_t err = cudaSetDevice(ctx->device);
+    if (err != cudaSuccess) {
+        int active = -1;
+        (void)cudaGetDevice(&active);
+        std::fprintf(stderr, "[cuda-backend-error] operation=select_device intended_device=%d active_device=%d cuda_error=%d cuda_error_string=%s\n",
+                     ctx->device, active, (int)err, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
     g_current_device = ctx->device;
     return 1;
 }
@@ -2308,7 +2327,9 @@ static int expert_group_issue_impl(ColiCudaTensor *const *gates,
          * an extra silu_mul here would re-apply it against the never-written
          * ctx->up buffer. */
         grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D,clamp_limit);
+        if(!cuda_ok(cudaGetLastError(),"expert group issue g4 hidden launch")) return abort_issue();
         grouped_down_g4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+        if(!cuda_ok(cudaGetLastError(),"expert group issue g4 down launch")) return abort_issue();
     } else {
         /* Fallback runs quant_matmul with gs=0,ng=1 — per-row-scale semantics.
          * That is only correct for fmt 0/1/2/3: refuse group/block-scaled

@@ -106,7 +106,7 @@ static void inputs(int token, int H, int D, int hidden,
 static bool run_case(int H, int D, int hidden, int length, int initial,
                      int cpu_prefix, int cpu_suffix, KdaFault fault,
                      Error &oe, Error &se, Error &we, int reset_at = -1,
-                     int *evidence = nullptr) {
+                     int *evidence = nullptr, int device = 0) {
     int P = H * D;
     KdaTestMat mat[4] = {make_mat(hidden, P, 1), make_mat(hidden, P, 2),
                          make_mat(hidden, P, 3), make_mat(P, hidden, 4)};
@@ -116,7 +116,7 @@ static bool run_case(int H, int D, int hidden, int length, int initial,
     std::vector<float> conv((size_t)3 * P * 4), norm(D);
     for (size_t i = 0; i < conv.size(); i++) conv[i] = 0.04f * sinf(i * 0.13f);
     for (int d = 0; d < D; d++) norm[d] = 0.7f + 0.003f * d;
-    KdaProto *gpu = coli_cuda_kda_create(0, H, D, hidden, 4, sources,
+    KdaProto *gpu = coli_cuda_kda_create(device, H, D, hidden, 4, sources,
                                         conv.data(), norm.data());
     if (!gpu) { fprintf(stderr, "KDA create failed\n"); return false; }
     std::vector<float> ref((size_t)H * D * D), dev_state(ref.size()),
@@ -224,9 +224,44 @@ static bool run_case(int H, int D, int hidden, int length, int initial,
     return ok;
 }
 
+static bool run_context_interop(int ndev) {
+    if (ndev < 2) {
+        printf("context_interop skipped=1 reason=requires_two_visible_devices\n");
+        return true;
+    }
+    KdaTestMat gm = make_mat(64, 64, 11), um = make_mat(64, 64, 12),
+               dm = make_mat(64, 64, 13);
+    ColiCudaTensor *g = nullptr, *u = nullptr, *d = nullptr;
+    bool ok = coli_cuda_tensor_upload_g(&g, gm.q.data(), gm.scale.data(), 4, 64, 64, 0, 64) &&
+              coli_cuda_tensor_upload_g(&u, um.q.data(), um.scale.data(), 4, 64, 64, 0, 64) &&
+              coli_cuda_tensor_upload_g(&d, dm.q.data(), dm.scale.data(), 4, 64, 64, 0, 64);
+    float x[64], limit = 1.0f;
+    for (int i = 0; i < 64; i++) x[i] = 0.01f * (i - 20);
+    for (int repeat = 0; repeat < 3 && ok; repeat++) {
+        size_t free_bytes = 0, total_bytes = 0;
+        ok = coli_cuda_mem_info(0, &free_bytes, &total_bytes);
+        Error oe, se, we;
+        if (ok) ok = run_case(2, 64, 64, 1, 0, 0, 0, KDA_OK,
+                              oe, se, we, -1, nullptr, 1);
+        int active = -1;
+        if (ok) ok = cudaGetDevice(&active) == cudaSuccess && active == 0;
+        ColiCudaTensor *gate[1] = {g}, *up[1] = {u}, *down[1] = {d};
+        int rows[1] = {1};
+        if (ok) ok = coli_cuda_expert_group_issue_clamped(gate, up, down,
+                          rows, 1, x, limit) != 0;
+        if (ok) ok = coli_cuda_expert_group_take(0) != nullptr;
+    }
+    coli_cuda_tensor_free(g); coli_cuda_tensor_free(u); coli_cuda_tensor_free(d);
+    printf("context_interop pass=%d kda_device=1 expert_device=0 repetitions=3\n", ok);
+    return ok;
+}
+
 int main() {
-    int device = 0;
-    if (!coli_cuda_init(&device, 1)) { fprintf(stderr, "CUDA unavailable\n"); return 77; }
+    int available = 0, devices[2] = {0, 1};
+    if (cudaGetDeviceCount(&available) != cudaSuccess || available < 1 ||
+        !coli_cuda_init(devices, available >= 2 ? 2 : 1)) {
+        fprintf(stderr, "CUDA unavailable\n"); return 77;
+    }
     /* Strict screening limits, not empirical acceptance tolerances. A real
      * GPU run must report the observed maxima before Phase 2F2 can proceed. */
     const float output_limit = 1e-3f, state_limit = 1e-4f;
@@ -263,6 +298,7 @@ int main() {
              ok, o.abs, s.abs, w.abs);
       failed += !ok || o.abs > output_limit || s.abs > state_limit || w.abs > 1e-6f;
     }
+    failed += !run_context_interop(available);
     coli_cuda_shutdown();
     return failed ? 1 : 0;
 }

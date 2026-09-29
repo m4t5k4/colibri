@@ -13,6 +13,31 @@ struct KdaProto {
     ColiCudaKdaTimes times;
 };
 
+/* Expert calls cache the calling thread's device in select_ctx(). KDA owns a
+ * separate stream but must not leave that thread on its layer's GPU. Mark the
+ * cache unknown after any direct switch so the next expert call reselects. */
+struct KdaDeviceScope {
+    int previous = -1, target;
+    bool entered = false;
+    explicit KdaDeviceScope(int device) : target(device) {
+        cudaError_t err = cudaGetDevice(&previous);
+        if (err == cudaSuccess) err = cudaSetDevice(target);
+        if (err == cudaSuccess) entered = true;
+        else std::fprintf(stderr, "[glm53-kda-cuda-error] operation=select_device intended_device=%d active_device=%d cuda_error=%d cuda_error_string=%s\n",
+                          target, previous, (int)err, cudaGetErrorString(err));
+        g_current_device = -1;
+    }
+    ~KdaDeviceScope() {
+        if (entered) {
+            cudaError_t err = cudaSetDevice(previous);
+            if (err != cudaSuccess)
+                std::fprintf(stderr, "[glm53-kda-cuda-error] operation=restore_device intended_device=%d active_device=%d cuda_error=%d cuda_error_string=%s\n",
+                             previous, target, (int)err, cudaGetErrorString(err));
+        }
+        g_current_device = -1;
+    }
+};
+
 static bool kda_alloc(float **p, size_t bytes, size_t *account) {
     *p = nullptr;
     if (cudaMalloc((void **)p, bytes) != cudaSuccess) return false;
@@ -22,7 +47,8 @@ static bool kda_alloc(float **p, size_t bytes, size_t *account) {
 
 static void kda_free(KdaProto *a) {
     if (!a) return;
-    cudaSetDevice(a->device);
+    KdaDeviceScope device(a->device);
+    if (!device.entered) return;
     if (a->stream) cudaStreamSynchronize(a->stream);
     for (int i = 0; i < 4; i++) coli_cuda_tensor_free(a->proj[i]);
     for (int i = 0; i < 2; i++) { cudaFree(a->state[i]); cudaFree(a->window[i]); }
@@ -39,11 +65,12 @@ static KdaProto *kda_create(int device, int H, int D, int hidden, int K,
                             const ColiCudaKdaMatrix *mat, const float *conv,
                             const float *norm) {
     if (H < 2 || D < 2 || K != 4 || hidden % 64 || (H * D) % 64) return nullptr;
+    KdaDeviceScope selected(device);
+    if (!selected.entered) return nullptr;
     KdaProto *a = new KdaProto{};
     a->device = device; a->H = H; a->D = D; a->P = H * D;
     a->hidden = hidden; a->K = K;
     size_t input_bytes = ((size_t)hidden + 2u * a->P + H) * sizeof(float);
-    if (cudaSetDevice(device) != cudaSuccess) goto fail;
     for (int i = 0; i < 4; i++) {
         if (mat[i].in != (i == 3 ? a->P : hidden) ||
             mat[i].out != (i == 3 ? hidden : a->P) ||
@@ -92,7 +119,8 @@ fail:
 }
 
 static bool kda_set_state(KdaProto *a, const float *state, const float *window) {
-    if (cudaSetDevice(a->device) != cudaSuccess) return false;
+    KdaDeviceScope device(a->device);
+    if (!device.entered) return false;
     int next = 1 - a->committed;
     size_t sb = (size_t)a->H * a->D * a->D * 4;
     size_t wb = (size_t)3 * a->P * a->K * 4;
@@ -106,7 +134,8 @@ static bool kda_set_state(KdaProto *a, const float *state, const float *window) 
 }
 
 static bool kda_get_state(KdaProto *a, float *state, float *window) {
-    if (cudaSetDevice(a->device) != cudaSuccess) return false;
+    KdaDeviceScope device(a->device);
+    if (!device.entered) return false;
     size_t sb = (size_t)a->H * a->D * a->D * 4;
     size_t wb = (size_t)3 * a->P * a->K * 4;
     if (cudaMemcpyAsync(state, a->state[a->committed], sb,
@@ -186,8 +215,9 @@ enum KdaFault { KDA_OK, KDA_FAIL_BEFORE, KDA_FAIL_AFTER_RECURRENCE };
 static bool kda_step(KdaProto *a, float *out, const float *x,
                      const float *decay, const float *beta, const float *gate,
                      KdaFault fault = KDA_OK, float output_eps = 1e-6f) {
-    if (fault == KDA_FAIL_BEFORE || cudaSetDevice(a->device) != cudaSuccess)
-        return false;
+    if (fault == KDA_FAIL_BEFORE) return false;
+    KdaDeviceScope device(a->device);
+    if (!device.entered) return false;
     int next = 1 - a->committed;
     cudaStream_t s = a->stream;
     size_t input_bytes = ((size_t)a->hidden + 2u * a->P + a->H) * sizeof(float);
