@@ -62,20 +62,41 @@ static void projection_case(int rows, int columns, int gs, int fmt,
     mat_release(&w);
 }
 
-static void one_token_mla_case(int profiled) {
+static void qb_projection_case(int rows, int columns, int gs, int fmt,
+                               int enabled, int expected) {
+    Mat w = fmt == 4 ? test_i4(rows, columns, gs) : test_f32(rows, columns);
+    float *x = malloc((size_t)columns * sizeof(float));
+    float *reference = malloc((size_t)rows * sizeof(float));
+    float *candidate = malloc((size_t)rows * sizeof(float));
+    assert(x && reference && candidate);
+    for (int i = 0; i < columns; i++) x[i] = (float)((i * 13) % 31 - 15) * 0.03125f;
+    if (fmt == 0) {
+        float *f = (float *)w.f;
+        for (int i = 0; i < rows * columns; i++)
+            f[i] = (float)((i * 5) % 23 - 11) * 0.0078125f;
+    }
+    mv(reference, &w, x);
+    assert(mv_mla_qb(candidate, &w, x, enabled) == expected);
+    assert(memcmp(reference, candidate, (size_t)rows * sizeof(float)) == 0);
+    free(candidate); free(reference); free(x);
+    mat_release(&w);
+}
+
+static void one_token_mla_case(int profiled, int qb_experiment) {
     Cfg c = {0};
     c.hidden = 8; c.n_heads = 3; c.q_lora = 64; c.kv_lora = 64;
     c.qk_nope = 64; c.v_head = 64;
     c.index_nh = 1; c.index_hd = 1; c.index_topk = 1; c.index_kpool = 1;
     c.eps = 1e-6f;
     GLayer l = {0};
-    l.qa = test_f32(64, 8); l.qb = test_f32(3 * 64, 64);
+    l.qa = test_f32(64, 8);
+    l.qb = qb_experiment ? test_i4(3 * 64, 64, 64) : test_f32(3 * 64, 64);
     l.kva = test_f32(64, 8); l.kvb_kt = test_f32(3 * 64, 64);
     l.iwq = test_f32(1, 64); l.iwk = test_f32(1, 8);
     l.ikpg = test_f32(1, 8); l.iwp = test_f32(1, 8);
     l.kvb_v = test_f32(3 * 64, 64); l.o = test_i4(8, 3 * 64, 64);
     ((float *)l.qa.f)[0] = 1.0f;
-    ((float *)l.qb.f)[0] = 1.0f;
+    if (!qb_experiment) ((float *)l.qb.f)[0] = 1.0f;
     ((float *)l.kva.f)[0] = 1.0f;
     ((float *)l.kvb_kt.f)[0] = 1.0f;
     ((float *)l.iwq.f)[0] = 1.0f;
@@ -93,6 +114,7 @@ static void one_token_mla_case(int profiled) {
     float generic[8], fast[8];
     GModel baseline = {0}, experimental = {0};
     experimental.mla_out_rows4 = 1;
+    experimental.mla_qb_rows4 = qb_experiment;
 #ifdef COLI_CUDA
     if (profiled) experimental.cuda.profile.clock = now_s;
 #else
@@ -138,6 +160,8 @@ static void one_token_mla_case(int profiled) {
         assert(d->mla_proj == end.mla_proj - start.mla_proj);
         assert(d->mla_query_path > 0 && d->mla_latent_path > 0);
         assert(d->mla_qa > 0 && d->mla_qnorm > 0 && d->mla_qb > 0);
+        assert(d->mla_qb_rows4_calls == (uint64_t)(qb_experiment && EXPECT_ROWS4));
+        assert(d->mla_qb_generic_calls == (uint64_t)!(qb_experiment && EXPECT_ROWS4));
         assert(d->mla_query_path >= d->mla_qa + d->mla_qnorm + d->mla_qb);
         assert(d->mla_query_path - d->mla_qa - d->mla_qnorm - d->mla_qb < 0.01);
         assert(d->mla_absorbed_q > 0 && d->mla_index_path > 0);
@@ -156,9 +180,15 @@ static void one_token_mla_case(int profiled) {
         assert(experimental.mla_absorbed_q_rows == 0);
     }
     assert(baseline.mla_out_generic_calls == 1);
+    assert(baseline.mla_qb_rows4_calls == 0);
+    assert(baseline.mla_qb_generic_calls == 1);
     const int calls = profiled ? 2 : 1;
     assert(experimental.mla_out_rows4_calls == (uint64_t)calls * EXPECT_ROWS4);
     assert(experimental.mla_out_generic_calls == (uint64_t)calls * !EXPECT_ROWS4);
+    assert(experimental.mla_qb_rows4_calls ==
+           (uint64_t)calls * (qb_experiment && EXPECT_ROWS4));
+    assert(experimental.mla_qb_generic_calls ==
+           (uint64_t)calls * !(qb_experiment && EXPECT_ROWS4));
     mat_release(&l.qa); mat_release(&l.qb); mat_release(&l.kva);
     mat_release(&l.kvb_kt); mat_release(&l.iwq); mat_release(&l.iwk);
     mat_release(&l.ikpg); mat_release(&l.iwp); mat_release(&l.kvb_v);
@@ -167,6 +197,13 @@ static void one_token_mla_case(int profiled) {
 
 #ifndef GLM53_MLA_NO_MAIN
 int main(void) {
+    unsetenv("GLM53_MLA_QB_ROWS4");
+    assert(!glm53_mla_qb_rows4_env());
+    setenv("GLM53_MLA_QB_ROWS4", "0", 1);
+    assert(!glm53_mla_qb_rows4_env());
+    setenv("GLM53_MLA_QB_ROWS4", "1", 1);
+    assert(glm53_mla_qb_rows4_env());
+    unsetenv("GLM53_MLA_QB_ROWS4");
     unsetenv("GLM53_MLA_OUT_ROWS4");
     assert(!glm53_mla_out_rows4_env());
     setenv("GLM53_MLA_OUT_ROWS4", "0", 1);
@@ -180,7 +217,14 @@ int main(void) {
     projection_case(8, 64, 32, 4, 1, 0);     /* unsupported MLA group */
     projection_case(8, 64, 64, 0, 1, 0);     /* non-int4 */
     projection_case(8, 70, 64, 4, 1, 0);    /* input/group tail */
-    one_token_mla_case(0);
+    qb_projection_case(16384, 1536, 64, 4, 0, 0); /* production q_b, switch off */
+    qb_projection_case(16384, 1536, 64, 4, 1, EXPECT_ROWS4);
+    qb_projection_case(5, 64, 64, 4, 1, 0);      /* row tail */
+    qb_projection_case(8, 70, 64, 4, 1, 0);     /* input/group tail */
+    qb_projection_case(8, 64, 32, 4, 1, 0);     /* unsupported group */
+    qb_projection_case(8, 64, 64, 0, 1, 0);     /* non-int4 */
+    one_token_mla_case(0, 0);
+    one_token_mla_case(0, 1);
     puts("glm53 MLA output rows4: PASS");
     return 0;
 }

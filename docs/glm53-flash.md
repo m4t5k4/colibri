@@ -177,6 +177,16 @@ the cumulative `[glm53-attn-split]` line includes
 `mla_out_rows4_calls` and `mla_out_generic_calls`; `mla_out_s` retains its
 existing inclusive timing interval.
 
+`GLM53_MLA_QB_ROWS4=1` independently enables the same default-off AVX2
+rows4 experiment for the one-token MLA `q_b` projection. It requires a
+fmt4/gs64 matrix, output rows divisible by four, and an input dimension
+divisible by 64; multi-token calls and all other formats/geometries keep the
+generic `mv` path. `q_a`, RMS,
+and MLA output dispatch are unaffected. The cumulative `[glm53-attn-split]`
+and decode-window `[glm53-cuda-decode-profile]` lines report
+`mla_qb_rows4_calls` and `mla_qb_generic_calls`; existing projection timers
+keep their previous boundaries.
+
 `CUDA_EXPERT_GB` is a total decimal-GB cap across all selected devices, or
 `auto` (default): the sum of free VRAM minus 2 GB of runtime headroom on each
 device, floored at zero per device. A numeric cap is clamped to that total;
