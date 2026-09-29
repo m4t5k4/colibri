@@ -103,6 +103,38 @@ static inline int coli_cuda_init_disposition(int nctx, int count,
 /* Opaque, persistent device copy of one resident quantized tensor. */
 typedef struct ColiCudaTensor ColiCudaTensor;
 
+/* GLM53 one-token KDA. Caller owns host weights and session state. The object
+ * owns two device state/window generations and never uses expert-group scratch. */
+typedef struct KdaProto ColiCudaKda;
+typedef struct {
+    const uint8_t *q4;
+    const float *scales;
+    int in, out;
+} ColiCudaKdaMatrix;
+typedef struct {
+    size_t projection_bytes, state_bytes, transactional_state_bytes;
+    size_t window_bytes, scratch_bytes, other_bytes, host_staging_bytes;
+} ColiCudaKdaFootprint;
+typedef struct {
+    double h2d_s, projection_s, convolution_s, recurrence_s;
+    double norm_output_s, d2h_s;
+} ColiCudaKdaTimes;
+COLI_CUDA_DLLEXPORT ColiCudaKda *coli_cuda_kda_create(int device, int heads,
+    int head_dim, int hidden, int kernel, const ColiCudaKdaMatrix matrices[4],
+    const float *conv, const float *norm);
+COLI_CUDA_DLLEXPORT void coli_cuda_kda_free(ColiCudaKda *kda);
+COLI_CUDA_DLLEXPORT int coli_cuda_kda_set_state(ColiCudaKda *kda,
+    const float *state, const float *window);
+COLI_CUDA_DLLEXPORT int coli_cuda_kda_get_state(ColiCudaKda *kda,
+    float *state, float *window);
+COLI_CUDA_DLLEXPORT int coli_cuda_kda_step(ColiCudaKda *kda, float *out,
+    const float *x, const float *decay, const float *beta, const float *gate,
+    float output_eps);
+COLI_CUDA_DLLEXPORT int coli_cuda_kda_footprint(const ColiCudaKda *kda,
+    ColiCudaKdaFootprint *out);
+COLI_CUDA_DLLEXPORT int coli_cuda_kda_times(const ColiCudaKda *kda,
+    ColiCudaKdaTimes *out);
+
 /* Devices are CUDA ordinals, not positions in the input list.
  * Repeating the same ordered list preserves active contexts. Changing an
  * active list returns 0 without replacing it; release tensors and shut down

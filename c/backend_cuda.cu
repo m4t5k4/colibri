@@ -3125,3 +3125,5 @@ extern "C" int coli_cuda_pipe_sync(int device){
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
     return cuda_ok(cudaDeviceSynchronize(),"pipe sync");
 }
+
+#include "glm53_kda_cuda_impl.h"

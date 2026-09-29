@@ -153,6 +153,15 @@ typedef int (*fn_pipe_sync)(int device);
 typedef int (*fn_pipe_upload)(int device,void *dst,const void *src,size_t bytes);
 typedef int (*fn_shared_mlp_w4a16)(ColiCudaTensor *gate, ColiCudaTensor *up, ColiCudaTensor *down, float *y, const float *x, int S);
 typedef int (*fn_tensor_update)(ColiCudaTensor *tensor, const void *weights, const float *scales);
+typedef ColiCudaKda *(*fn_kda_create)(int, int, int, int, int,
+    const ColiCudaKdaMatrix[4], const float *, const float *);
+typedef void (*fn_kda_free)(ColiCudaKda *);
+typedef int (*fn_kda_set_state)(ColiCudaKda *, const float *, const float *);
+typedef int (*fn_kda_get_state)(ColiCudaKda *, float *, float *);
+typedef int (*fn_kda_step)(ColiCudaKda *, float *, const float *,
+    const float *, const float *, const float *, float);
+typedef int (*fn_kda_footprint)(const ColiCudaKda *, ColiCudaKdaFootprint *);
+typedef int (*fn_kda_times)(const ColiCudaKda *, ColiCudaKdaTimes *);
 
 /* Resolved pointers, plus a flag so we attempt the load at most once. */
 static struct {
@@ -225,6 +234,13 @@ static struct {
     fn_pipe_upload pipe_upload;
     fn_shared_mlp_w4a16 shared_mlp_w4a16;
     fn_tensor_update tensor_update;
+    fn_kda_create kda_create;
+    fn_kda_free kda_free;
+    fn_kda_set_state kda_set_state;
+    fn_kda_get_state kda_get_state;
+    fn_kda_step kda_step;
+    fn_kda_footprint kda_footprint;
+    fn_kda_times kda_times;
 } g_cuda;
 
 #ifdef COLI_HIP_DLL
@@ -1487,6 +1503,13 @@ static int coli_cuda_load(void){
     RESOLVE(pipe_upload, fn_pipe_upload)
     RESOLVE(shared_mlp_w4a16, fn_shared_mlp_w4a16)
     RESOLVE(tensor_update, fn_tensor_update)
+    RESOLVE_OPT(kda_create, fn_kda_create)
+    RESOLVE_OPT(kda_free, fn_kda_free)
+    RESOLVE_OPT(kda_set_state, fn_kda_set_state)
+    RESOLVE_OPT(kda_get_state, fn_kda_get_state)
+    RESOLVE_OPT(kda_step, fn_kda_step)
+    RESOLVE_OPT(kda_footprint, fn_kda_footprint)
+    RESOLVE_OPT(kda_times, fn_kda_times)
     #undef RESOLVE
     #undef COLI_RELEASE_RUNTIME_ON_FAIL
 
@@ -1670,6 +1693,40 @@ int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x,
                      int fmt, int S, int I, int O, int device, int gs){
     if(!g_cuda.available) return 0;
     return g_cuda.matmul(tensor, y, x, weights, scales, fmt, S, I, O, device, gs);
+}
+
+ColiCudaKda *coli_cuda_kda_create(int device, int heads, int head_dim,
+    int hidden, int kernel, const ColiCudaKdaMatrix matrices[4],
+    const float *conv, const float *norm) {
+    return g_cuda.available && g_cuda.kda_create ?
+        g_cuda.kda_create(device, heads, head_dim, hidden, kernel,
+                          matrices, conv, norm) : NULL;
+}
+void coli_cuda_kda_free(ColiCudaKda *kda) {
+    if (g_cuda.available && g_cuda.kda_free) g_cuda.kda_free(kda);
+}
+int coli_cuda_kda_set_state(ColiCudaKda *kda,
+    const float *state, const float *window) {
+    return g_cuda.available && g_cuda.kda_set_state &&
+           g_cuda.kda_set_state(kda, state, window);
+}
+int coli_cuda_kda_get_state(ColiCudaKda *kda, float *state, float *window) {
+    return g_cuda.available && g_cuda.kda_get_state &&
+           g_cuda.kda_get_state(kda, state, window);
+}
+int coli_cuda_kda_step(ColiCudaKda *kda, float *out, const float *x,
+    const float *decay, const float *beta, const float *gate, float eps) {
+    return g_cuda.available && g_cuda.kda_step &&
+           g_cuda.kda_step(kda, out, x, decay, beta, gate, eps);
+}
+int coli_cuda_kda_footprint(const ColiCudaKda *kda,
+    ColiCudaKdaFootprint *out) {
+    return g_cuda.available && g_cuda.kda_footprint &&
+           g_cuda.kda_footprint(kda, out);
+}
+int coli_cuda_kda_times(const ColiCudaKda *kda, ColiCudaKdaTimes *out) {
+    return g_cuda.available && g_cuda.kda_times &&
+           g_cuda.kda_times(kda, out);
 }
 
 int coli_cuda_matmul_mxfp4(float *y, const float *x, const unsigned char *q4,

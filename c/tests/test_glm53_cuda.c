@@ -196,6 +196,30 @@ const float *coli_cuda_expert_group_take(int d) {
     if (d == fail_group_take_device) return NULL;
     return fake_group[d].output;
 }
+/* The Phase 2F2 object is optional. Existing tier tests leave it disabled. */
+ColiCudaKda *coli_cuda_kda_create(int d, int h, int hd, int hidden, int k,
+        const ColiCudaKdaMatrix m[4], const float *conv, const float *norm) {
+    (void)d; (void)h; (void)hd; (void)hidden; (void)k;
+    (void)m; (void)conv; (void)norm; return NULL;
+}
+void coli_cuda_kda_free(ColiCudaKda *kda) { (void)kda; }
+int coli_cuda_kda_set_state(ColiCudaKda *kda, const float *s, const float *w) {
+    (void)kda; (void)s; (void)w; return 0;
+}
+int coli_cuda_kda_get_state(ColiCudaKda *kda, float *s, float *w) {
+    (void)kda; (void)s; (void)w; return 0;
+}
+int coli_cuda_kda_step(ColiCudaKda *kda, float *out, const float *x,
+        const float *decay, const float *beta, const float *gate, float eps) {
+    (void)kda; (void)out; (void)x; (void)decay;
+    (void)beta; (void)gate; (void)eps; return 0;
+}
+int coli_cuda_kda_footprint(const ColiCudaKda *kda, ColiCudaKdaFootprint *out) {
+    (void)kda; (void)out; return 0;
+}
+int coli_cuda_kda_times(const ColiCudaKda *kda, ColiCudaKdaTimes *out) {
+    (void)kda; (void)out; return 0;
+}
 #endif
 #ifndef G53_CUDA_NO_TEST_MAIN
 int main(void) {

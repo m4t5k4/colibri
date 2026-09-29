@@ -699,6 +699,26 @@ typedef struct {
 
 #ifdef COLI_CUDA
 typedef struct {
+    ColiCudaKda *object;
+    GSession *owner;
+    int device, usable, valid, host_stale;
+} G53KdaCudaLayer;
+typedef struct {
+    int enabled, ndev, devices[COLI_CUDA_MAX_DEVICES];
+    unsigned layers[COLI_CUDA_MAX_DEVICES];
+    size_t logical[COLI_CUDA_MAX_DEVICES];
+    size_t projection[COLI_CUDA_MAX_DEVICES], transactional[COLI_CUDA_MAX_DEVICES];
+    size_t scratch[COLI_CUDA_MAX_DEVICES], host_staging[COLI_CUDA_MAX_DEVICES];
+    size_t free_before[COLI_CUDA_MAX_DEVICES], free_after[COLI_CUDA_MAX_DEVICES];
+    uint64_t calls, fallbacks, errors, invalidations;
+    uint64_t pushes, pulls, push_bytes, pull_bytes, h2d_bytes, d2h_bytes;
+    uint64_t device_calls[COLI_CUDA_MAX_DEVICES];
+    double seconds, push_s, pull_s, device_s[COLI_CUDA_MAX_DEVICES];
+} G53KdaCudaTier;
+#endif
+
+#ifdef COLI_CUDA
+typedef struct {
     int valid;
     double cuda_seconds[G53_PROFILE_TIMES], planning, join_wait, deferred_join_wait;
     double disk, attn, ffn, head;
@@ -728,6 +748,8 @@ typedef struct {
     int streaming;
 #ifdef COLI_CUDA
     G53Cuda cuda;
+    G53KdaCudaLayer *kda_gpu;
+    G53KdaCudaTier kda_tier;
     G53DecodeBase decode_base, decode_total;
 #endif
     struct ERef *eref;
@@ -1584,8 +1606,117 @@ static void mlp3(float *out, const float *x, const Mat *g, const Mat *u, const M
 /* ---------- KDA: proiezioni, gate, ricorrenza ---------- */
 static double now_s(void);
 
+#ifdef COLI_CUDA
+static void g53_kda_pull(GModel *m, int layer) {
+    G53KdaCudaLayer *e = &m->kda_gpu[layer];
+    if (!e->owner || !e->host_stale) return;
+    GLayerState *host = &e->owner->layer[layer];
+    double start = now_s();
+    if (!coli_cuda_kda_get_state(e->object, host->kda_state, host->kda_window)) {
+        /* A previous successful GPU token made the host state stale. There is
+         * no valid CPU continuation if the committed state cannot be read. */
+        fprintf(stderr, "[glm53-kda-cuda] committed state pull failed layer=%d; session cannot continue\n", layer);
+        exit(1);
+    }
+    G53KdaCudaTier *t = &m->kda_tier;
+    t->pulls++; t->pull_bytes += ((size_t)m->c.kda_heads * m->c.kda_hd * m->c.kda_hd +
+                                 (size_t)3 * m->c.kda_proj * m->c.conv_k) * sizeof(float);
+    t->pull_s += now_s() - start;
+    e->host_stale = 0;
+}
+static void g53_kda_cpu_prepare(GModel *m, GSession *s, int layer) {
+    G53KdaCudaLayer *e = &m->kda_gpu[layer];
+    if (e->owner == s) {
+        g53_kda_pull(m, layer);
+        if (e->valid) { e->valid = 0; m->kda_tier.invalidations++; }
+    }
+}
+static int g53_kda_try_decode(GModel *m, const Cfg *c, const GLayer *l,
+                              GSession *s, int layer, const float *x, float *out) {
+    G53KdaCudaLayer *e = &m->kda_gpu[layer];
+    if (!e->usable || !e->object) return 0;
+    G53KdaCudaTier *t = &m->kda_tier;
+    if (e->owner != s) {
+        g53_kda_pull(m, layer);
+        e->owner = s; e->valid = 0; e->host_stale = 0;
+        t->invalidations++;
+    }
+    GLayerState *host = &s->layer[layer];
+    if (!e->valid) {
+        double start = now_s();
+        if (!coli_cuda_kda_set_state(e->object, host->kda_state, host->kda_window)) {
+            e->usable = 0; t->errors++;
+            fprintf(stderr, "[glm53-kda-cuda] state push failed layer=%d; CPU fallback\n", layer);
+            return 0;
+        }
+        t->pushes++;
+        t->push_bytes += ((size_t)c->kda_heads * c->kda_hd * c->kda_hd +
+                          (size_t)3 * c->kda_proj * c->conv_k) * sizeof(float);
+        t->push_s += now_s() - start;
+        e->valid = 1;
+    }
+    const int P = c->kda_proj, H = c->kda_heads, D = c->kda_hd;
+    float *decay = malloc((size_t)P * sizeof(float));
+    float *beta = malloc((size_t)H * sizeof(float));
+    float *gate = malloc((size_t)P * sizeof(float));
+    float *low = malloc((size_t)D * sizeof(float));
+    if (!decay || !beta || !gate || !low) {
+        free(decay); free(beta); free(gate); free(low);
+        g53_kda_cpu_prepare(m, s, layer);
+        return 0;
+    }
+    double start = now_s();
+    mv(low, &l->kfa, x); mv(decay, &l->kfb, low);
+    for (int h = 0; h < H; h++) for (int d = 0; d < D; d++) {
+        int i = h * D + d;
+        decay[i] = c->gate_lb * sigmoidf_(expf(l->alog[h]) * (decay[i] + l->dt[i]));
+    }
+    m->t_kda_decay += now_s() - start;
+    start = now_s();
+    mv(beta, &l->kb, x);
+    for (int h = 0; h < H; h++) beta[h] = sigmoidf_(beta[h]);
+    m->t_kda_beta += now_s() - start;
+    start = now_s();
+    mv(low, &l->kga, x); mv(gate, &l->kgb, low);
+    m->t_kda_gateproj += now_s() - start;
+    start = now_s();
+    int ok = coli_cuda_kda_step(e->object, out, x, decay, beta, gate, c->eps);
+    double elapsed = now_s() - start;
+    free(decay); free(beta); free(gate); free(low);
+    if (ok) {
+        e->host_stale = 1;
+        t->calls++; t->seconds += elapsed;
+        t->h2d_bytes += ((size_t)c->hidden + 2u * P + H) * sizeof(float);
+        t->d2h_bytes += (size_t)c->hidden * sizeof(float);
+        for (int di = 0; di < t->ndev; di++) if (t->devices[di] == e->device) {
+            t->device_calls[di]++; t->device_s[di] += elapsed; break;
+        }
+        return 1;
+    }
+    /* step never commits a failed generation: pull the previous successful
+     * token's state, then let the CPU process this token exactly once. */
+    g53_kda_pull(m, layer);
+    e->usable = 0; e->valid = 0;
+    t->errors++; t->invalidations++;
+    fprintf(stderr, "[glm53-kda-cuda] step failed layer=%d; committed state restored, CPU fallback\n", layer);
+    return 0;
+}
+#endif
+
 static void kda_layer(GModel *m, const Cfg *c, const GLayer *l, const float *x, int tokens,
-                      float *out, float *state, float *window, float *scratch) {
+                      float *out, GSession *session, int layer) {
+    float *state = session->layer[layer].kda_state;
+    float *window = session->layer[layer].kda_window;
+    float *scratch = session->kda_scratch;
+#ifdef COLI_CUDA
+    if (m->kda_tier.enabled && m->kda_gpu) {
+        if (tokens == 1 && m->cuda.decode_call) {
+            if (g53_kda_try_decode(m, c, l, session, layer, x, out)) return;
+            m->kda_tier.fallbacks++;
+        }
+        g53_kda_cpu_prepare(m, session, layer);
+    }
+#endif
     const int P = c->kda_proj, H = c->kda_heads, D = c->kda_hd;
     float *qkv = malloc((size_t)3 * P * sizeof(float));
     float *gate = malloc((size_t)P * sizeof(float));
@@ -3718,6 +3849,14 @@ static GSession *session_open(const GModel *m, int cap) {
 
 static void session_close(const GModel *m, GSession *s) {
     if (!s) return;
+#ifdef COLI_CUDA
+    if (m->kda_gpu) for (int i = 0; i < m->c.n_layers; i++)
+        if (m->kda_gpu[i].owner == s) {
+            m->kda_gpu[i].owner = NULL;
+            m->kda_gpu[i].valid = 0;
+            m->kda_gpu[i].host_stale = 0;
+        }
+#endif
     for (int i = 0; i < m->c.n_layers; i++) {
         GLayerState *st = &s->layer[i];
         free(st->latent); free(st->ikeys); free(st->igates);
@@ -3768,8 +3907,7 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                  * conversazione, e azzerarlo qui vorrebbe dire ricominciare
                  * la ricorrenza a ogni token generato. */
                 if (c->is_full[i]) mla_layer(m, c, l, normed, n, branch, st, start);
-                else kda_layer(m, c, l, normed, n, branch, st->kda_state, st->kda_window,
-                               s->kda_scratch);
+                else kda_layer(m, c, l, normed, n, branch, s, i);
             } else {
                 ffn_layer(m, l, i, normed, n, branch);
             }
@@ -3815,6 +3953,12 @@ static void mat_release(Mat *mat) {
 static void model_release(GModel *m) {
     if (!m) return;
 #ifdef COLI_CUDA
+    if (m->kda_gpu) {
+        for (int i = 0; i < m->c.n_layers; i++)
+            coli_cuda_kda_free(m->kda_gpu[i].object);
+        free(m->kda_gpu);
+        m->kda_gpu = NULL;
+    }
     g53_cuda_close(&m->cuda);
 #endif
     if (m->layer) {
@@ -3885,6 +4029,116 @@ static void model_release(GModel *m) {
 }
 
 /* Il caso pieno: tutti i layer, embedding e testa comprese. */
+#ifdef COLI_CUDA
+static void glm53_kda_cuda_init(GModel *m) {
+    const char *flag = getenv("GLM53_CUDA_KDA");
+    if (!flag || !strcmp(flag, "0")) return;
+    if (strcmp(flag, "1")) {
+        fprintf(stderr, "invalid GLM53_CUDA_KDA (expected 0 or 1)\n"); exit(1);
+    }
+    if (!getenv("COLI_CUDA") || strcmp(getenv("COLI_CUDA"), "1")) {
+        fprintf(stderr, "[glm53-kda-cuda] COLI_CUDA is not active; CPU KDA retained\n");
+        return;
+    }
+    G53KdaCudaTier *tier = &m->kda_tier;
+    tier->ndev = g53_cuda_devices(getenv("COLI_GPUS"), getenv("COLI_GPU"), tier->devices);
+    if (!tier->ndev || !coli_cuda_init(tier->devices, tier->ndev)) {
+        fprintf(stderr, "[glm53-kda-cuda] backend unavailable; CPU KDA retained\n");
+        return;
+    }
+    m->kda_gpu = calloc((size_t)m->c.n_layers, sizeof(*m->kda_gpu));
+    if (!m->kda_gpu) {
+        fprintf(stderr, "[glm53-kda-cuda] metadata unavailable; CPU KDA retained\n");
+        return;
+    }
+    tier->enabled = 1;
+    for (int d = 0; d < tier->ndev; d++) {
+        size_t total;
+        coli_cuda_mem_info(tier->devices[d], &tier->free_before[d], &total);
+    }
+    int ordinal = 0;
+    for (int i = 0; i < m->c.n_layers; i++) if (!m->c.is_full[i]) {
+        int di = ordinal++ % tier->ndev;
+        G53KdaCudaLayer *entry = &m->kda_gpu[i];
+        const GLayer *l = &m->layer[i];
+        entry->device = tier->devices[di];
+        const Mat *weights[4] = {&l->kq, &l->kk, &l->kv, &l->ko};
+        ColiCudaKdaMatrix matrices[4];
+        int supported = m->c.conv_k == 4;
+        for (int j = 0; j < 4; j++) {
+            matrices[j] = (ColiCudaKdaMatrix){weights[j]->q4, weights[j]->s,
+                                               weights[j]->columns, weights[j]->rows};
+            supported &= weights[j]->fmt == 4 && weights[j]->gs == 64;
+        }
+        if (supported) entry->object = coli_cuda_kda_create(entry->device,
+            m->c.kda_heads, m->c.kda_hd, m->c.hidden, m->c.conv_k,
+            matrices, l->conv, l->onorm);
+        entry->usable = entry->object != NULL;
+        if (entry->usable) {
+            ColiCudaKdaFootprint f = {0};
+            if (coli_cuda_kda_footprint(entry->object, &f)) {
+                tier->logical[di] += f.projection_bytes + f.state_bytes +
+                    f.transactional_state_bytes + f.window_bytes +
+                    f.scratch_bytes + f.other_bytes;
+                tier->projection[di] += f.projection_bytes;
+                tier->transactional[di] += f.transactional_state_bytes;
+                tier->scratch[di] += f.scratch_bytes;
+                tier->host_staging[di] += f.host_staging_bytes;
+            }
+            tier->layers[di]++;
+        }
+        if (getenv("GLM53_VERBOSE") && atoi(getenv("GLM53_VERBOSE")))
+            fprintf(stderr, "[glm53-kda-cuda-layer] layer=%d ordinal=%d device=%d loaded=%d\n",
+                    i, ordinal - 1, entry->device, entry->usable);
+    }
+    for (int d = 0; d < tier->ndev; d++) {
+        size_t total;
+        coli_cuda_mem_info(tier->devices[d], &tier->free_after[d], &total);
+        fprintf(stderr, "[glm53-kda-cuda-device] device=%d layers=%u logical_bytes=%zu projection_bytes=%zu transactional_bytes=%zu scratch_bytes=%zu host_staging_bytes=%zu free_before=%zu free_after=%zu measured_delta=%zu\n",
+                tier->devices[d], tier->layers[d], tier->logical[d],
+                tier->projection[d], tier->transactional[d], tier->scratch[d],
+                tier->host_staging[d],
+                tier->free_before[d], tier->free_after[d],
+                tier->free_before[d] >= tier->free_after[d] ?
+                    tier->free_before[d] - tier->free_after[d] : 0);
+    }
+    /* g53_cuda_init below samples post-KDA free memory for every device. */
+}
+static void glm53_kda_cuda_close(GModel *m) {
+    if (!m->kda_gpu) return;
+    G53KdaCudaTier *t = &m->kda_tier;
+    ColiCudaKdaTimes times = {0};
+    for (int i = 0; i < m->c.n_layers; i++) if (m->kda_gpu[i].object) {
+        ColiCudaKdaTimes one = {0};
+        if (!coli_cuda_kda_times(m->kda_gpu[i].object, &one)) continue;
+        times.h2d_s += one.h2d_s; times.projection_s += one.projection_s;
+        times.convolution_s += one.convolution_s;
+        times.recurrence_s += one.recurrence_s;
+        times.norm_output_s += one.norm_output_s; times.d2h_s += one.d2h_s;
+    }
+    fprintf(stderr, "[glm53-kda-cuda] kda_cuda_calls=%llu kda_cuda_s=%.6f kda_cuda_fallbacks=%llu kda_cuda_errors=%llu phase_timing_enabled=%d h2d_bytes=%llu h2d_s=%.6f d2h_bytes=%llu d2h_s=%.6f projection_s=%.6f conv_s=%.6f recurrence_s=%.6f norm_gate_o_s=%.6f state_pushes=%llu state_push_bytes=%llu state_push_s=%.6f state_pulls=%llu state_pull_bytes=%llu state_pull_s=%.6f invalidations=%llu\n",
+            (unsigned long long)t->calls, t->seconds,
+            (unsigned long long)t->fallbacks, (unsigned long long)t->errors,
+            getenv("GLM53_CUDA_PROFILE") && !strcmp(getenv("GLM53_CUDA_PROFILE"), "1"),
+            (unsigned long long)t->h2d_bytes, times.h2d_s,
+            (unsigned long long)t->d2h_bytes, times.d2h_s,
+            times.projection_s, times.convolution_s, times.recurrence_s,
+            times.norm_output_s,
+            (unsigned long long)t->pushes, (unsigned long long)t->push_bytes, t->push_s,
+            (unsigned long long)t->pulls, (unsigned long long)t->pull_bytes, t->pull_s,
+            (unsigned long long)t->invalidations);
+    for (int di = 0; di < t->ndev; di++)
+        fprintf(stderr, "[glm53-kda-cuda-device-final] device=%d calls=%llu kda_cuda_s=%.6f layers=%u logical_bytes=%zu measured_delta=%zu\n",
+                t->devices[di], (unsigned long long)t->device_calls[di],
+                t->device_s[di], t->layers[di], t->logical[di],
+                t->free_before[di] >= t->free_after[di] ?
+                    t->free_before[di] - t->free_after[di] : 0);
+    for (int i = 0; i < m->c.n_layers; i++)
+        coli_cuda_kda_free(m->kda_gpu[i].object);
+    free(m->kda_gpu);
+    m->kda_gpu = NULL;
+}
+#endif
 static void model_load(GModel *m, const char *dir) {
     model_load_range(m, dir, 0, -1, 1);
     /* Only CLI/SERVE own the process-global CUDA backend. Segment and Edge
@@ -3892,8 +4146,15 @@ static void model_load(GModel *m, const char *dir) {
      * zero-initialized tier stays inactive and cannot shut down another owner.
      * Keep this out of the range loader, including the CPU-build opt-in error. */
 #ifdef COLI_CUDA
+    glm53_kda_cuda_init(m);
     g53_cuda_init(&m->cuda, m->c.n_layers, m->c.n_experts,
-                  m->c.hidden, m->c.moe_inter, m->streaming);
+                   m->c.hidden, m->c.moe_inter, m->streaming);
+    if (m->kda_tier.enabled) for (int di = 0; di < m->cuda.ndev; di++)
+        fprintf(stderr, "[glm53-kda-cuda-budget] device=%d kda_layers=%u post_kda_free=%zu expert_ceiling_bytes=%zu expert_slots=%zu shared_expert_budget=%zu\n",
+                m->cuda.devices[di], m->kda_tier.layers[di],
+                m->kda_tier.free_after[di], m->cuda.capacity[di],
+                m->cuda.expert_bytes ? m->cuda.capacity[di] / m->cuda.expert_bytes : 0,
+                m->cuda.budget);
     g53_cuda_profile_enable(&m->cuda, now_s);
     g53_cuda_profile_report(&m->cuda, "start");
 #else
@@ -4361,7 +4622,7 @@ static void slot_pin_drop(const GModel *m, KVSlot *slot) {
     slot->pin_session = NULL;
 }
 
-static int slot_pin_save(const GModel *m, KVSlot *slot, const int *tokens, int n,
+static int slot_pin_save(GModel *m, KVSlot *slot, const int *tokens, int n,
                          const float *logit) {
     const Cfg *c = &m->c;
     if (!slot->session || n < 1 || !logit) return 0;
@@ -4392,6 +4653,10 @@ static int slot_pin_save(const GModel *m, KVSlot *slot, const int *tokens, int n
     for (int i = 0; i < c->n_layers; i++) {
         GLayerState *ls = &slot->session->layer[i];
         if (c->is_full[i] || !ls->kda_state || !st->state[i]) continue;
+#ifdef COLI_CUDA
+        if (m->kda_gpu && m->kda_gpu[i].owner == slot->session)
+            g53_kda_pull(m, i);
+#endif
         memcpy(st->state[i],  ls->kda_state,  ns * sizeof(float));
         memcpy(st->window[i], ls->kda_window, nw * sizeof(float));
     }
@@ -4403,7 +4668,7 @@ static int slot_pin_save(const GModel *m, KVSlot *slot, const int *tokens, int n
 /* Rimette lo scatto piu profondo che sia un prefisso stretto di questo prompt,
  * se la sessione che l'ha prodotto e ancora quella dello slot. Torna quante
  * posizioni sono gia' fatte, 0 se non si applica. */
-static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, int n) {
+static int slot_pin_restore(GModel *m, KVSlot *slot, const int *tokens, int n) {
     const Cfg *c = &m->c;
     if (!slot->session || slot->pin_session != slot->session) return 0;
     const size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd;
@@ -4425,6 +4690,13 @@ static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, in
                 if (c->is_full[i] || !ls->kda_state || !st->state[i]) continue;
                 memcpy(ls->kda_state,  st->state[i],  ns * sizeof(float));
                 memcpy(ls->kda_window, st->window[i], nw * sizeof(float));
+#ifdef COLI_CUDA
+                if (m->kda_gpu && m->kda_gpu[i].owner == slot->session) {
+                    m->kda_gpu[i].valid = 0;
+                    m->kda_gpu[i].host_stale = 0;
+                    m->kda_tier.invalidations++;
+                }
+#endif
             }
             slot->session->filled = k->len;
             coli_pin_touch(&slot->pins, s);
@@ -5082,6 +5354,7 @@ int main(int argc, char **argv) {
         coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
         serve_loop(&served, &serve_tok);
 #ifdef COLI_CUDA
+        glm53_kda_cuda_close(&served);
         g53_cuda_close(&served.cuda);
 #endif
         glm53_telemetry_save();
@@ -5253,6 +5526,7 @@ int main(int argc, char **argv) {
     free(logits);
     session_close(&model, session);
 #ifdef COLI_CUDA
+    glm53_kda_cuda_close(&model);
     g53_cuda_close(&model.cuda);
 #endif
     glm53_telemetry_save();
