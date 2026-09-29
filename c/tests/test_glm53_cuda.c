@@ -47,6 +47,8 @@ static void project(float *y, const float *x, const unsigned char *w,
 struct ColiCudaTensor { unsigned char *w; float *s; int I, O, device; };
 static int live, upload_calls, fail_upload, mat_calls, fail_mat, init_calls, shutdown_calls;
 static int fake_upload_active, fake_upload_peak, fake_upload_delay;
+static int fake_upload_slow_device = -1;
+static int fake_record_upload_completion, fake_upload_complete_order[1024], fake_upload_complete_count;
 static int fake_fail_upload_device = -1, fake_fail_upload_n;
 static int fake_device_upload_calls[COLI_CUDA_MAX_DEVICES];
 static int fake_ndev, fake_devices[COLI_CUDA_MAX_DEVICES], live_device[COLI_CUDA_MAX_DEVICES];
@@ -101,7 +103,7 @@ int coli_cuda_tensor_upload_g(ColiCudaTensor **t, const void *w, const float *s,
              if (peak >= active) break; }
         while (!__sync_bool_compare_and_swap(&fake_upload_peak, peak, active));
 #ifdef _OPENMP
-        double until = omp_get_wtime() + 0.005;
+        double until = omp_get_wtime() + (d == fake_upload_slow_device ? 0.020 : 0.005);
         while (omp_get_wtime() < until) { }
 #endif
         __sync_sub_and_fetch(&fake_upload_active, 1);
@@ -114,7 +116,13 @@ int coli_cuda_tensor_upload_g(ColiCudaTensor **t, const void *w, const float *s,
     memcpy((*t)->w, w, (size_t)I * O / 2); memcpy((*t)->s, s, (size_t)I * O / 16);
     __sync_add_and_fetch(&live, 1); __sync_add_and_fetch(&live_device[d], 1); return 1;
 }
-int coli_cuda_tensor_upload_complete(int d) { (void)d; return 1; }
+int coli_cuda_tensor_upload_complete(int d) {
+    if (!fake_record_upload_completion) return 1;
+    int at = __sync_fetch_and_add(&fake_upload_complete_count, 1);
+    assert(at < (int)(sizeof(fake_upload_complete_order)/sizeof(fake_upload_complete_order[0])));
+    fake_upload_complete_order[at] = d;
+    return 1;
+}
 int coli_cuda_matmul(ColiCudaTensor **t, float *y, const float *x, const void *w,
                      const float *s, int fmt, int S, int I, int O, int d, int gs) {
     (void)w; (void)s; assert(fmt == 4 && S == 1 && gs == 64);

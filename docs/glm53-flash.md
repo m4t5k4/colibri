@@ -184,10 +184,20 @@ Warm uploads do not increment runtime `uploads`, `upload_s`, or `promotion_s`.
 `warm_hits` counts selections of still-resident preload entries; `warm_misses`
 counts selections of those same entries after eviction, not all cold misses.
 Warm `read_s` and `upload_s` are components of warm `total_s`, not additive
-elapsed times. With `GLM53_CUDA_TRACE`, `W,layer,eid,owner_index,device_id`
-records each warm publication and `B,warm_loaded,resident_before_inference`
-marks the transition to normal `S/A/P/E/U` events. Preload is serial; it does
-not use the runtime parallel-promotion workers.
+elapsed times. `GLM53_CUDA_WARM_PARALLEL=1` enables a separate default-off
+startup scheduler. It plans the same ranked owner sequence before any upload,
+reads into at most one reusable host slot per GPU, and uploads distinct-owner
+batches concurrently. It does not alter runtime promotion. Extra host staging
+is bounded by the sum of at most one expert slot per active GPU (about 113 MB
+for eight GLM53 devices, rather than one 24 GB copy of the warm set).
+`upload_s` is the sum of worker upload durations in parallel mode; the new
+`upload_wall_s` is elapsed upload-batch wall time, excluding serial reads.
+`total_s` remains the end-to-end preload wall time. `parallel_uploads` counts
+tasks assigned to multi-device batches, while `peak_inflight` counts overlapping
+worker intervals. With `GLM53_CUDA_TRACE`, `W,layer,eid,owner_index,device_id`
+records successful warm publications in ranked order, `F,layer,eid,owner_index,
+device_id,stage` records a failed upload, and `B,warm_loaded,
+resident_before_inference` marks the transition to normal `S/A/P/E/U` events.
 
 `GLM53_MLA_OUT_ROWS4=1` is a separate, default-off CPU attention experiment.
 For a one-token MLA output projection it reuses KDA KO's AVX2 rows4 int4

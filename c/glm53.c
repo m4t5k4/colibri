@@ -2452,17 +2452,52 @@ static void glm53_cuda_warm_start(GModel *m) {
     long miss_before = m->miss;
     uint64_t bytes_before = m->ebytes;
     size_t target = g->warm_requested < (size_t)n ? g->warm_requested : (size_t)n;
-    for (size_t i = 0; i < target && !g->failed; i++) {
-        int layer = ranked[i].layer, eid = ranked[i].eid;
-        if (g->expert_bytes > g->budget || g->bytes > g->budget - g->expert_bytes ||
-            g53_cuda_place(g) < 0) break;
-        double read_start = now_s();
-        expert_read(m, layer, eid, &slot);
-        g->warm_read_s += now_s() - read_start;
-        if (!g53_cuda_warm_upload(g, layer, eid, slot.piece, now_s)) break;
+    G53CudaWarmPlan *plan = NULL;
+    Slot *stage = NULL;
+    if (g->warm_parallel && target) {
+        plan = malloc(target * sizeof(*plan));
+        stage = calloc((size_t)g->ndev, sizeof(*stage));
+        if (!plan || !stage) {
+            fprintf(stderr, "[glm53-cuda-warm] parallel staging unavailable; using serial preload\n");
+            free(plan); free(stage); plan = NULL; stage = NULL;
+            g->warm_parallel = 0; g->warm_workers = 1;
+        }
+    }
+    if (g->warm_parallel && target) {
+        size_t planned = g53_cuda_warm_plan(g, ranked, target, plan);
+        size_t at = 0;
+        while (at < planned && !g->failed) {
+            G53CudaPromotionTask task[COLI_CUDA_MAX_DEVICES] = {{0}};
+            int batch = g53_cuda_warm_batch_size(plan, at, planned, g->ndev);
+            for (int j = 0; j < batch; j++) {
+                const G53CudaWarmPlan *p = &plan[at++];
+                Slot *source = &stage[p->owner];
+                double read_start = now_s();
+                expert_read(m, p->layer, p->eid, source);
+                g->warm_read_s += now_s() - read_start;
+                G53CudaPromotionTask *t = &task[j];
+                t->layer = p->layer; t->eid = p->eid; t->owner = p->owner;
+                t->device = g->devices[p->owner]; t->D = g->D; t->I = g->I;
+                for (int k = 0; k < 6; k++) t->piece[k] = source->piece[k];
+            }
+            if (!g53_cuda_warm_batch(g, task, batch, now_s)) break;
+        }
+    } else {
+        for (size_t i = 0; i < target && !g->failed; i++) {
+            int layer = ranked[i].layer, eid = ranked[i].eid;
+            if (g->expert_bytes > g->budget || g->bytes > g->budget - g->expert_bytes ||
+                g53_cuda_place(g) < 0) break;
+            double read_start = now_s();
+            expert_read(m, layer, eid, &slot);
+            g->warm_read_s += now_s() - read_start;
+            if (!g53_cuda_warm_upload(g, layer, eid, slot.piece, now_s)) break;
+        }
     }
     m->miss = miss_before;
     m->ebytes = bytes_before;
+    if (stage) for (int i = 0; i < g->ndev; i++) free(stage[i].own);
+    free(stage);
+    free(plan);
     free(slot.own);
     free(ranked);
     g->warm_total_s = now_s() - start;

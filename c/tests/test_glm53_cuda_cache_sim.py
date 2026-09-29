@@ -253,6 +253,15 @@ A,6,0,1
             with self.assertRaisesRegex(ValueError, "start cold"):
                 SIM.replay_warm(parsed, (1, 1), 2, 2, 1, {"baseline": []})
 
+    def test_warm_failure_marker_does_not_become_runtime_upload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trace = Path(directory) / "warm-failed.trace"
+            trace.write_text("W,0,2,0,0\nF,0,1,1,1,2\nB,1,1\nS,1,1,0,2,1,1\n")
+            parsed = list(SIM.events(trace))
+            self.assertEqual(SIM.warm_trace_prefix(parsed), ([(0, 2, 0, 0)], (1, 1)))
+            with self.assertRaisesRegex(ValueError, "cold trace"):
+                SIM.replay(parsed, (1, 1))
+
     def test_command_output_and_device_log_are_deterministic(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
