@@ -310,6 +310,11 @@ and loop overhead, not another kernel. `mla_absorbed_q_calls` and
 `mla_absorbed_q_rows` are decode-only counts of per-head matvec calls and
 their output rows. The child clocks and counts run only with
 `GLM53_CUDA_PROFILE=1`; no kernel or OpenMP dispatch changes.
+Within `mla_query_path_s`, the sequential `mla_qa_s`, `mla_qnorm_s`, and
+`mla_qb_s` children time the q_a matvec, query RMS normalization, and q_b
+matvec respectively. `mla_query_residual_s` is their parent minus those three
+children. The decode-only line reports their prefill-excluding deltas; the
+cumulative `[glm53-attn-split]` line also carries these four fields.
 The original cumulative lines and their field meanings are unchanged. Worker
 `upload_s` is summed worker time; `promotion_s` and join waits measure caller
 blocking, and the phase/substage fields are nested rather than exclusive.

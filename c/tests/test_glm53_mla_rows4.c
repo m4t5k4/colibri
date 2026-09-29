@@ -103,6 +103,13 @@ static void one_token_mla_case(int profiled) {
     assert(memcmp(generic, fast, sizeof(generic)) == 0);
 #ifdef COLI_CUDA
     if (profiled) {
+        assert(experimental.t_mla_qa > 0);
+        assert(experimental.t_mla_qnorm > 0);
+        assert(experimental.t_mla_qb > 0);
+        double query_child = experimental.t_mla_qa + experimental.t_mla_qnorm +
+                             experimental.t_mla_qb;
+        assert(experimental.t_mla_query_path >= query_child);
+        assert(experimental.t_mla_query_path - query_child < 0.01);
         assert(experimental.t_mla_query_path > 0);
         assert(experimental.t_mla_latent_path > 0);
         assert(experimental.t_mla_absorbed_q > 0);
@@ -122,16 +129,25 @@ static void one_token_mla_case(int profiled) {
         const G53DecodeBase *d = &experimental.decode_total;
         assert(d->valid && d->mla_absorbed_q_calls == 3 && d->mla_absorbed_q_rows == 3 * 64);
         assert(d->mla_query_path == end.mla_query_path - start.mla_query_path);
+        assert(d->mla_qa == end.mla_qa - start.mla_qa);
+        assert(d->mla_qnorm == end.mla_qnorm - start.mla_qnorm);
+        assert(d->mla_qb == end.mla_qb - start.mla_qb);
         assert(d->mla_latent_path == end.mla_latent_path - start.mla_latent_path);
         assert(d->mla_absorbed_q == end.mla_absorbed_q - start.mla_absorbed_q);
         assert(d->mla_index_path == end.mla_index_path - start.mla_index_path);
         assert(d->mla_proj == end.mla_proj - start.mla_proj);
         assert(d->mla_query_path > 0 && d->mla_latent_path > 0);
+        assert(d->mla_qa > 0 && d->mla_qnorm > 0 && d->mla_qb > 0);
+        assert(d->mla_query_path >= d->mla_qa + d->mla_qnorm + d->mla_qb);
+        assert(d->mla_query_path - d->mla_qa - d->mla_qnorm - d->mla_qb < 0.01);
         assert(d->mla_absorbed_q > 0 && d->mla_index_path > 0);
         assert(experimental.t_kda_proj == 0 && experimental.t_kda_qkv == 0);
     } else
 #endif
     {
+        assert(experimental.t_mla_qa == 0);
+        assert(experimental.t_mla_qnorm == 0);
+        assert(experimental.t_mla_qb == 0);
         assert(experimental.t_mla_query_path == 0);
         assert(experimental.t_mla_latent_path == 0);
         assert(experimental.t_mla_absorbed_q == 0);
