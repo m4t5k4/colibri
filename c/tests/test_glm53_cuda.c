@@ -197,6 +197,7 @@ const float *coli_cuda_expert_group_take(int d) {
     return fake_group[d].output;
 }
 /* The Phase 2F2 object is optional. Existing tier tests leave it disabled. */
+#ifndef G53_CUDA_TEST_KDA_BACKEND
 ColiCudaKda *coli_cuda_kda_create(int d, int h, int hd, int hidden, int k,
         const ColiCudaKdaMatrix m[4], const float *conv, const float *norm) {
     (void)d; (void)h; (void)hd; (void)hidden; (void)k;
@@ -220,6 +221,7 @@ int coli_cuda_kda_footprint(const ColiCudaKda *kda, ColiCudaKdaFootprint *out) {
 int coli_cuda_kda_times(const ColiCudaKda *kda, ColiCudaKdaTimes *out) {
     (void)kda; (void)out; return 0;
 }
+#endif
 #endif
 #ifndef G53_CUDA_NO_TEST_MAIN
 int main(void) {

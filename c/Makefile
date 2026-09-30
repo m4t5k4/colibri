@@ -1319,7 +1319,7 @@ glm53$(EXE): glm53.c sse41_kernels.h decode_batch.h pin_pool.h cli_args.h st.h j
 	$(CC) $(CFLAGS) glm53.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
 .PHONY: glm53-cuda-tier-check glm53-cuda-check glm53-cuda-multidev-check
-glm53-cuda-tier-check: tests/test_glm53_cuda_adapters$(EXE) tests/test_glm53_cuda_profile$(EXE) tests/test_glm53_cuda_multidev$(EXE) tests/test_glm53_cuda_multidev_oracle$(EXE) tests/test_glm53_cuda_prodshape$(EXE) tests/test_glm53_cuda_scatter$(EXE) tests/test_glm53_cuda_phase2$(EXE) tests/test_glm53_cuda_promotion$(EXE) tests/test_glm53_cuda_warm$(EXE) tests/test_glm53_mla_rows4$(EXE) tests/test_glm53_mla_profile$(EXE) tests/test_glm53_mla_absorbed_batch$(EXE)
+glm53-cuda-tier-check: tests/test_glm53_cuda_adapters$(EXE) tests/test_glm53_cuda_profile$(EXE) tests/test_glm53_cuda_multidev$(EXE) tests/test_glm53_cuda_multidev_oracle$(EXE) tests/test_glm53_cuda_prodshape$(EXE) tests/test_glm53_cuda_scatter$(EXE) tests/test_glm53_cuda_phase2$(EXE) tests/test_glm53_cuda_promotion$(EXE) tests/test_glm53_cuda_warm$(EXE) tests/test_glm53_mla_rows4$(EXE) tests/test_glm53_mla_profile$(EXE) tests/test_glm53_mla_absorbed_batch$(EXE) tests/test_glm53_kda_lifecycle$(EXE)
 	$(CC) $(NOCUDA_CFLAGS) tests/test_glm53_cuda.c -o tests/test_glm53_cuda$(EXE) $(NOCUDA_LDFLAGS)
 	COLI_CUDA=1 COLI_GPU=0 COLI_GPUS= CUDA_EXPERT_GB=auto ./tests/test_glm53_cuda$(EXE)
 	./tests/test_glm53_cuda_adapters$(EXE)
@@ -1334,6 +1334,7 @@ glm53-cuda-tier-check: tests/test_glm53_cuda_adapters$(EXE) tests/test_glm53_cud
 	./tests/test_glm53_mla_rows4$(EXE)
 	./tests/test_glm53_mla_profile$(EXE)
 	./tests/test_glm53_mla_absorbed_batch$(EXE)
+	./tests/test_glm53_kda_lifecycle$(EXE)
 
 tests/test_glm53_mla_rows4$(EXE): tests/test_glm53_mla_rows4.c glm53.c quant.h segment_runtime.c edge_runtime.c
 	$(CC) $(filter-out -DCOLI_METAL -DCOLI_VULKAN,$(NOCUDA_CFLAGS)) $< segment_runtime.c edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
@@ -1391,6 +1392,13 @@ glm53-kda-cuda-proto-check: tests/test_glm53_kda_cuda.cu backend_cuda.cu glm53_k
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) tests/test_glm53_kda_cuda.cu -o tests/test_glm53_kda_cuda$(EXE)
 	./tests/test_glm53_kda_cuda$(EXE)
+
+.PHONY: glm53-kda-lifecycle-check
+glm53-kda-lifecycle-check: tests/test_glm53_kda_lifecycle$(EXE)
+	./tests/test_glm53_kda_lifecycle$(EXE)
+
+tests/test_glm53_kda_lifecycle$(EXE): tests/test_glm53_kda_lifecycle.c tests/test_glm53_cuda.c glm53.c glm53_cuda.h backend_cuda.h pin_pool.h segment_runtime.c edge_runtime.c
+	$(CC) $(filter-out -DCOLI_METAL -DCOLI_VULKAN,$(NOCUDA_CFLAGS)) -DCOLI_CUDA $< segment_runtime.c edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
 
 # Synthetic two-device numerical oracle. Skip cleanly when CUDA reports <2 devices.
 glm53-cuda-multidev-check: $(CUDA_OBJ)

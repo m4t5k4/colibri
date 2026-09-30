@@ -332,6 +332,15 @@ make -C c glm53 CUDA=1 CUDA_ARCH=sm_86 -j4
 Two visible devices exercise KDA-to-expert context interop. With one visible
 device that case reports a skip; the numerical/state tests still run.
 
+`make -C c glm53-kda-lifecycle-check` exercises the production KDA/session/slot
+functions without CUDA or a checkpoint. A transactional CPU-backed device double
+checks alternating sessions, GPU-to-CPU prefill, one-token CPU prefill, pin/save
+and restore after device tokens, reset, and failed push/step after prior successful
+device tokens. It compares outputs, recurrent state and convolution history with
+CPU continuation and checks that a failed token is processed once. This is host
+lifecycle coverage, not CUDA numerical or hardware validation; it also runs in
+`glm53-cuda-tier-check`.
+
 ### Opt-in CUDA profiling
 
 Set `GLM53_CUDA_PROFILE=1` with the CUDA tier. The profiler is off
