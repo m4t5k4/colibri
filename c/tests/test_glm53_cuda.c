@@ -149,7 +149,8 @@ static void fake_complete_group(int d) {
         }
     }
     free(su); free(sg);
-    if (d == nonfinite_group_device) fake_group[d].output[0] = NAN;
+    if (d >= 0 && d < COLI_CUDA_MAX_DEVICES && d == nonfinite_group_device)
+        fake_group[d].output[0] = NAN;
     fake_group[d].done = 1;
     assert(fake_completion_count < (int)(sizeof(fake_completion_order)/sizeof(fake_completion_order[0])));
     fake_completion_order[fake_completion_count++] = d;
