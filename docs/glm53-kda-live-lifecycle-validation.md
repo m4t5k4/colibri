@@ -44,6 +44,22 @@ python3 -B -m unittest discover -s c/tests -p test_glm53_kda_serve_lifecycle.py 
 bash c/tests/run_glm53_kda_serve_lifecycle.sh
 ```
 
+If the child exits before the first response, first run only the OFF diagnostic:
+
+```bash
+bash c/tests/run_glm53_kda_serve_lifecycle.sh --diagnostic-one-request \
+  --startup-timeout 900 --read-timeout 600 --request-timeout 1800
+```
+
+This never starts ON or requests 2-8. The driver uses raw pipes and complete
+write handling like the production gateway, drains READY/STAT/EMAP before SUBMIT,
+and bounds startup, idle reads and whole requests. On failure, `0.failure.json`
+records the pre-cleanup poll/exit/signal, stdin status, startup frame identities,
+last complete frame, request ID and stderr tail. It separately labels termination
+of a still-live child; an already-exited child's status is preserved. Exact input
+bytes are saved as `0.stdin.bin`. The runner records after-hashes even on failure.
+Successful one-request completion is not a full lifecycle-validation pass.
+
 The shell script establishes the production environment and runs the same binary
 OFF then ON, without rebuilding. It writes logs, request/results JSON and hashes
 under a fresh `artifacts/phase2f-live/serve.*` directory. The Python driver freezes

@@ -19,11 +19,12 @@ fingerprint() {
     sha256sum c/glm53 "$COLI_USAGE"
 }
 fingerprint > "$run/before.txt"
+trap 'fingerprint > "$run/after.txt"' EXIT
 printf 'Artifacts: %s\n' "$run"
 python3 -B c/tests/glm53_kda_serve_lifecycle.py \
     --binary "$PWD/c/glm53" \
     --model /srv/models-fast/colibri/glm53-flash-i4 \
-    --usage "$COLI_USAGE" --output "$run/stock" | tee "$run/console.log"
+    --usage "$COLI_USAGE" --output "$run/stock" "$@" 2>&1 | tee "$run/console.log"
 fingerprint > "$run/after.txt"
 diff -u "$run/before.txt" "$run/after.txt"
-printf 'PASS stock production SERVE validation. Artifacts: %s\n' "$run"
+printf 'Driver completed. Artifacts: %s\n' "$run"

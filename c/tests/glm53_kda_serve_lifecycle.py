@@ -7,9 +7,71 @@ import math
 import os
 from pathlib import Path
 import re
+import queue
+import threading
+import time
 import subprocess
 
 USAGE_SHA = "7a246a49fc1dc3fb6360c131153c22012ca08949da390455654652d76e18a953"
+
+
+class PipeReader:
+    """Drain the raw pipe independently; deadlines include partial frames."""
+    def __init__(self, stream, raw):
+        self.items = queue.Queue()
+        self.buffer = bytearray()
+        self.eof = False
+        self.raw = raw
+        self.thread = threading.Thread(target=self.pump, args=(stream,), daemon=True)
+        self.thread.start()
+
+    def pump(self, stream):
+        try:
+            while True:
+                data = stream.read(65536)
+                if not data:
+                    break
+                self.raw.write(data)
+                self.raw.flush()
+                self.items.put(data)
+        except Exception as error:
+            self.items.put(error)
+        finally:
+            self.items.put(None)
+
+    def more(self, deadline):
+        item = self.items.get(timeout=max(0, deadline - time.monotonic()))
+        if isinstance(item, Exception):
+            raise item
+        if item is None:
+            self.eof = True
+        else:
+            self.buffer.extend(item)
+
+    def read(self, count, deadline):
+        while len(self.buffer) < count and not self.eof:
+            self.more(deadline)
+        data = bytes(self.buffer[:count])
+        del self.buffer[:count]
+        return data
+
+    def line(self, deadline):
+        while b"\n" not in self.buffer and not self.eof:
+            self.more(deadline)
+        count = self.buffer.find(b"\n") + 1
+        if not count:
+            count = len(self.buffer)
+        return self.read(count, deadline)
+
+
+def write_all(stream, data):
+    view = memoryview(data)
+    while view:
+        written = stream.write(view)
+        if written is None or written <= 0:
+            raise BrokenPipeError("SUBMIT write made no progress")
+        view = view[written:]
+    stream.flush()
 
 
 def sha(path):
@@ -26,6 +88,15 @@ class Engine:
         self.log = args.output / f"{mode}.stderr.log"
         self.stderr = self.log.open("wb")
         self.raw = (args.output / f"{mode}.stdout.bin").open("wb")
+        self.input_log = (args.output / f"{mode}.stdin.bin").open("wb")
+        self.failure_path = args.output / f"{mode}.failure.json"
+        self.failure = None
+        self.startup_frames = []
+        self.last_frame = None
+        self.request_id = None
+        self.read_timeout = args.read_timeout
+        self.request_timeout = args.request_timeout
+        self.deadline = time.monotonic() + args.startup_timeout
         env = dict(os.environ, SERVE="1", SERVE_BATCH="1", KV_SLOTS="2",
                    COLI_PIN_SLOTS="4", SNAP=str(args.model),
                    COLI_USAGE=str(args.usage), USAGE_SAVE="0",
@@ -33,33 +104,84 @@ class Engine:
                    GLM53_CUDA_PROFILE="1", GLM53_VERBOSE="1")
         self.p = subprocess.Popen([str(args.binary), "1024"], env=env,
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=self.stderr)
+                                  stderr=self.stderr, bufsize=0)
+        self.reader = PipeReader(self.p.stdout, self.raw)
         self.closed = False
         try:
-            while b"READY" not in self.line():
-                pass
+            while True:
+                frame = self.line()
+                self.startup_frames.append(frame.split()[0].decode(errors="replace"))
+                if frame == b"\x01\x01READY\x01\x01":
+                    self.startup_frames[-1] = "READY"
+                    break
+            for expected in (b"STAT", b"EMAP"):
+                fields = self.line().split()
+                assert fields and fields[0] == expected, fields
+                self.startup_frames.append(expected.decode())
+                if expected == b"EMAP":
+                    assert len(fields) == 4 and len(fields[3]) == 2 * int(fields[1]) * int(fields[2]), "bad startup EMAP"
+            self.deadline = None
         except BaseException:
             self.abort()
             raise
 
+    def diagnostics(self, reason):
+        if self.failure is not None:
+            return self.failure
+        before = self.p.poll()
+        original = before
+        if original is None:
+            try:
+                original = self.p.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                pass
+        self.failure = {"reason": reason, "mode": self.mode,
+            "request_id": self.request_id, "pid": self.p.pid,
+            "poll_before_cleanup": before, "original_returncode": original,
+            "original_signal": -original if original is not None and original < 0 else None,
+            "stdin_closed": self.p.stdin.closed,
+            "startup_frame_count": len(self.startup_frames),
+            "startup_frames": self.startup_frames, "last_complete_frame": self.last_frame,
+            "stdout_bytes": self.raw.tell(), "buffered_stdout_bytes": len(self.reader.buffer),
+            "stderr_tail": self.log.read_bytes()[-6000:].decode(errors="replace")}
+        self.failure_path.write_text(json.dumps(self.failure, indent=2) + "\n")
+        return self.failure
+
+    def fail(self, reason):
+        raise AssertionError(json.dumps(self.diagnostics(reason), indent=2))
+
+    def read_deadline(self):
+        idle = time.monotonic() + self.read_timeout
+        return min(idle, self.deadline) if self.deadline is not None else idle
+
     def read(self, count):
-        data = self.p.stdout.read(count)
-        self.raw.write(data)
+        try:
+            data = self.reader.read(count, self.read_deadline())
+        except queue.Empty:
+            self.fail("protocol read timeout")
         if len(data) != count:
-            raise AssertionError(f"mode={self.mode}: truncated frame; see {self.log}")
+            self.fail(f"truncated frame: wanted={count} got={len(data)}")
         return data
 
     def line(self):
-        data = self.p.stdout.readline()
-        self.raw.write(data)
-        if not data:
-            raise AssertionError(f"mode={self.mode}: unexpected EOF; see {self.log}")
+        try:
+            data = self.reader.line(self.read_deadline())
+        except queue.Empty:
+            self.fail("protocol line timeout")
+        if not data or not data.endswith(b"\n"):
+            self.fail("unexpected EOF" if not data else "EOF in partial header")
+        if not data.startswith((b"DATA ", b"ECHO ")):
+            self.last_frame = data[:240].decode(errors="replace")
         return data.rstrip(b"\r\n")
 
     def request(self, rid, slot, payload):
+        self.request_id = rid
+        self.deadline = time.monotonic() + self.request_timeout
         header = f"SUBMIT {rid} {slot} {len(payload)} 16 0 1 logprobs=1\n".encode()
-        self.p.stdin.write(header + payload + b"\n")
-        self.p.stdin.flush()
+        wire = header + payload + b"\n"
+        self.input_log.write(wire)
+        self.input_log.flush()
+        write_all(self.p.stdin, wire)
         tokens, pieces = [], []
         while True:
             fields = self.line().split()
@@ -69,6 +191,7 @@ class Engine:
                 assert int(fields[1]) == rid, fields
                 body = self.read(int(fields[2]))
                 assert self.read(1) == b"\n"
+                self.last_frame = f"{fields[0].decode()} request={rid} payload_bytes={len(body)}"
                 if fields[0] == b"DATA":
                     assert len(fields) == 7 and fields[4] == b"1", fields
                     assert math.isfinite(float(fields[3])) and math.isfinite(float(fields[6])), fields
@@ -87,26 +210,44 @@ class Engine:
 
     def close(self):
         self.p.stdin.close()
-        while True:
-            data = self.p.stdout.read(65536)
-            if not data:
-                break
-            self.raw.write(data)
-        code = self.p.wait(timeout=120)
+        self.deadline = time.monotonic() + 120
+        try:
+            while not self.reader.eof:
+                self.reader.more(self.deadline)
+                self.reader.buffer.clear()
+            code = self.p.wait(timeout=max(0, self.deadline - time.monotonic()))
+        except (queue.Empty, subprocess.TimeoutExpired):
+            self.fail("shutdown timeout")
+        self.reader.thread.join(timeout=1)
         self.p.stdout.close()
         self.stderr.close()
         self.raw.close()
+        self.input_log.close()
         self.closed = True
         assert code == 0, f"mode={self.mode}: exit={code}; see {self.log}"
 
     def abort(self):
         if not self.closed:
-            self.p.kill()
-            self.p.wait()
+            report = self.diagnostics("exception before cleanup")
+            action = "none: child already exited"
+            if self.p.poll() is None:
+                action = "terminate live child"
+                self.p.terminate()
+                try:
+                    self.p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    action = "kill after terminate timeout"
+                    self.p.kill()
+                    self.p.wait()
+            self.reader.thread.join(timeout=2)
+            report["cleanup_action"] = action
+            report["returncode_after_cleanup"] = self.p.returncode
+            self.failure_path.write_text(json.dumps(report, indent=2) + "\n")
             self.p.stdin.close()
             self.p.stdout.close()
             self.stderr.close()
             self.raw.close()
+            self.input_log.close()
             self.closed = True
 
 
@@ -123,15 +264,16 @@ def unexpected_errors(text):
     assert all(int(x) == 0 for x in re.findall(r"\berrors=(\d+)", text)), "expert CUDA error"
 
 
-def check_log(path, mode, results):
+def check_log(path, mode, results, diagnostic=False):
     text = path.read_text(errors="replace")
     unexpected_errors(text)
     reuse = {int(r): (int(n), int(p)) for r, n, p in
              re.findall(r"^REUSE (\d+) (\d+) (\d+)$", text, re.M)}
-    for rid in (3, 4, 5, 6):
-        n, p = reuse[rid]
-        assert n > 0 and p - n > 1, f"request {rid}: reuse/prefill unexercised"
-    assert reuse[7][0] == reuse[8][0] == 0, "reset was not exercised"
+    if not diagnostic:
+        for rid in (3, 4, 5, 6):
+            n, p = reuse[rid]
+            assert n > 0 and p - n > 1, f"request {rid}: reuse/prefill unexercised"
+        assert reuse[7][0] == reuse[8][0] == 0, "reset was not exercised"
     expert = re.findall(r"^\[glm53-cuda\].*\berrors=(\d+)", text, re.M)
     assert expert and all(int(x) == 0 for x in expert), "expert CUDA error"
     counters = {}
@@ -155,7 +297,7 @@ def run(args, mode, reference=None):
              b"Write a C binary search function and explain all edge cases."]
     latest = {}
     try:
-        for rid in range(1, 9):
+        for rid in range(1, 2 if args.diagnostic_one_request else 9):
             slot = (rid - 1) % 2
             if reference is not None:
                 payload = bytes.fromhex(reference[rid - 1]["prompt_hex"])
@@ -174,11 +316,14 @@ def run(args, mode, reference=None):
             latest[slot] = result
             results.append(result)
             print(f"mode={mode} request={rid} slot={slot} emitted={result['emitted']} semantic=PASS", flush=True)
-        assert same(results[6], results[7]), "reset/fresh-slot reference mismatch"
+        if not args.diagnostic_one_request:
+            assert same(results[6], results[7]), "reset/fresh-slot reference mismatch"
         e.close()
-        health = check_log(e.log, mode, results)
+        health = check_log(e.log, mode, results, args.diagnostic_one_request)
         (args.output / f"{mode}.results.json").write_text(json.dumps(
-            {"requests": results, "health": health}, indent=2) + "\n")
+            {"requests": results, "health": health,
+             "startup_frames": e.startup_frames,
+             "returncode": e.p.returncode}, indent=2) + "\n")
         return results
     except BaseException:
         e.abort()
@@ -191,7 +336,14 @@ def main():
     p.add_argument("--model", type=Path, required=True)
     p.add_argument("--usage", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--diagnostic-one-request", action="store_true",
+                   help="Run only OFF request 1; never starts KDA ON")
+    p.add_argument("--startup-timeout", type=float, default=900)
+    p.add_argument("--read-timeout", type=float, default=600)
+    p.add_argument("--request-timeout", type=float, default=1800)
     args = p.parse_args()
+    assert all(x > 0 and math.isfinite(x) for x in
+               (args.startup_timeout, args.read_timeout, args.request_timeout))
     for key in ("binary", "model", "usage", "output"):
         setattr(args, key, getattr(args, key).resolve())
     args.output.mkdir(parents=True, exist_ok=False)
@@ -202,6 +354,9 @@ def main():
          if k.startswith(("OMP_", "COLI_", "CUDA_", "GLM53_")) or k in ("DRAFT", "USAGE_SAVE")}}, indent=2) + "\n")
     reference = run(args, 0)
     assert before == {"binary": sha(args.binary), "usage": sha(args.usage)}
+    if args.diagnostic_one_request:
+        print("PASS one-request OFF diagnostic; not full lifecycle or KDA ON validation")
+        return
     run(args, 1, reference)
     assert before == {"binary": sha(args.binary), "usage": sha(args.usage)}
     print("PASS stock CUDA SERVE lifecycle; hashes unchanged; no injected failures")
