@@ -37,6 +37,22 @@ shutdown so final KDA/expert counters are captured.
 
 ## Stock SERVE protocol cases
 
+The stock multi-slot/decode-prefill/reset comparison is runnable with:
+
+```bash
+python3 -B -m unittest discover -s c/tests -p test_glm53_kda_serve_lifecycle.py -v
+bash c/tests/run_glm53_kda_serve_lifecycle.sh
+```
+
+The shell script establishes the production environment and runs the same binary
+OFF then ON, without rebuilding. It writes logs, request/results JSON and hashes
+under a fresh `artifacts/phase2f-live/serve.*` directory. The Python driver freezes
+the OFF payloads for ON, checks token IDs and DATA bytes after each request, tests
+reset against the same prompt in another fresh slot, and rejects missing REUSE
+coverage. Healthy final calls must match the actual SERVE decode-forward count;
+all KDA/expert errors and fallbacks must be zero. This stock script does not test
+direct stale-state pin/save or injected failures.
+
 `SUBMIT <id> <slot> <payload_bytes> <max_tokens> 0 1 logprobs=1 [pin=1]`
 followed by the UTF-8 payload and a newline requests deterministic generation.
 Wait for READY before submitting, and DONE before the next request. DATA and
@@ -78,6 +94,23 @@ failure by returning false after a successful committed step, resetting CUDA,
 or causing real device loss.
 
 ## Required test-only live-CUDA driver
+
+Pending implementation, the exact proposed file changes are:
+
+- `c/tests/test_glm53_kda_live_lifecycle.c`: new driver including production
+  lifecycle functions, loading real weights and calling the real CUDA backend.
+- `c/tests/glm53_kda_live_backend.cu`: new test translation unit including
+  `backend_cuda.cu`, privately renaming the normal step/push wrappers and
+  supplying test-only wrappers that pass the existing transactional fault
+  argument. Kernels, streams and device allocations remain the real backend.
+- `c/tests/glm53_kda_live_test_api.h`: new private arm/observe API for that test
+  executable only; no environment variables or production header additions.
+- `c/Makefile`: a separate live test backend object/executable, never linked into
+  `glm53` and never substituted for the normal production backend object.
+- This document: exact build/run commands once that target exists.
+
+No production source changes are required by this proposed arrangement. There
+is intentionally no build/run command for the unimplemented driver yet.
 
 Prepare a separate test executable, not a production feature flag. Reuse the
 production functions and backend object, with the real checkpoint and all 34
