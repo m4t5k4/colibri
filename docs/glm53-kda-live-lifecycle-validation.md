@@ -51,6 +51,29 @@ bash c/tests/run_glm53_kda_serve_lifecycle.sh --diagnostic-one-request \
   --startup-timeout 900 --read-timeout 600 --request-timeout 1800
 ```
 
+For the constrained rig, explicitly retain the host expert budget:
+
+```bash
+GLM53_EXPERT_GB=8 bash c/tests/run_glm53_kda_serve_lifecycle.sh \
+  --diagnostic-one-request --startup-timeout 900 --read-timeout 600 \
+  --request-timeout 1800
+```
+
+The runner launches `[binary]`, with no positional expert-cache cap, and sets
+`GLM53_MAXT=1024` for SERVE context. A bare `1024` argument is an expert-cache
+override, not context: it clamps to all 288 experts per sparse layer and can
+ignore `GLM53_EXPERT_GB`. The normal gateway launches `[executable, resolved_cap]`;
+GLM53's implicit cap is 0 unless an explicit cap or planned/profile cap wins.
+The 0 sentinel leaves RAM-budget sizing active; a positive cap overrides it.
+
+Startup evidence is saved as `0.startup.json` and checked before SUBMIT. Using
+the actual config's fmt-4/group-64 geometry, 14,155,776-byte slots and 42 sparse
+layers, 8,000,000,000 host-cache bytes produce 13 slots/layer and 7,729,053,696
+logical bytes (reported as 7.7 GB). This is the expert-cache allocation ceiling,
+not total process RSS. The check rejects a cap inconsistent with the explicit
+budget and also requires `KV slots: 2 with 1024 positions each`. EOF/OOM `/proc`
+and pipe diagnostics remain enabled.
+
 This never starts ON or requests 2-8. The driver uses raw pipes and complete
 write handling like the production gateway, drains READY/STAT/EMAP before SUBMIT,
 and bounds startup, idle reads and whole requests. On failure, `0.failure.json`

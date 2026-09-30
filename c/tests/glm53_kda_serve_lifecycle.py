@@ -157,6 +157,43 @@ def sha(path):
     return digest.hexdigest()
 
 
+def startup_geometry(text, budget_setting, model):
+    rows = re.findall(r"^experts: ([\d.]+) MB slots, (\d+) per layer across (\d+) sparse layers \(([\d.]+) GB resident\)$", text, re.M)
+    assert len(rows) == 1, "missing/ambiguous startup host expert-cache geometry"
+    mb, slots, sparse, resident = rows[0]
+    mb, slots, sparse, resident = float(mb), int(slots), int(sparse), float(resident)
+    assert slots > 0 and sparse > 0 and mb > 0
+    assert "KV slots: 2 with 1024 positions each" in text, "SERVE context is not 1024"
+    evidence = {"slot_mb_reported": mb, "slots_per_layer": slots,
+                "sparse_layers": sparse, "resident_gb_reported": resident,
+                "expert_budget_gb_env": budget_setting, "serve_context": 1024}
+    config = model / "config.json"
+    if config.exists():
+        cfg = json.loads(config.read_text())
+        cfg = cfg.get("text_config", cfg)
+        elements = int(cfg["hidden_size"]) * int(cfg["moe_intermediate_size"])
+        slot_bytes = 3 * (elements // 2 + elements // 64 * 4)
+        evidence["exact_slot_bytes"] = slot_bytes
+        evidence["logical_cache_bytes"] = slots * sparse * slot_bytes
+        assert abs(slot_bytes / 1e6 - mb) <= 0.050001, "slot bytes disagree with startup"
+        assert abs(slots * sparse * slot_bytes / 1e9 - resident) <= 0.050001, "cache bytes disagree with startup"
+    else:
+        slot_bytes = None  # Synthetic protocol tests may omit model files.
+    if budget_setting is not None:
+        budget = float(budget_setting)
+        assert math.isfinite(budget) and budget > 0, "invalid diagnostic host expert budget"
+        if slot_bytes is not None:
+            expected = min(int(cfg["n_routed_experts"]), max(1, int(budget * 1e9 / (slot_bytes * sparse))))
+            assert slots == expected, f"host expert-cache override: expected {expected} slots/layer, got {slots}"
+            evidence["expected_slots_per_layer"] = expected
+        else:
+            low = max(1, int(budget * 1e9 / ((mb + 0.05) * 1e6 * sparse)))
+            high = max(1, int(budget * 1e9 / ((mb - 0.05) * 1e6 * sparse)))
+            assert low <= slots <= high, f"host expert-cache override: expected approximately {low}-{high} slots/layer, got {slots}"
+        assert resident <= budget + 0.050001, "reported host cache exceeds explicit budget"
+    return evidence
+
+
 class Engine:
     def __init__(self, args, mode):
         self.mode = mode
@@ -178,8 +215,10 @@ class Engine:
                    COLI_PIN_SLOTS="4", SNAP=str(args.model),
                    COLI_USAGE=str(args.usage), USAGE_SAVE="0",
                    GLM53_CUDA_WARM_RESIDENCY="0", GLM53_CUDA_KDA=str(mode),
-                   GLM53_CUDA_PROFILE="1", GLM53_VERBOSE="1")
-        self.p = subprocess.Popen([str(args.binary), "1024"], env=env,
+                   GLM53_CUDA_PROFILE="1", GLM53_VERBOSE="1", GLM53_MAXT="1024")
+        self.launch_argv = [str(args.binary)]
+        self.startup_cache = None
+        self.p = subprocess.Popen(self.launch_argv, env=env,
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=self.stderr, bufsize=0)
         self.parent_pipes_at_launch = {"stdin": pipe_identity(self.p.stdin),
@@ -200,6 +239,11 @@ class Engine:
                 if expected == b"EMAP":
                     assert len(fields) == 4 and len(fields[3]) == 2 * int(fields[1]) * int(fields[2]), "bad startup EMAP"
             self.deadline = None
+            self.startup_cache = startup_geometry(self.log.read_text(errors="replace"),
+                                                 env.get("GLM53_EXPERT_GB"), args.model)
+            (args.output / f"{mode}.startup.json").write_text(json.dumps(
+                {"argv": self.launch_argv, "cache": self.startup_cache,
+                 "GLM53_MAXT": env["GLM53_MAXT"]}, indent=2) + "\n")
         except BaseException:
             self.abort()
             raise
@@ -239,6 +283,8 @@ class Engine:
         self.input_log.flush()
         input_path = Path(self.input_log.name)
         self.failure.update({"process_scene_before_cleanup": scene,
+            "argv": getattr(self, "launch_argv", None),
+            "startup_cache": getattr(self, "startup_cache", None),
             "reader_terminal": self.reader.terminal,
             "parent_pipes_at_launch": getattr(self, "parent_pipes_at_launch", None),
             "stdin_capture": {"path": str(input_path), "size": input_path.stat().st_size,

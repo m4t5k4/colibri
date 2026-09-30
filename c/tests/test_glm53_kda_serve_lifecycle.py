@@ -1,5 +1,6 @@
 """Protocol/parser checks only; no model or CUDA claims."""
 import io
+import json
 from pathlib import Path
 import tempfile
 import subprocess
@@ -10,6 +11,8 @@ import unittest
 from unittest import mock
 
 import glm53_kda_serve_lifecycle as h
+
+STARTUP = "import sys; sys.stderr.write('experts: 14.2 MB slots, 13 per layer across 42 sparse layers (7.7 GB resident)\\nKV slots: 2 with 1024 positions each\\n')\n"
 
 
 class ServeLifecycleTests(unittest.TestCase):
@@ -128,9 +131,10 @@ assert sys.stdin.buffer.read() == b""
                 binary=Path("glm53"),read_timeout=2,request_timeout=2,startup_timeout=2)
             original=subprocess.Popen
             def spawn(argv, **kwargs):
-                self.assertEqual(argv,["glm53","1024"])
+                self.assertEqual(argv,["glm53"])
                 self.assertEqual(kwargs["bufsize"],0)
-                return original([sys.executable,"-c",child],**kwargs)
+                self.assertEqual(kwargs["env"]["GLM53_MAXT"],"1024")
+                return original([sys.executable,"-c",STARTUP+child],**kwargs)
             with mock.patch.object(h.subprocess,"Popen",side_effect=spawn):
                 e=h.Engine(args,0)
                 try:
@@ -154,7 +158,7 @@ sys.stdin.buffer.read()  # Intentionally silent until the writer closes.
                 binary=Path("glm53"),read_timeout=2,request_timeout=0.03,startup_timeout=2)
             original=subprocess.Popen
             with mock.patch.object(h.subprocess,"Popen",side_effect=lambda argv,**kw:
-                                   original([sys.executable,"-c",child],**kw)):
+                                   original([sys.executable,"-c",STARTUP+child],**kw)):
                 e=h.Engine(args,0)
                 try:
                     with self.assertRaises(AssertionError):
@@ -192,7 +196,7 @@ sys.stdin.buffer.read()
                 binary=Path("glm53"),read_timeout=2,request_timeout=2,startup_timeout=2)
             original=subprocess.Popen
             with mock.patch.object(h.subprocess,"Popen",side_effect=lambda argv,**kw:
-                                   original([sys.executable,"-c",child],**kw)):
+                                   original([sys.executable,"-c",STARTUP+child],**kw)):
                 e=h.Engine(args,0)
                 try:
                     with self.assertRaises(AssertionError):
@@ -207,6 +211,21 @@ sys.stdin.buffer.read()
                     self.assertIn("SUBMIT 1",report["stdin_capture"]["first_request"]["escaped"])
                 finally:
                     e.abort()
+
+
+    def test_startup_rejects_expert_cap_override(self):
+        with tempfile.TemporaryDirectory() as d:
+            model=Path(d)
+            (model/"config.json").write_text(json.dumps({"text_config": {
+                "hidden_size":4096,"moe_intermediate_size":2048,"n_routed_experts":288}}))
+            text="experts: 14.2 MB slots, 13 per layer across 42 sparse layers (7.7 GB resident)\nKV slots: 2 with 1024 positions each\n"
+            evidence=h.startup_geometry(text,"8",model)
+            self.assertEqual(evidence["exact_slot_bytes"],14155776)
+            self.assertEqual(evidence["expected_slots_per_layer"],13)
+            with self.assertRaises(AssertionError):
+                h.startup_geometry(text.replace("13 per layer","288 per layer").replace("7.7 GB","171.2 GB"),"8",model)
+            with self.assertRaises(AssertionError):
+                h.startup_geometry(text.replace("1024 positions","8192 positions"),"8",model)
 
 
 if __name__ == "__main__":
