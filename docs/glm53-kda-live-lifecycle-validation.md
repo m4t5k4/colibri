@@ -183,26 +183,149 @@ or causing real device loss.
 
 ## Required test-only live-CUDA driver
 
-Pending implementation, the exact proposed file changes are:
+The dedicated executable is now implemented in these test-only files:
 
 - `c/tests/test_glm53_kda_live_lifecycle.c`: new driver including production
   lifecycle functions, loading real weights and calling the real CUDA backend.
 - `c/tests/glm53_kda_live_backend.cu`: new test translation unit including
-  `backend_cuda.cu`, privately renaming the normal step/push wrappers and
+  `backend_cuda.cu`, privately renaming the normal step/pull wrappers and
   supplying test-only wrappers that pass the existing transactional fault
   argument. Kernels, streams and device allocations remain the real backend.
 - `c/tests/glm53_kda_live_test_api.h`: new private arm/observe API for that test
   executable only; no environment variables or production header additions.
 - `c/Makefile`: a separate live test backend object/executable, never linked into
   `glm53` and never substituted for the normal production backend object.
-- This document: exact build/run commands once that target exists.
+- This document: exact build/run commands and acceptance criteria.
 
-No production source changes are required by this proposed arrangement. There
-is intentionally no build/run command for the unimplemented driver yet.
+No production sources or public headers are changed. The new object
+`tests/glm53_kda_live_backend.o` is linked only by the test executable. Neither
+`CUDA_OBJ` nor the normal `glm53` target references it. Normal production step
+always uses `KDA_OK`; injection is armed with a private C function in the driver,
+never an environment variable. This test is Linux CUDA only and requires all
+eight configured devices and all 34 KDA objects to initialize successfully.
 
-Prepare a separate test executable, not a production feature flag. Reuse the
-production functions and backend object, with the real checkpoint and all 34
-initialized KDA objects. The driver must explicitly exercise:
+The driver loads one real model and runs independent CPU-KDA reference sessions
+against live GPU-KDA sessions, sequentially, with the existing real CUDA expert
+tier enabled for both. It tokenizes a real prompt, checks every compared greedy
+token ID, and compares every KDA layer's recurrent state and convolution history.
+It prints actual absolute/relative errors and fails on nonfinite values or error
+above `1e-4 + 1e-4 * abs(reference)` per element. These are fail-closed full-model
+integration thresholds, not empirically measured production error claims; a rig
+failure requires investigation, not automatic tolerance relaxation. Snapshot,
+restore, recovery-pull and failed-token local CPU comparisons are exact.
+
+Case A completes two GPU tokens with host state still stale, invokes production
+`slot_pin_save`, requires 34 production pulls, checks snapshot/logit copies, runs
+two additional GPU tokens, and invokes `slot_pin_restore`. It requires exact
+restored host state/history, 34 invalidations without pulling the advanced state,
+then 34 pushes on first resumed decode. Three resumed tokens must match the
+independent reference which never advanced past the checkpoint.
+
+Case B starts fresh sessions and completes two GPU tokens, then arms the first
+KDA object for exactly one `KDA_FAIL_AFTER_RECURRENCE`. The wrapper executes real
+QKV/convolution/recurrence on its real stream, inspects both device generations,
+and returns failure before commit. It proves the committed generation index and
+both committed buffers unchanged, compares each actual next buffer before/after
+the failed token, and prints their FNV64 digests to show mutation. It also proves
+the production recovery pull byte-identical to
+the pre-token committed generation. An independent local CPU KDA step uses the
+captured actual input and exact committed state/history; its state/history must
+match production CPU recovery exactly. Full-model CPU-reference continuation
+must match token IDs and state/history for the failed token and three later
+tokens. Exactly the targeted layer is disabled; all 33 others must remain active.
+The expert tier must remain active/not failed with zero errors and increasing
+executed rows after injection. Upload delta is reported but may legitimately be
+zero when continuation experts are already resident.
+No fake backend, production test hook or public API extension is involved.
+
+### Exact manual rig commands
+
+Build before the validation run, not between reference/live trajectories:
+
+```bash
+set -euo pipefail
+cd ~/colibri-glm53-cuda
+make -C c glm53-kda-live-lifecycle-build CUDA=1 CUDA_ARCH=sm_86 \
+  NVCC=/usr/bin/nvcc -j4
+make -C c glm53-kda-cuda-proto-check CUDA=1 CUDA_ARCH=sm_86 \
+  NVCC=/usr/bin/nvcc
+make -C c glm53 CUDA=1 CUDA_ARCH=sm_86 NVCC=/usr/bin/nvcc -j4
+
+# Normal backend/binary must have no private live-test symbols. The test must.
+production_symbols=$(nm c/backend_cuda.o c/glm53)
+if grep 'g53_live_' <<< "$production_symbols"; then
+  echo 'FAIL: private injection linked into production' >&2; exit 1
+fi
+test_symbols=$(nm c/tests/test_glm53_kda_live_lifecycle)
+for symbol in g53_live_arm g53_live_evidence g53_live_failure_input g53_live_clear \
+              g53_live_original_step g53_live_original_get_state; do
+  grep -E "[[:space:]]${symbol}$" <<< "$test_symbols"
+done
+```
+
+Run in a shell with `set -euo pipefail` so any test/hash failure stops:
+
+```bash
+set -euo pipefail
+cd ~/colibri-glm53-cuda
+export OMP_NUM_THREADS=4 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close OMP_PLACES=cores
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export COLI_CUDA=1 COLI_GPU= COLI_GPUS=0,1,2,3,4,5,6,7 CUDA_EXPERT_GB=48
+export GLM53_EXPERT_GB=8
+export GLM53_CUDA_HEAT_MIN=2 GLM53_CUDA_HEAT_MARGIN=1
+export GLM53_CUDA_PARALLEL_PROMOTE=1 GLM53_CUDA_PROMOTE_OVERLAP=1 GLM53_CUDA_PROMOTE_LATE_JOIN=1
+export GLM53_MLA_OUT_ROWS4=1 GLM53_MLA_QB_ROWS4=0 GLM53_MLA_ABSORBED_BATCH=0
+export GLM53_CUDA_WARM_RESIDENCY=0 GLM53_CUDA_KDA=1
+export GLM53_CUDA_PROFILE=1 GLM53_VERBOSE=1 GLM53_MAXT=1024 DRAFT=0 USAGE_SAVE=0
+export COLI_USAGE="$PWD/artifacts/phase2e/usage-snapshot-before-phase2e"
+printf '%s  %s\n' \
+  7a246a49fc1dc3fb6360c131153c22012ca08949da390455654652d76e18a953 \
+  "$COLI_USAGE" | sha256sum -c -
+mkdir -p artifacts/phase2f-live
+run=$(mktemp -d "$PWD/artifacts/phase2f-live/direct.XXXXXX")
+fingerprint() {
+  git rev-parse HEAD
+  git status --short
+  sha256sum c/glm53 c/tests/test_glm53_kda_live_lifecycle "$COLI_USAGE"
+}
+fingerprint > "$run/before.txt"
+env | sort > "$run/environment.txt"
+# Collect after-hashes even if a semantic/state assertion exits nonzero.
+trap 'fingerprint > "$run/after.txt"' EXIT
+printf 'Artifacts: %s\n' "$run"
+/usr/bin/timeout --signal=TERM --kill-after=30s 3600s \
+  /usr/bin/time -f 'process_wall_s=%e exit=%x' -o "$run/time.txt" \
+  stdbuf -oL -eL c/tests/test_glm53_kda_live_lifecycle \
+  /srv/models-fast/colibri/glm53-flash-i4 \
+  > "$run/stdout.log" 2> "$run/stderr.log"
+fingerprint > "$run/after.txt"
+diff -u "$run/before.txt" "$run/after.txt"
+grep -E '^case=|^PASS |^boundary=|^target_layer=' "$run/stdout.log"
+grep -E 'test-only-kda-injection|test-only-kda-generation|step failed|kda_cuda_calls|cuda-device|resident=' "$run/stderr.log"
+```
+
+No bare numeric expert-cache argument is supplied. The driver requires the known
+safe host budget `GLM53_EXPERT_GB=8`, `USAGE_SAVE=0`, and warm residency disabled.
+It does not write usage history. Token IDs are the deterministic semantic
+reference; this direct test is not a timing benchmark.
+
+Acceptance requires exit 0, both named cases `pass=1`, all comparisons `pass=1`,
+and unchanged fingerprint files. Case A requires zero KDA errors/fallbacks. Case
+B requires exactly one expected KDA error and four fallbacks (failed token plus
+three later tokens for the disabled layer), one exact committed recovery pull,
+and `(34-1)*3` successful CUDA calls during subsequent continuation. Final
+expert tier must remain active/not failed with zero errors and increasing
+executed rows after injection; a zero upload delta is acceptable.
+There must be exactly one `[test-only-kda-injection]` and one production
+`step failed ... committed state restored` message. No additional backend CUDA
+error, KDA failure or expert failure is acceptable. Any assertion, token/state
+mismatch, unexpected CUDA failure or timeout is a failure: stop and return logs.
+This implementation still requires live rig validation; local WSL checks do not
+establish CUDA correctness. The stock eight-request suite already covers
+alternating slots, prefill transitions and fresh/reset generation separately.
+
+The broader lifecycle validation is split between stock SERVE and this direct
+driver, with the real checkpoint and all 34 initialized KDA objects:
 
 1. Two actual GSession instances alternating owners after successful GPU tokens.
 2. An exact token-ID continuation through CPU multi-token prefill and back to
@@ -213,14 +336,13 @@ initialized KDA objects. The driver must explicitly exercise:
    reproduce a fresh CPU-reference generation.
 5. A targeted post-recurrence/pre-commit failure after at least two successful
    GPU tokens in one layer. Route it through the real `g53_kda_try_decode()`
-   fallback, not an isolated backend retry. Also test a failed push after CPU
-   prefill invalidates a previously successful device generation.
+   fallback, not an isolated backend retry. Failed push is covered by the
+   checkpoint-free lifecycle suite, not injected by this live driver.
 
-Expose the existing fault argument only in a separately compiled test backend
-behind a test-only macro. Bind injection to a layer/object and successful-token
-ordinal, consume it once, and record committed/next generation evidence. The
-normal backend must remain unable to inject faults. This driver/hook is a next
-implementation step; it is not an existing target or runnable stock flag.
+The private wrapper exposes the existing fault argument only in its separately
+compiled test backend. The driver arms the chosen object after two successful
+tokens, consumes the fault once, and records committed/next generation evidence.
+There is no runnable stock failure-injection flag.
 
 After every transition, compare final output, recurrent state and convolution
 history to CPU continuation. Use the established CUDA regression tolerances,
@@ -237,11 +359,12 @@ pulls, invalidations, per-device calls and final allocation/cache counters.
 If aggregate reporting cannot identify a transition, add test-driver assertions
 or explicit test-only observations; do not infer coverage from a model completing.
 
-For each forced failure require: committed state/window unchanged, next generation
-changed for the post-recurrence fault, host recovery from the committed generation,
+For each forced failure require: committed generation index/state/window unchanged,
+next state/window mutated relative to their own pre-step contents for the
+post-recurrence fault, host recovery from the committed generation,
 the failed token applied once on CPU, only the targeted layer disabled, subsequent
 CPU continuation correct, other CUDA KDA layers active, expert errors still zero
-and promotion continuing. One intentional KDA error is expected for a single
+and executed expert rows increasing (no new upload is required). One intentional KDA error is expected for a single
 injection; later CPU fallback counts may grow for the disabled layer. Never fold
 injected failures into the healthy zero-error requirement.
 

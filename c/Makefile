@@ -511,12 +511,13 @@ TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(f
 # actually drives it end to end.
 # test_qwen38_tier_engine drives qwen38.c over the generated FP8 fixture
 # (qwen38_tiny_fp8, gitignored); it runs from qwen38-tier-engine-check.
+# test_glm53_kda_live_lifecycle is a manual eight-GPU real-model CUDA harness.
 TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
 	test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real \
 	test_xdna_execution test_xdna_failure \
 	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine \
-	test_e8x4g64_loader \
+	test_e8x4g64_loader test_glm53_kda_live_lifecycle \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
@@ -1396,6 +1397,20 @@ glm53-kda-cuda-proto-check: tests/test_glm53_kda_cuda.cu backend_cuda.cu glm53_k
 .PHONY: glm53-kda-lifecycle-check
 glm53-kda-lifecycle-check: tests/test_glm53_kda_lifecycle$(EXE)
 	./tests/test_glm53_kda_lifecycle$(EXE)
+
+# Build only: the real-model test must be run explicitly with its rig environment.
+# This private backend object must NEVER enter CUDA_OBJ or glm53's link line.
+.PHONY: glm53-kda-live-lifecycle-build
+glm53-kda-live-lifecycle-build:
+	@test "$(CUDA)" = 1 || { echo "requires Linux CUDA=1" >&2; exit 1; }
+	$(MAKE) tests/test_glm53_kda_live_lifecycle$(EXE)
+
+tests/glm53_kda_live_backend.o: tests/glm53_kda_live_backend.cu tests/glm53_kda_live_test_api.h backend_cuda.cu backend_cuda.h glm53_kda_cuda_impl.h fp8_format.h backend_gpu_compat.h .build-config
+	"$(NVCC)" $(NVCCFLAGS) -c $< -o $@
+
+tests/test_glm53_kda_live_lifecycle$(EXE): tests/test_glm53_kda_live_lifecycle.c tests/glm53_kda_live_test_api.h glm53.c glm53_cuda.h backend_cuda.h pin_pool.h tests/glm53_kda_live_backend.o .build-config
+	@test "$(CUDA)" = 1 || { echo "requires Linux CUDA=1" >&2; exit 1; }
+	$(CC) $(filter-out -DCOLI_METAL -DCOLI_VULKAN,$(CFLAGS)) $< tests/glm53_kda_live_backend.o -o $@ $(LDFLAGS)
 
 tests/test_glm53_kda_lifecycle$(EXE): tests/test_glm53_kda_lifecycle.c tests/test_glm53_cuda.c glm53.c glm53_cuda.h backend_cuda.h pin_pool.h segment_runtime.c edge_runtime.c
 	$(CC) $(filter-out -DCOLI_METAL -DCOLI_VULKAN,$(NOCUDA_CFLAGS)) -DCOLI_CUDA $< segment_runtime.c edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
