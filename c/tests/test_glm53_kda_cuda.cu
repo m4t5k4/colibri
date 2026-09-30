@@ -64,6 +64,10 @@ struct Error {
     int token = -1, index = -1;
     void add(const float *ref, const float *got, size_t n, int t) {
         for (size_t i = 0; i < n; i++) {
+            if (!std::isfinite(ref[i]) || !std::isfinite(got[i])) {
+                abs = rel = INFINITY; token = t; index = (int)i;
+                continue;
+            }
             float d = fabsf(ref[i] - got[i]);
             float r = d / fmaxf(1e-4f, fabsf(ref[i]));
             if (d > abs) { abs = d; token = t; index = (int)i; }
@@ -166,6 +170,7 @@ static bool run_case(int H, int D, int hidden, int length, int initial,
                 ok = kda_get_state(gpu, prior_state.data(), prior_win.data()) &&
                      !kda_step(gpu, go.data(), x.data(), decay.data(),
                                beta.data(), gate.data(), fault) &&
+                     cudaGetLastError() == cudaSuccess &&
                      kda_get_state(gpu, dev_state.data(), dev_win.data());
                 if (ok && evidence) {
                     evidence[0] = !memcmp(prior_state.data(), dev_state.data(), ref.size() * 4);
@@ -174,10 +179,14 @@ static bool run_case(int H, int D, int hidden, int length, int initial,
                 ok = ok && !memcmp(prior_state.data(), dev_state.data(), ref.size() * 4) &&
                      !memcmp(prior_win.data(), dev_win.data(), win.size() * 4);
                 if (!ok) break;
-                if (fault == KDA_FAIL_AFTER_RECURRENCE) {
+                if (fault == KDA_FAIL_AFTER_RECURRENCE ||
+                    fault == KDA_FAIL_RUNTIME_AFTER_RECURRENCE ||
+                    fault == KDA_FAIL_RESTORE_BEFORE_COMMIT) {
                     std::vector<float> next_state(ref.size()), next_window(win.size());
                     int next = 1 - gpu->committed;
-                    ok = cudaMemcpyAsync(next_state.data(), gpu->state[next],
+                    KdaDeviceScope observation(gpu->device);
+                    ok = observation.entered &&
+                         cudaMemcpyAsync(next_state.data(), gpu->state[next],
                                          ref.size() * 4, cudaMemcpyDeviceToHost,
                                          gpu->stream) == cudaSuccess &&
                          cudaMemcpyAsync(next_window.data(), gpu->window[next],
@@ -241,7 +250,8 @@ static bool run_context_interop(int ndev) {
         size_t free_bytes = 0, total_bytes = 0;
         ok = coli_cuda_mem_info(0, &free_bytes, &total_bytes);
         Error oe, se, we;
-        if (ok) ok = run_case(2, 64, 64, 1, 0, 0, 0, KDA_OK,
+        KdaFault fault = repeat == 2 ? KDA_FAIL_RUNTIME_AFTER_RECURRENCE : KDA_OK;
+        if (ok) ok = run_case(2, 64, 64, repeat == 2 ? 4 : 1, 0, 0, 0, fault,
                               oe, se, we, -1, nullptr, 1);
         int active = -1;
         if (ok) ok = cudaGetDevice(&active) == cudaSuccess && active == 0;
@@ -252,7 +262,7 @@ static bool run_context_interop(int ndev) {
         if (ok) ok = coli_cuda_expert_group_take(0) != nullptr;
     }
     coli_cuda_tensor_free(g); coli_cuda_tensor_free(u); coli_cuda_tensor_free(d);
-    printf("context_interop pass=%d kda_device=1 expert_device=0 repetitions=3\n", ok);
+    printf("context_interop pass=%d kda_device=1 expert_device=0 repetitions=3 includes_runtime_failure=1\n", ok);
     return ok;
 }
 
@@ -266,6 +276,13 @@ int main() {
      * GPU run must report the observed maxima before Phase 2F2 can proceed. */
     const float output_limit = 1e-3f, state_limit = 1e-4f;
     int failed = 0;
+    { Error e;
+      float ref = 1.0f, got = NAN;
+      e.add(&ref, &got, 1, 0);
+      bool ok = std::isinf(e.abs) && std::isinf(e.rel);
+      printf("nonfinite_guard pass=%d\n", ok);
+      failed += !ok;
+    }
     const int lengths[] = {1, 2, 4, 8, 16};
     for (int n : lengths) for (int initial = 0; initial < 4; initial++) {
         Error o, s, w;
@@ -275,15 +292,19 @@ int main() {
                s.abs, s.rel, s.token, s.index, w.abs, w.rel, w.token, w.index);
         failed += !ok || o.abs > output_limit || s.abs > state_limit || w.abs > 1e-6f;
     }
-    for (int mode = 0; mode < 6; mode++) {
+    for (int mode = 0; mode < 8; mode++) {
         Error o, s, w;
         const char *names[] = {"CPU_TO_CUDA", "CUDA_TO_CPU", "CPU_CUDA_CPU",
-            "FAILURE_AFTER_NEXT_STATE_BEFORE_COMMIT", "FAILURE_BEFORE_MUTATION", "RESET"};
+            "FAILURE_AFTER_NEXT_STATE_BEFORE_COMMIT", "FAILURE_BEFORE_MUTATION", "RESET",
+            "RUNTIME_ERROR_AFTER_NEXT_STATE_BEFORE_COMMIT",
+            "RESTORE_DEVICE_FAILURE_BEFORE_COMMIT"};
         int evidence[3] = {0};
         int prefix = mode == 0 || mode == 2 ? 3 : 0;
         int suffix = mode == 1 || mode == 2 ? 3 : 0;
         KdaFault fault = mode == 3 ? KDA_FAIL_AFTER_RECURRENCE :
-                         mode == 4 ? KDA_FAIL_BEFORE : KDA_OK;
+                         mode == 4 ? KDA_FAIL_BEFORE :
+                         mode == 6 ? KDA_FAIL_RUNTIME_AFTER_RECURRENCE :
+                         mode == 7 ? KDA_FAIL_RESTORE_BEFORE_COMMIT : KDA_OK;
         bool ok = run_case(2, 64, 64, 8, mode != 5 ? 3 : 0, prefix, suffix,
                            fault, o, s, w, mode == 5 ? 4 : -1, evidence);
         printf("transition=%s pass=%d committed_state_unchanged=%d committed_window_unchanged=%d next_state_changed=%d output_abs=%g output_rel=%g output_at=%d:%d state_abs=%g state_rel=%g state_at=%d:%d window_abs=%g window_rel=%g window_at=%d:%d\n",

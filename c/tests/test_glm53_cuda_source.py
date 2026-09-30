@@ -16,7 +16,12 @@ class Glm53CudaOwnershipTests(unittest.TestCase):
         self.assertNotIn('getenv("COLI_CUDA")', body("model_load_range"))
         self.assertIn("g53_cuda_init", body("model_load"))
         self.assertEqual(SRC.count("g53_cuda_init("), 1)
-        self.assertNotIn("coli_cuda_init(", SRC)
+        self.assertEqual(SRC.count("coli_cuda_init("), 1)
+        self.assertIn("coli_cuda_init(", body("glm53_kda_cuda_init"))
+        loader = body("model_load")
+        self.assertEqual(SRC.count("glm53_kda_cuda_init(m);"), 1)
+        self.assertLess(loader.index("glm53_kda_cuda_init(m);"),
+                        loader.index("g53_cuda_init("))
         self.assertNotIn("coli_cuda_shutdown(", SRC)
 
     def test_adapters_use_zero_initialized_range_models_and_cpu_contract(self):

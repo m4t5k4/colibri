@@ -1698,7 +1698,11 @@ int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x,
 ColiCudaKda *coli_cuda_kda_create(int device, int heads, int head_dim,
     int hidden, int kernel, const ColiCudaKdaMatrix matrices[4],
     const float *conv, const float *norm) {
-    return g_cuda.available && g_cuda.kda_create ?
+    /* An optional KDA API must be present as a complete lifecycle. A partial
+     * DLL must not create state that the host cannot pull or release. */
+    return g_cuda.available && g_cuda.kda_create && g_cuda.kda_free &&
+        g_cuda.kda_set_state && g_cuda.kda_get_state && g_cuda.kda_step &&
+        g_cuda.kda_footprint && g_cuda.kda_times ?
         g_cuda.kda_create(device, heads, head_dim, hidden, kernel,
                           matrices, conv, norm) : NULL;
 }

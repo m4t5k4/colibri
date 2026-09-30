@@ -1615,7 +1615,7 @@ static void g53_kda_pull(GModel *m, int layer) {
     if (!coli_cuda_kda_get_state(e->object, host->kda_state, host->kda_window)) {
         /* A previous successful GPU token made the host state stale. There is
          * no valid CPU continuation if the committed state cannot be read. */
-        fprintf(stderr, "[glm53-kda-cuda] committed state pull failed layer=%d; session cannot continue\n", layer);
+        fprintf(stderr, "[glm53-kda-cuda] committed state pull failed layer=%d device=%d; session cannot continue\n", layer, e->device);
         exit(1);
     }
     G53KdaCudaTier *t = &m->kda_tier;
@@ -1646,7 +1646,7 @@ static int g53_kda_try_decode(GModel *m, const Cfg *c, const GLayer *l,
         double start = now_s();
         if (!coli_cuda_kda_set_state(e->object, host->kda_state, host->kda_window)) {
             e->usable = 0; t->errors++;
-            fprintf(stderr, "[glm53-kda-cuda] state push failed layer=%d; CPU fallback\n", layer);
+            fprintf(stderr, "[glm53-kda-cuda] state push failed layer=%d device=%d; layer disabled, CPU fallback\n", layer, e->device);
             return 0;
         }
         t->pushes++;
@@ -1698,7 +1698,7 @@ static int g53_kda_try_decode(GModel *m, const Cfg *c, const GLayer *l,
     g53_kda_pull(m, layer);
     e->usable = 0; e->valid = 0;
     t->errors++; t->invalidations++;
-    fprintf(stderr, "[glm53-kda-cuda] step failed layer=%d; committed state restored, CPU fallback\n", layer);
+    fprintf(stderr, "[glm53-kda-cuda] step failed layer=%d device=%d; committed state restored, layer disabled, CPU fallback\n", layer, e->device);
     return 0;
 }
 #endif
@@ -4074,6 +4074,9 @@ static void glm53_kda_cuda_init(GModel *m) {
             m->c.kda_heads, m->c.kda_hd, m->c.hidden, m->c.conv_k,
             matrices, l->conv, l->onorm);
         entry->usable = entry->object != NULL;
+        if (!entry->usable)
+            fprintf(stderr, "[glm53-kda-cuda] initialization skipped layer=%d device=%d reason=%s; CPU fallback\n",
+                    i, entry->device, supported ? "backend_create_failed" : "unsupported_format_or_kernel");
         if (entry->usable) {
             ColiCudaKdaFootprint f = {0};
             if (coli_cuda_kda_footprint(entry->object, &f)) {

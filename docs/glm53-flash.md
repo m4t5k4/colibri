@@ -278,7 +278,7 @@ The multi-device fake test covers ordered parsing/initialization, deterministic
 placement, shared-budget accounting, uneven headroom, partial upload rollback,
 CPU fallback signaling, and cleanup on every device and initialization errors.
 Phase 2 can group experts by owner for parallel issue/take execution once the
-GLM53 clamped SwiGLU contract is supported. Dense/KDA/MLA placement is later work;
+GLM53 clamped SwiGLU contract is supported. Dense/MLA placement is later work;
 this phase adds no tensor parallelism, matrix sharding, or NCCL.
 
 The numerical test uses asymmetric matrices, distinct per-group scales and
@@ -296,6 +296,41 @@ a fixture regression check; near ties in real models may differ with floating
 point accumulation order. GPU detection or `nvidia-smi` alone proves no tensor
 execution. CUDA kernel and full-model results must be measured on the target
 hardware before claiming performance.
+
+### Optional CUDA KDA decode
+
+`GLM53_CUDA_KDA=1` enables CUDA KDA for explicit one-token decode calls in
+CLI/SERVE when `COLI_CUDA=1`. The default is OFF: unset and `0` retain CPU KDA.
+CUDA builds reject other values. Prefill, including one-token prefill, remains
+CPU; Segment/Edge keep their CPU state contract.
+
+Each supported layer has resident fmt-4/group-64 Q/K/V/O projections, a dedicated
+stream and pinned input staging, and two recurrent/window generations. Layer
+ownership is KDA ordinal modulo the configured device count. `COLI_GPUS` uses
+CUDA-visible ordinals: with `CUDA_VISIBLE_DEVICES=2,5`, the two devices are
+configured as `COLI_GPUS=0,1`. KDA allocations precede expert capacity measurement;
+startup reports logical and measured KDA bytes plus the resulting expert ceilings.
+
+Host session state is pushed before first decode and materialized before CPU
+prefill, switching the device owner, or saving a pin. Restore/reset invalidates
+device authority. Successful tokens commit only after output completion and
+caller-device restoration. A recoverable push/step failure disables that KDA
+layer and runs the token on CPU from valid host or committed device state.
+If newer committed device state cannot be pulled, inference terminates instead
+of continuing from stale host state. CUDA context loss is not transparently
+recoverable. Error diagnostics give the operation/device/CUDA error; the engine
+adds the layer and fallback action. Final counters report actual CUDA calls,
+fallbacks/errors, transfers and state synchronization.
+
+Run the shared backend regression without a model, then build the engine:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 make -C c glm53-kda-cuda-proto-check CUDA=1 CUDA_ARCH=sm_86
+make -C c glm53 CUDA=1 CUDA_ARCH=sm_86 -j4
+```
+
+Two visible devices exercise KDA-to-expert context interop. With one visible
+device that case reports a skip; the numerical/state tests still run.
 
 ### Opt-in CUDA profiling
 

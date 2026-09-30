@@ -104,7 +104,12 @@ static inline int coli_cuda_init_disposition(int nctx, int count,
 typedef struct ColiCudaTensor ColiCudaTensor;
 
 /* GLM53 one-token KDA. Caller owns host weights and session state. The object
- * owns two device state/window generations and never uses expert-group scratch. */
+ * owns two device state/window generations and never uses expert-group scratch.
+ * Serialize calls per object; set_state is required before the first step.
+ * State is [heads,head_dim,head_dim], window is [3,heads*head_dim,kernel].
+ * A failed step leaves the committed generation unchanged. Successful calls
+ * restore the caller's device; errors attempt restoration and invalidate the
+ * backend device cache. A lost CUDA context may prevent committed-state pull. */
 typedef struct KdaProto ColiCudaKda;
 typedef struct {
     const uint8_t *q4;
