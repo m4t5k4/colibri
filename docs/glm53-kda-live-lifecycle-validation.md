@@ -60,6 +60,55 @@ of a still-live child; an already-exited child's status is preserved. Exact inpu
 bytes are saved as `0.stdin.bin`. The runner records after-hashes even on failure.
 Successful one-request completion is not a full lifecycle-validation pass.
 
+The failure report also snapshots Linux `/proc/<pid>/status`, `stat`, `wchan`,
+all fd symlink targets, fdinfo for 0/1/2 and each task's wchan before cleanup.
+When the raw stdout read returns zero bytes, it takes a second snapshot directly
+in the reader thread at that event. Parent pipe identities at launch and failure
+allow child fd 1 to be compared to the expected pipe. Permission/disappearance
+races are recorded as errors rather than suppressing the rest of the snapshot.
+On Linux, FIONREAD on the parent's stdin pipe also reports currently queued bytes
+without consuming them. The exact stdin capture size/hash, successful writer byte
+count and escaped first request distinguish logged intent from completed writes.
+These observations do not by themselves prove the child parsed a consumed frame.
+
+`FileIO.read(65536)` on a blocking Linux pipe can return short nonempty data;
+zero bytes indicate EOF. A nonblocking raw stream can instead return None when
+it would block. The driver now diagnoses None explicitly, never as EOF, and
+records raw stream type, pipe identity/blocking mode and terminal event kind.
+
+### Optional fd-filtered syscall diagnostic
+
+First use the untraced one-request run above. If additional syscall evidence is
+needed and installed strace supports `--trace-fds`, run the following manually:
+
+```bash
+cd ~/colibri-glm53-cuda
+command -v strace
+strace --help | grep -- '--trace-fds'
+# Stop here if either check fails; do not fall back to unfiltered tracing.
+mkdir -p artifacts/phase2f-live
+trace=$(mktemp "$PWD/artifacts/phase2f-live/stdio-strace.XXXXXX")
+strace -f -tt -T -yy -s 160 --trace-fds=0,1,2 \
+  -e trace=read,write,writev,close,dup,dup2,dup3,fcntl,poll,ppoll,select,pselect6 \
+  -o "$trace" \
+  bash c/tests/run_glm53_kda_serve_lifecycle.sh --diagnostic-one-request \
+    --startup-timeout 900 --read-timeout 600 --request-timeout 1800
+```
+
+This traces the launcher/driver and descendants so the actual glm53 PID remains
+the Popen PID in the report. Use that PID to identify engine calls. Descriptor
+filtering excludes normal model-file I/O on other descriptors and prints only
+160 payload bytes per call. It includes stdin reads and stdout/stderr operations
+plus fd-related polls. It does not capture Python's read side if that pipe uses
+a descriptor other than 0/1/2. Tracing still perturbs execution: do not use this
+run for performance claims, and do not broaden it to all model-file I/O.
+
+Interpretation: missing/replaced child fd 1 supports A; matching fd 1 with a
+zero-byte raw read requires investigating descriptor-sharing/races or the reader
+(B), not assuming a model failure. Queued complete request bytes or traced stdin
+reads establish consumption evidence for C/D. A zero queued byte count alone
+does not prove successful parsing or identify where request processing hangs.
+
 The shell script establishes the production environment and runs the same binary
 OFF then ON, without rebuilding. It writes logs, request/results JSON and hashes
 under a fresh `artifacts/phase2f-live/serve.*` directory. The Python driver freezes

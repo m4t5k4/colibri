@@ -24,6 +24,7 @@ class ServeLifecycleTests(unittest.TestCase):
         e.reader = h.PipeReader(e.p.stdout, e.raw)
         e.read_timeout = 1; e.request_timeout = 1; e.deadline = None
         e.last_frame = None; e.request_id = None; e.input_log = io.BytesIO()
+        e.submitted_bytes = 0; e.first_request = None
         result = e.request(1, 0, b"prompt")
         e.reader.thread.join(timeout=1)
         self.assertEqual(e.raw.getvalue(), wire)
@@ -85,6 +86,7 @@ class ServeLifecycleTests(unittest.TestCase):
             e.failure_path=args.output/"failure.json"; e.failure=None
             e.startup_frames=["READY","STAT","EMAP"]; e.last_frame="EMAP 42 288 ..."
             e.request_id=1; e.closed=False; e.read_timeout=1; e.deadline=None
+            e.submitted_bytes=0; e.first_request=None
             e.p=subprocess.Popen([sys.executable,"-c","import sys; sys.stderr.write('original error\\n'); sys.exit(7)"],
                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=e.stderr,bufsize=0)
             e.reader=h.PipeReader(e.p.stdout,e.raw)
@@ -164,6 +166,47 @@ sys.stdin.buffer.read()  # Intentionally silent until the writer closes.
             self.assertFalse(e.failure["stdin_closed"])
             self.assertEqual(e.failure["request_id"],1)
             self.assertEqual(e.failure["cleanup_action"],"terminate live child")
+
+    def test_raw_none_is_not_eof(self):
+        class WouldBlock:
+            def read(self, count):
+                return None
+        reader=h.PipeReader(WouldBlock(),io.BytesIO())
+        with self.assertRaises(BlockingIOError):
+            reader.line(time.monotonic()+1)
+        self.assertFalse(reader.eof)
+        self.assertEqual(reader.terminal["kind"],"reader_exception")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc evidence")
+    def test_live_child_closed_stdout_snapshot(self):
+        child = r'''
+import os, sys
+sys.stdout.buffer.write(b"\x01\x01READY\x01\x01\nSTAT 0 0 0 0\nEMAP 1 1 00\n")
+sys.stdout.buffer.flush()
+assert sys.stdin.buffer.readline().startswith(b"SUBMIT 1 ")
+os.close(1)
+sys.stdin.buffer.read()
+'''
+        with tempfile.TemporaryDirectory() as d:
+            args=SimpleNamespace(output=Path(d),model=Path("model"),usage=Path("usage"),
+                binary=Path("glm53"),read_timeout=2,request_timeout=2,startup_timeout=2)
+            original=subprocess.Popen
+            with mock.patch.object(h.subprocess,"Popen",side_effect=lambda argv,**kw:
+                                   original([sys.executable,"-c",child],**kw)):
+                e=h.Engine(args,0)
+                try:
+                    with self.assertRaises(AssertionError):
+                        e.request(1,0,b"prompt")
+                    report=e.failure
+                    self.assertIsNone(report["original_returncode"])
+                    scene=report["reader_terminal"]["process_scene"]
+                    self.assertNotIn("1",scene["child"]["fd_listing"])
+                    self.assertIsInstance(scene["child"]["fd"]["1"],dict)
+                    self.assertEqual(report["stdin_capture"]["write_all_completed_bytes"],
+                                     report["stdin_capture"]["size"])
+                    self.assertIn("SUBMIT 1",report["stdin_capture"]["first_request"]["escaped"])
+                finally:
+                    e.abort()
 
 
 if __name__ == "__main__":

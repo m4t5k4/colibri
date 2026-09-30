@@ -11,17 +11,82 @@ import queue
 import threading
 import time
 import subprocess
+import stat
+
+
+def proc_snapshot(pid):
+    """Best-effort, read-only Linux evidence; races/errors stay in the report."""
+    root = Path(f"/proc/{pid}")
+    result = {"pid": pid, "monotonic_s": time.monotonic()}
+    def read(path):
+        try:
+            return path.read_text(errors="replace")
+        except OSError as error:
+            return {"error": str(error)}
+    def link(path):
+        try:
+            return os.readlink(path)
+        except OSError as error:
+            return {"error": str(error)}
+    for name in ("status", "stat", "wchan"):
+        result[name] = read(root / name)
+    result["fd"] = {str(i): link(root / "fd" / str(i)) for i in range(3)}
+    result["fdinfo"] = {str(i): read(root / "fdinfo" / str(i)) for i in range(3)}
+    try:
+        result["fd_listing"] = {p.name: link(p) for p in
+                                sorted((root / "fd").iterdir(), key=lambda p: int(p.name))}
+    except OSError as error:
+        result["fd_listing"] = {"error": str(error)}
+    try:
+        result["task_wchan"] = {p.name: read(p / "wchan") for p in
+                                sorted((root / "task").iterdir(), key=lambda p: int(p.name))}
+    except OSError as error:
+        result["task_wchan"] = {"error": str(error)}
+    return result
+
+
+def pipe_identity(stream):
+    if os.name != "posix":
+        # Windows CRT fd inspection can wait on another thread's blocking read.
+        return {"unavailable": "POSIX pipe metadata only", "stream_type": type(stream).__name__}
+    try:
+        fd = stream.fileno()
+        info = os.fstat(fd)
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError as error:
+            target = {"error": str(error)}
+        return {"fd": fd, "target": target, "inode": info.st_ino,
+                "device": info.st_dev, "blocking": os.get_blocking(fd),
+                "is_pipe": stat.S_ISFIFO(info.st_mode),
+                "stream_type": type(stream).__name__}
+    except (OSError, ValueError) as error:
+        return {"error": str(error)}
+
+
+def unread_pipe_bytes(stream):
+    try:
+        import array
+        import fcntl
+        import termios
+        value = array.array("i", [0])
+        fcntl.ioctl(stream.fileno(), termios.FIONREAD, value, True)
+        return value[0]
+    except (ImportError, AttributeError, OSError, ValueError) as error:
+        return {"error": str(error)}
 
 USAGE_SHA = "7a246a49fc1dc3fb6360c131153c22012ca08949da390455654652d76e18a953"
 
 
 class PipeReader:
     """Drain the raw pipe independently; deadlines include partial frames."""
-    def __init__(self, stream, raw):
+    def __init__(self, stream, raw, on_eof=None):
         self.items = queue.Queue()
         self.buffer = bytearray()
         self.eof = False
         self.raw = raw
+        self.on_eof = on_eof
+        self.terminal = None
         self.thread = threading.Thread(target=self.pump, args=(stream,), daemon=True)
         self.thread.start()
 
@@ -29,12 +94,21 @@ class PipeReader:
         try:
             while True:
                 data = stream.read(65536)
-                if not data:
+                if data is None:
+                    # Raw nonblocking streams may return None, not EOF. Do not
+                    # silently turn that into the b"" EOF case.
+                    raise BlockingIOError("raw stdout read returned None (would block), not EOF")
+                if data == b"":
+                    self.terminal = {"kind": "zero_byte_read", "requested_bytes": 65536,
+                                     "returned_bytes": 0, "pipe": pipe_identity(stream)}
+                    if self.on_eof:
+                        self.terminal["process_scene"] = self.on_eof()
                     break
                 self.raw.write(data)
                 self.raw.flush()
                 self.items.put(data)
         except Exception as error:
+            self.terminal = {"kind": "reader_exception", "error": repr(error)}
             self.items.put(error)
         finally:
             self.items.put(None)
@@ -72,6 +146,7 @@ def write_all(stream, data):
             raise BrokenPipeError("SUBMIT write made no progress")
         view = view[written:]
     stream.flush()
+    return len(data)
 
 
 def sha(path):
@@ -94,6 +169,8 @@ class Engine:
         self.startup_frames = []
         self.last_frame = None
         self.request_id = None
+        self.submitted_bytes = 0
+        self.first_request = None
         self.read_timeout = args.read_timeout
         self.request_timeout = args.request_timeout
         self.deadline = time.monotonic() + args.startup_timeout
@@ -105,7 +182,9 @@ class Engine:
         self.p = subprocess.Popen([str(args.binary), "1024"], env=env,
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=self.stderr, bufsize=0)
-        self.reader = PipeReader(self.p.stdout, self.raw)
+        self.parent_pipes_at_launch = {"stdin": pipe_identity(self.p.stdin),
+                                      "stdout": pipe_identity(self.p.stdout)}
+        self.reader = PipeReader(self.p.stdout, self.raw, self.process_scene)
         self.closed = False
         try:
             while True:
@@ -125,10 +204,23 @@ class Engine:
             self.abort()
             raise
 
+    def process_scene(self):
+        child = proc_snapshot(self.p.pid)
+        pipes = {"stdin": pipe_identity(self.p.stdin),
+                 "stdout": pipe_identity(self.p.stdout)}
+        child_stdout = child["fd"].get("1")
+        expected = pipes["stdout"].get("target")
+        matches = child_stdout == expected if isinstance(child_stdout, str) and isinstance(expected, str) else None
+        return {"child": child,
+                "parent_pid": os.getpid(),
+                "parent_pipes": pipes, "child_stdout_matches_parent_pipe": matches,
+                "stdin_pipe_unread_bytes": unread_pipe_bytes(self.p.stdin)}
+
     def diagnostics(self, reason):
         if self.failure is not None:
             return self.failure
         before = self.p.poll()
+        scene = self.process_scene()  # Always before wait/cleanup signals.
         original = before
         if original is None:
             try:
@@ -144,6 +236,15 @@ class Engine:
             "startup_frames": self.startup_frames, "last_complete_frame": self.last_frame,
             "stdout_bytes": self.raw.tell(), "buffered_stdout_bytes": len(self.reader.buffer),
             "stderr_tail": self.log.read_bytes()[-6000:].decode(errors="replace")}
+        self.input_log.flush()
+        input_path = Path(self.input_log.name)
+        self.failure.update({"process_scene_before_cleanup": scene,
+            "reader_terminal": self.reader.terminal,
+            "parent_pipes_at_launch": getattr(self, "parent_pipes_at_launch", None),
+            "stdin_capture": {"path": str(input_path), "size": input_path.stat().st_size,
+                              "sha256": sha(input_path),
+                              "write_all_completed_bytes": self.submitted_bytes,
+                              "first_request": self.first_request}})
         self.failure_path.write_text(json.dumps(self.failure, indent=2) + "\n")
         return self.failure
 
@@ -181,7 +282,10 @@ class Engine:
         wire = header + payload + b"\n"
         self.input_log.write(wire)
         self.input_log.flush()
-        write_all(self.p.stdin, wire)
+        if self.first_request is None:
+            self.first_request = {"bytes": len(wire), "sha256": hashlib.sha256(wire).hexdigest(),
+                                  "escaped": repr(wire[:4096]), "escaped_truncated": len(wire) > 4096}
+        self.submitted_bytes += write_all(self.p.stdin, wire)
         tokens, pieces = [], []
         while True:
             fields = self.line().split()
