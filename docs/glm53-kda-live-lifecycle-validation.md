@@ -1,8 +1,11 @@
 # CUDA KDA live lifecycle validation
 
-This is the next correctness gate before a default-on experiment. Keep
-`GLM53_CUDA_KDA` default OFF. Do not tune kernels, transfers, placement or cache
-policy. The checkpoint-free lifecycle suite proves host bookkeeping with a
+Live CUDA lifecycle validation passed on revision
+`61ed9094aac390feeaf0735f30a15632052a1c4a`. The next isolated experiment defaults
+CUDA KDA ON when `GLM53_CUDA_KDA` is unset on the supported Linux CUDA path.
+Explicit `0` remains OFF and explicit `1` remains ON; backend/device capability
+guards and CPU fallback are unchanged. Do not tune kernels, transfers, placement
+or cache policy. The checkpoint-free lifecycle suite proves host bookkeeping with a
 device double; it does not establish live CUDA SERVE behavior.
 
 ## Freeze the rig
@@ -368,6 +371,101 @@ and executed expert rows increasing (no new upload is required). One intentional
 injection; later CPU fallback counts may grow for the disabled layer. Never fold
 injected failures into the healthy zero-error requirement.
 
-Do not authorize a default-on experiment until both the stock SERVE comparison
-and these direct real-CUDA lifecycle cases pass. This is correctness validation,
-not Phase 2F4 performance work.
+Both the stock SERVE comparison and direct real-CUDA cases passed on the revision
+above. The next three-arm run validates the isolated default-ON change, not
+Phase 2F4 performance work. No expert, host-cache or warm-residency defaults change.
+
+## Default-ON three-arm correctness experiment
+
+Unset now requests the same KDA initialization as explicit `1`; explicit `0`
+returns before KDA backend probing/allocation. CPU/non-CUDA builds remain unchanged.
+Run OFF, DEFAULT, ON sequentially with one binary and immutable usage snapshot.
+The DEFAULT arm explicitly unsets the variable inside a subshell. Unset inherited
+SERVE controls so these commands take the CLI path, not the SERVE protocol.
+
+```bash
+set -euo pipefail
+cd ~/colibri-glm53-cuda
+make -C c glm53-kda-lifecycle-check
+make -C c glm53-kda-cuda-proto-check CUDA=1 CUDA_ARCH=sm_86 NVCC=/usr/bin/nvcc
+make -C c glm53 CUDA=1 CUDA_ARCH=sm_86 NVCC=/usr/bin/nvcc -j4
+
+export OMP_NUM_THREADS=4 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close OMP_PLACES=cores
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export COLI_CUDA=1 COLI_GPU= COLI_GPUS=0,1,2,3,4,5,6,7 CUDA_EXPERT_GB=48
+export GLM53_EXPERT_GB=8
+export GLM53_CUDA_HEAT_MIN=2 GLM53_CUDA_HEAT_MARGIN=1
+export GLM53_CUDA_PARALLEL_PROMOTE=1 GLM53_CUDA_PROMOTE_OVERLAP=1 GLM53_CUDA_PROMOTE_LATE_JOIN=1
+export GLM53_MLA_OUT_ROWS4=1 GLM53_MLA_QB_ROWS4=0 GLM53_MLA_ABSORBED_BATCH=0
+export GLM53_CUDA_WARM_RESIDENCY=0 GLM53_CUDA_PROFILE=1 GLM53_VERBOSE=1
+export GLM53_MAXT=1024 DRAFT=0 USAGE_SAVE=0
+export COLI_USAGE="$PWD/artifacts/phase2e/usage-snapshot-before-phase2e"
+unset SERVE SERVE_BATCH SNAP
+printf '%s  %s\n' \
+  7a246a49fc1dc3fb6360c131153c22012ca08949da390455654652d76e18a953 \
+  "$COLI_USAGE" | sha256sum -c -
+mkdir -p artifacts/phase2f-live
+run=$(mktemp -d "$PWD/artifacts/phase2f-live/default-on.XXXXXX")
+git rev-parse HEAD > "$run/revision.txt"
+git status --short > "$run/git-status.txt"
+sha256sum c/glm53 "$COLI_USAGE" > "$run/frozen.sha256"
+env | sort > "$run/environment.txt"
+for arm in OFF DEFAULT ON; do
+  sha256sum -c "$run/frozen.sha256" > "$run/$arm.before-hashes.txt"
+  (
+    case "$arm" in
+      OFF) export GLM53_CUDA_KDA=0 ;;
+      DEFAULT) unset GLM53_CUDA_KDA ;;
+      ON) export GLM53_CUDA_KDA=1 ;;
+    esac
+    printf 'arm=%s GLM53_CUDA_KDA=%s\n' "$arm" "${GLM53_CUDA_KDA-unset}" > "$run/$arm.environment.txt"
+    /usr/bin/timeout --signal=TERM --kill-after=30s 1800s \
+      c/glm53 --model /srv/models-fast/colibri/glm53-flash-i4 \
+      --prompt 'Answer only with the word OK.' --greedy 128 \
+      > "$run/$arm.stdout.log" 2> "$run/$arm.stderr.log"
+  )
+  sha256sum -c "$run/frozen.sha256" > "$run/$arm.after-hashes.txt"
+  # Reject unexpected failures before starting the next arm.
+  python3 - "$run" "$arm" <<'PY'
+from pathlib import Path
+import re, sys
+root, arm = Path(sys.argv[1]), sys.argv[2]
+log = (root / f'{arm}.stderr.log').read_text()
+out = (root / f'{arm}.stdout.log').read_bytes()
+errors = re.findall(r'\berrors=(\d+)', log)
+assert errors and all(int(x) == 0 for x in errors), 'expert errors/missing counters'
+assert not re.search(r'\[CUDA\].*(?:failed|error|invalid)|glm53-kda-cuda-error|step failed|state push failed|committed state pull failed', log, re.I), 'unexpected CUDA failure'
+header = re.search(rb'^teacher_forcing[^\n]*\n', out, re.M)
+footer = re.search(rb'\ndecode (\d+) token in [^\n]*\n', out)
+assert header and footer and footer.start() >= header.end(), 'missing semantic/decode output'
+semantic = out[header.start():footer.start()]
+(root / f'{arm}.semantic.bin').write_bytes(semantic)
+if arm != 'OFF':
+    assert semantic == (root / 'OFF.semantic.bin').read_bytes(), 'semantic mismatch'
+layers = re.findall(r'^\[glm53-kda-cuda-layer\] layer=(\d+) ordinal=(\d+) device=(\d+) loaded=(\d+)$', log, re.M)
+final = re.findall(r'^\[glm53-kda-cuda\] kda_cuda_calls=.*$', log, re.M)
+if arm == 'OFF':
+    assert not layers and not final, 'explicit OFF initialized KDA'
+else:
+    assert len(layers) == 34 and all(row[3] == '1' for row in layers), 'KDA initialization incomplete'
+    assert len(final) == 1, 'missing/ambiguous KDA final counters'
+    fields = dict(re.findall(r'(\w+)=(\S+)', final[0]))
+    assert int(fields['kda_cuda_calls']) == 34 * int(footer[1]), 'wrong decode call count'
+    assert fields['kda_cuda_errors'] == fields['kda_cuda_fallbacks'] == '0', 'KDA errors/fallbacks'
+    if arm == 'ON':
+        default = (root / 'DEFAULT.stderr.log').read_text()
+        assert layers == re.findall(r'^\[glm53-kda-cuda-layer\] layer=(\d+) ordinal=(\d+) device=(\d+) loaded=(\d+)$', default, re.M)
+        prior = dict(re.findall(r'(\w+)=(\S+)', re.findall(r'^\[glm53-kda-cuda\] kda_cuda_calls=.*$', default, re.M)[0]))
+        for key in ('kda_cuda_calls', 'kda_cuda_errors', 'kda_cuda_fallbacks', 'state_pushes', 'state_pulls', 'invalidations', 'h2d_bytes', 'd2h_bytes'):
+            assert fields[key] == prior[key], f'default/ON mismatch: {key}'
+print(f'PASS arm={arm} decoded={int(footer[1])} semantic and health')
+PY
+done
+printf 'PASS three-arm default experiment. Artifacts: %s\n' "$run"
+```
+
+Accept only three successful arms with unchanged binary/usage hashes, identical
+semantic output, no unexpected KDA/expert failures, no KDA initialization for
+OFF, and equivalent initialized layer/device assignments and deterministic KDA
+counters for DEFAULT/ON. Times and free-memory measurements need not be identical.
+Stop on any timeout, failed assertion or semantic difference; return the logs.

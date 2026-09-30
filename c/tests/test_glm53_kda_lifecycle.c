@@ -23,13 +23,17 @@ typedef struct {
     float weights[9][LP * LX], conv[LW], norm[LD], alog[LH], dt[LP];
 } LifecycleFixture;
 
+static ColiCudaKda *startup_device;
+static int startup_creates;
+
 ColiCudaKda *coli_cuda_kda_create(int device, int heads, int hd, int hidden,
         int kernel, const ColiCudaKdaMatrix matrices[4], const float *conv,
         const float *norm) {
     (void)device; (void)heads; (void)hd; (void)hidden; (void)kernel;
     (void)matrices; (void)conv; (void)norm;
-    assert(!"lifecycle fixtures attach an explicit device double");
-    return NULL;
+    assert(startup_device && "lifecycle fixtures attach an explicit device double");
+    startup_creates++;
+    return startup_device;
 }
 void coli_cuda_kda_free(ColiCudaKda *kda) { (void)kda; }
 int coli_cuda_kda_set_state(ColiCudaKda *kda, const float *s, const float *w) {
@@ -95,6 +99,47 @@ static void fixture(LifecycleFixture *f) {
     for (int i = 0; i < LP; i++) f->dt[i] = -0.3f + i * 0.06f;
     f->layer.conv=f->conv; f->layer.onorm=f->norm;
     f->layer.alog=f->alog; f->layer.dt=f->dt;
+}
+static void feature_gate(void) {
+    const char *states[] = {NULL, "0", "1"};
+    for (int i = 0; i < 3; i++) {
+        LifecycleFixture f; fixture(&f);
+        f.model.kda_gpu = NULL;
+        memset(&f.model.kda_tier, 0, sizeof(f.model.kda_tier));
+        Mat *projections[] = {&f.layer.kq, &f.layer.kk, &f.layer.kv, &f.layer.ko};
+        for (int j = 0; j < 4; j++) {
+            projections[j]->fmt = 4; projections[j]->gs = 64;
+        }
+        if (states[i]) setenv("GLM53_CUDA_KDA", states[i], 1);
+        else unsetenv("GLM53_CUDA_KDA");
+        setenv("COLI_CUDA", "1", 1); setenv("COLI_GPU", "0", 1);
+        unsetenv("COLI_GPUS");
+        startup_device = &f.device; startup_creates = init_calls = 0;
+        glm53_kda_cuda_init(&f.model);
+        int enabled = i != 1;
+        assert(f.model.kda_tier.enabled == enabled);
+        assert(init_calls == enabled && startup_creates == enabled);
+        if (enabled) {
+            assert(f.model.kda_gpu && f.model.kda_gpu[0].usable);
+            assert(f.model.kda_gpu[0].object == &f.device);
+            assert(!f.model.kda_gpu[0].valid && !f.model.kda_gpu[0].host_stale);
+            assert(f.model.kda_tier.layers[0] == 1);
+            glm53_kda_cuda_close(&f.model);
+        } else assert(!f.model.kda_gpu);
+        startup_device = NULL;
+        printf("feature_gate=%s enabled=%d pass=1\n", states[i] ? states[i] : "UNSET", enabled);
+    }
+    /* Default ON must not bypass backend availability/capability guards. */
+    unsetenv("GLM53_CUDA_KDA");
+    GModel absent = {0}; init_calls = 0;
+    setenv("COLI_CUDA", "0", 1);
+    glm53_kda_cuda_init(&absent);
+    assert(!absent.kda_tier.enabled && !absent.kda_gpu && init_calls == 0);
+    setenv("COLI_CUDA", "1", 1); setenv("COLI_GPUS", "invalid", 1);
+    glm53_kda_cuda_init(&absent);
+    assert(!absent.kda_tier.enabled && !absent.kda_gpu && init_calls == 0);
+    unsetenv("COLI_GPUS");
+    puts("feature_gate=UNSET_UNAVAILABLE enabled=0 pass=1");
 }
 static void equal(const float *a, const float *b, int n) {
     for (int i = 0; i < n; i++) assert(isfinite(a[i]) && isfinite(b[i]) &&
@@ -218,6 +263,7 @@ static void failure_after_success(int push_failure) {
 }
 int main(void) {
     setenv("COLI_PIN_SLOTS", "4", 1);
+    feature_gate();
     alternating_sessions(); prefill_transition(); pin_restore_reset();
     failure_after_success(0); failure_after_success(1);
     puts("glm53 KDA production lifecycle: PASS (fake backend, no CUDA claim)");

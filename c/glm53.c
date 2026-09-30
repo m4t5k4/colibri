@@ -4032,8 +4032,8 @@ static void model_release(GModel *m) {
 #ifdef COLI_CUDA
 static void glm53_kda_cuda_init(GModel *m) {
     const char *flag = getenv("GLM53_CUDA_KDA");
-    if (!flag || !strcmp(flag, "0")) return;
-    if (strcmp(flag, "1")) {
+    if (flag && !strcmp(flag, "0")) return;
+    if (flag && strcmp(flag, "1")) {
         fprintf(stderr, "invalid GLM53_CUDA_KDA (expected 0 or 1)\n"); exit(1);
     }
     if (!getenv("COLI_CUDA") || strcmp(getenv("COLI_CUDA"), "1")) {

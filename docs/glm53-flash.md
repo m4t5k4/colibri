@@ -299,9 +299,13 @@ hardware before claiming performance.
 
 ### Optional CUDA KDA decode
 
-`GLM53_CUDA_KDA=1` enables CUDA KDA for explicit one-token decode calls in
-CLI/SERVE when `COLI_CUDA=1`. The default is OFF: unset and `0` retain CPU KDA.
-CUDA builds reject other values. Prefill, including one-token prefill, remains
+CUDA KDA now defaults ON for explicit one-token decode calls in CLI/SERVE on
+the supported Linux CUDA path when `COLI_CUDA=1`. Unset and
+`GLM53_CUDA_KDA=1` request CUDA KDA; `GLM53_CUDA_KDA=0` explicitly retains CPU
+KDA as the escape hatch. CUDA builds reject other values. Existing backend,
+device and layer capability checks still apply; unavailable/unsupported KDA
+retains the established CPU fallback. CPU/non-CUDA builds are unaffected.
+Prefill, including one-token prefill, remains
 CPU; Segment/Edge keep their CPU state contract.
 
 Each supported layer has resident fmt-4/group-64 Q/K/V/O projections, a dedicated
