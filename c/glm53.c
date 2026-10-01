@@ -761,6 +761,15 @@ typedef struct {
      * vuoti su Flash perche' il motore non emetteva nulla). Tempi di fase
      * cumulativi dall'avvio; il turno ne prende la differenza. */
     double t_attn, t_kda, t_mla, t_ffn, t_disk, t_head;
+#ifdef COLI_CUDA
+    struct {
+        int enabled;
+        double ffn_dense_s, ffn_sparse_s;
+        double sparse_router_s, sparse_topk_s, sparse_shared_s, sparse_union_s;
+        double sparse_join_wait_s, sparse_routed_tier_s;
+        uint64_t gpu_group_attempts, gpu_group_successes;
+    } phase3b;
+#endif
     double t_kda_proj, t_kda_core, t_kda_out;
     double t_kda_qkv, t_kda_decay, t_kda_beta;
     double t_kda_gateproj, t_kda_normgate, t_kda_ko;
@@ -783,6 +792,48 @@ typedef struct {
     ColiVisionTower vision;
     ColiVisionBlock *vblocks;
 } GModel;
+
+#ifdef COLI_CUDA
+static double now_s(void);
+/* Decode-only wall regions; joins are a nested diagnostic, not additive.
+ * Raw host-cache/KDA counters include prefill; emit prefill snapshots so
+ * consecutive decode deltas exclude it. No clocks or logging when disabled. */
+static void g53_phase3b_report(const GModel *m, const char *phase) {
+    if (!m->phase3b.enabled) return;
+    fprintf(stderr, "[glm53-phase3b-profile] phase=%s decode_tokens=%llu"
+        " ffn_dense_s=%.9f ffn_sparse_s=%.9f"
+        " sparse_router_s=%.9f sparse_topk_s=%.9f sparse_shared_s=%.9f"
+        " sparse_union_s=%.9f sparse_join_wait_s=%.9f sparse_routed_tier_s=%.9f"
+        " host_cache_hits=%llu host_cache_misses=%llu host_expert_miss_bytes=%llu"
+        " gpu_group_attempts=%llu gpu_group_successes=%llu cpu_routed_fallback_calls=%llu"
+        " kda_cuda_calls=%llu kda_h2d_bytes=%llu kda_d2h_bytes=%llu"
+        " kda_state_pushes=%llu kda_state_push_bytes=%llu"
+        " kda_state_pulls=%llu kda_state_pull_bytes=%llu\n",
+        phase, (unsigned long long)m->cuda.profile.decode_tokens,
+        m->phase3b.ffn_dense_s, m->phase3b.ffn_sparse_s,
+        m->phase3b.sparse_router_s, m->phase3b.sparse_topk_s,
+        m->phase3b.sparse_shared_s, m->phase3b.sparse_union_s,
+        m->phase3b.sparse_join_wait_s, m->phase3b.sparse_routed_tier_s,
+        (unsigned long long)m->hits, (unsigned long long)m->miss,
+        (unsigned long long)m->ebytes,
+        (unsigned long long)m->phase3b.gpu_group_attempts,
+        (unsigned long long)m->phase3b.gpu_group_successes,
+        (unsigned long long)m->cuda.profile.fallback_compute_rows,
+        (unsigned long long)m->kda_tier.calls,
+        (unsigned long long)m->kda_tier.h2d_bytes,
+        (unsigned long long)m->kda_tier.d2h_bytes,
+        (unsigned long long)m->kda_tier.pushes,
+        (unsigned long long)m->kda_tier.push_bytes,
+        (unsigned long long)m->kda_tier.pulls,
+        (unsigned long long)m->kda_tier.pull_bytes);
+}
+static void g53_phase3b_routed_end(GModel *m, int enabled, double start,
+                                  double join_start) {
+    if (!enabled) return;
+    m->phase3b.sparse_routed_tier_s += now_s() - start;
+    m->phase3b.sparse_join_wait_s += m->cuda.profile.promotion_join_s - join_start;
+}
+#endif
 
 #ifdef COLI_CUDA
 /* Snapshot immediately around each explicit decode forward. Summing these
@@ -2945,6 +2996,7 @@ static int g53_cuda_ffn_grouped(GModel *m, const GLayer *l, int index,
                                 const int *chosen, const float *weight,
                                 float *sg, float *su) {
     G53Cuda *g = &m->cuda;
+    if (m->phase3b.enabled && g->decode_call) m->phase3b.gpu_group_attempts++;
     g53_cuda_join_pending(g, G53_JOIN_NEXT_FFN);
     const Cfg *c = &m->c;
     if (!g->active || g->failed || g->ndev < 2 || n_union < 1 || n_union > 8 ||
@@ -3147,6 +3199,10 @@ static int g53_scale_audit_cli(const char *dir, int audit, int scan_all) {
 static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                       int tokens, float *out) {
 #ifdef COLI_CUDA
+    const int p3 = m->phase3b.enabled && m->cuda.decode_call && tokens == 1 &&
+                   index >= m->c.first_dense;
+    const double p3_join_start = p3 ? m->cuda.profile.promotion_join_s : 0;
+    double p3_routed_start = 0;
     const int late_join = m->cuda.promote_late_join && m->cuda.promotion_flight &&
                           m->cuda.decode_call && tokens == 1 &&
                           index >= m->c.first_dense && m->streaming;
@@ -3185,7 +3241,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     for (int t = 0; t < tokens; t++) {
         const float *row = x + (size_t)t * c->hidden;
 #ifdef COLI_CUDA
-        const double score_start = late_opportunity ? now_s() : 0;
+        const double score_start = (late_opportunity || p3) ? now_s() : 0;
         if (late_join && late_opportunity) router_begin = score_start;
 #endif
         for (int e = 0; e < c->n_experts; e++) {
@@ -3195,13 +3251,15 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             score[e] = sigmoidf_(sum);
         }
 #ifdef COLI_CUDA
-        if (late_opportunity) {
-            router_end = now_s(); late_router += router_end - score_start;
+        if (late_opportunity || p3) {
+            router_end = now_s();
+            if (late_opportunity) late_router += router_end - score_start;
+            if (p3) m->phase3b.sparse_router_s += router_end - score_start;
         }
 #ifdef GLM53_CUDA_TEST_HOOK
         glm53_cuda_test_ffn_prelude_stage(&m->cuda, 0); /* router */
 #endif
-        const double topk_start = late_opportunity ? now_s() : 0;
+        const double topk_start = (late_opportunity || p3) ? now_s() : 0;
         if (late_join && late_opportunity) topk_begin = topk_start;
 #endif
         /* la selezione usa score+bias, il PESO usa lo score puro: la
@@ -3225,8 +3283,10 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         for (int k = 0; k < topk; k++)
             mine_w[k] = mine_w[k] / (total + 1e-20f) * c->routed_scale;
 #ifdef COLI_CUDA
-        if (late_opportunity) {
-            topk_end = now_s(); late_topk += topk_end - topk_start;
+        if (late_opportunity || p3) {
+            topk_end = now_s();
+            if (late_opportunity) late_topk += topk_end - topk_start;
+            if (p3) m->phase3b.sparse_topk_s += topk_end - topk_start;
         }
 #ifdef GLM53_CUDA_TEST_HOOK
         glm53_cuda_test_ffn_prelude_stage(&m->cuda, 1); /* top-k */
@@ -3256,15 +3316,17 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
 
     /* l'esperto condiviso e' sempre attivo e non passa dalla cache */
 #ifdef COLI_CUDA
-    const double shared_start = late_opportunity ? now_s() : 0;
+    const double shared_start = (late_opportunity || p3) ? now_s() : 0;
     if (late_join && late_opportunity) shared_begin = shared_start;
 #endif
     for (int t = 0; t < tokens; t++)
         mlp3(out + (size_t)t * c->hidden, x + (size_t)t * c->hidden,
              &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
 #ifdef COLI_CUDA
-    if (late_opportunity) {
-        shared_end = now_s(); late_shared = shared_end - shared_start;
+    if (late_opportunity || p3) {
+        shared_end = now_s();
+        if (late_opportunity) late_shared = shared_end - shared_start;
+        if (p3) m->phase3b.sparse_shared_s += shared_end - shared_start;
     }
 #ifdef GLM53_CUDA_TEST_HOOK
     glm53_cuda_test_ffn_prelude_stage(&m->cuda, 2); /* shared expert */
@@ -3272,6 +3334,9 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
 #endif
 
     if (!m->streaming) {
+#ifdef COLI_CUDA
+        if (p3) p3_routed_start = now_s();
+#endif
         for (int t = 0; t < tokens; t++)
             for (int k = 0; k < topk; k++) {
                 const int eid = chosen[(size_t)t * topk + k];
@@ -3282,12 +3347,15 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                 for (int d = 0; d < c->hidden; d++) dst[d] += scale * tmp[d];
             }
         free(tmp); free(su); free(sg); free(weight); free(chosen);
+#ifdef COLI_CUDA
+        g53_phase3b_routed_end(m, p3, p3_routed_start, p3_join_start);
+#endif
         return;
     }
 
     /* unione dei distinti, nell'ordine in cui compaiono */
 #ifdef COLI_CUDA
-    const double union_start = late_opportunity ? now_s() : 0;
+    const double union_start = (late_opportunity || p3) ? now_s() : 0;
     if (late_join && late_opportunity) union_begin = union_start;
 #endif
     int *union_ids = malloc((size_t)tokens * topk * sizeof(int));
@@ -3300,7 +3368,11 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     }
 
 #ifdef COLI_CUDA
-    const double prelude_end = late_opportunity ? now_s() : 0;
+    const double prelude_end = (late_opportunity || p3) ? now_s() : 0;
+    if (p3) {
+        m->phase3b.sparse_union_s += prelude_end - union_start;
+        p3_routed_start = prelude_end;
+    }
     if (late_opportunity) {
         union_end = prelude_end; late_union = union_end - union_start;
     }
@@ -3331,8 +3403,10 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     if (tokens == 1 && m->cuda.active && m->cuda.ndev > 1 &&
         g53_cuda_ffn_grouped(m, l, index, x, out, union_ids, n_union,
                              chosen, weight, sg, su)) {
+        if (p3 && !m->cuda.failed) m->phase3b.gpu_group_successes++;
         if (index == m->layer_end - 1) g53_cuda_stats(&m->cuda);
         free(union_ids); free(tmp); free(su); free(sg); free(weight); free(chosen);
+        g53_phase3b_routed_end(m, p3, p3_routed_start, p3_join_start);
         return;
     }
     if (m->cuda.active) {
@@ -3507,6 +3581,9 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     if (index == m->layer_end - 1) g53_cuda_stats(&m->cuda);
 #endif
     free(tmp); free(su); free(sg); free(weight); free(chosen);
+#ifdef COLI_CUDA
+    g53_phase3b_routed_end(m, p3, p3_routed_start, p3_join_start);
+#endif
 }
 
 /* ---------- caricamento ---------- */
@@ -3916,6 +3993,12 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
             const double phase_s = now_s() - t_phase;
             if (site) {
                 m->t_ffn += phase_s;
+#ifdef COLI_CUDA
+                if (m->phase3b.enabled && m->cuda.decode_call && n == 1) {
+                    if (i < c->first_dense) m->phase3b.ffn_dense_s += phase_s;
+                    else m->phase3b.ffn_sparse_s += phase_s;
+                }
+#endif
             } else {
                 m->t_attn += phase_s;
                 if (c->is_full[i]) m->t_mla += phase_s;
@@ -4108,6 +4191,7 @@ static void glm53_kda_cuda_init(GModel *m) {
     /* g53_cuda_init below samples post-KDA free memory for every device. */
 }
 static void glm53_kda_cuda_close(GModel *m) {
+    g53_phase3b_report(m, "final");
     if (!m->kda_gpu) return;
     G53KdaCudaTier *t = &m->kda_tier;
     ColiCudaKdaTimes times = {0};
@@ -4160,6 +4244,10 @@ static void model_load(GModel *m, const char *dir) {
                 m->cuda.budget);
     g53_cuda_profile_enable(&m->cuda, now_s);
     g53_cuda_profile_report(&m->cuda, "start");
+    const char *phase3b_env = getenv("GLM53_PHASE3B_PROFILE");
+    m->phase3b.enabled = m->cuda.profile.clock && phase3b_env &&
+                         !strcmp(phase3b_env, "1");
+    g53_phase3b_report(m, "start");
 #else
     if (getenv("COLI_CUDA") && !strcmp(getenv("COLI_CUDA"), "1")) {
         fprintf(stderr, "GLM53: COLI_CUDA=1 requires a CUDA build\n"); exit(1);
@@ -4303,6 +4391,7 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
             m->decode_base.valid = 0;
         }
         g53_cuda_profile_report(&m->cuda, p->decode ? "decode" : "prefill");
+        g53_phase3b_report(m, p->decode ? "decode" : "prefill");
         if (p->decode) g53_decode_report(m);
         if (p->decode)
             fprintf(stderr,

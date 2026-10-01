@@ -1320,10 +1320,11 @@ glm53$(EXE): glm53.c sse41_kernels.h decode_batch.h pin_pool.h cli_args.h st.h j
 	$(CC) $(CFLAGS) glm53.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
 .PHONY: glm53-cuda-tier-check glm53-cuda-check glm53-cuda-multidev-check
-glm53-cuda-tier-check: tests/test_glm53_cuda_adapters$(EXE) tests/test_glm53_cuda_profile$(EXE) tests/test_glm53_cuda_multidev$(EXE) tests/test_glm53_cuda_multidev_oracle$(EXE) tests/test_glm53_cuda_prodshape$(EXE) tests/test_glm53_cuda_scatter$(EXE) tests/test_glm53_cuda_phase2$(EXE) tests/test_glm53_cuda_promotion$(EXE) tests/test_glm53_cuda_warm$(EXE) tests/test_glm53_mla_rows4$(EXE) tests/test_glm53_mla_profile$(EXE) tests/test_glm53_mla_absorbed_batch$(EXE) tests/test_glm53_kda_lifecycle$(EXE)
+glm53-cuda-tier-check: tests/test_glm53_phase3b_profile$(EXE) tests/test_glm53_cuda_adapters$(EXE) tests/test_glm53_cuda_profile$(EXE) tests/test_glm53_cuda_multidev$(EXE) tests/test_glm53_cuda_multidev_oracle$(EXE) tests/test_glm53_cuda_prodshape$(EXE) tests/test_glm53_cuda_scatter$(EXE) tests/test_glm53_cuda_phase2$(EXE) tests/test_glm53_cuda_promotion$(EXE) tests/test_glm53_cuda_warm$(EXE) tests/test_glm53_mla_rows4$(EXE) tests/test_glm53_mla_profile$(EXE) tests/test_glm53_mla_absorbed_batch$(EXE) tests/test_glm53_kda_lifecycle$(EXE)
 	$(CC) $(NOCUDA_CFLAGS) tests/test_glm53_cuda.c -o tests/test_glm53_cuda$(EXE) $(NOCUDA_LDFLAGS)
 	COLI_CUDA=1 COLI_GPU=0 COLI_GPUS= CUDA_EXPERT_GB=auto ./tests/test_glm53_cuda$(EXE)
 	./tests/test_glm53_cuda_adapters$(EXE)
+	./tests/test_glm53_phase3b_profile$(EXE)
 	./tests/test_glm53_cuda_profile$(EXE)
 	./tests/test_glm53_cuda_multidev$(EXE)
 	./tests/test_glm53_cuda_multidev_oracle$(EXE)
@@ -2526,3 +2527,7 @@ tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c sse41_kerne
 # Kimi CUDA dispatch/fallback with a fake backend; no CUDA toolkit required.
 tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c sse41_kernels.h kimi_k3.c backend_cuda.h kv_prefix.h serve_codec.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h fp8_format.h idot.h omp_tune.h route_trace.h $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# Phase 3B uses the production FFN and existing asynchronous fake CUDA fixture.
+tests/test_glm53_phase3b_profile$(EXE): tests/test_glm53_phase3b_profile.c tests/test_glm53_cuda_phase2.c tests/test_glm53_cuda_multidev_oracle.c glm53.c glm53_cuda.h backend_cuda.h segment_runtime.c edge_runtime.c
+	$(CC) $(filter-out -DCOLI_METAL -DCOLI_VULKAN,$(NOCUDA_CFLAGS)) -DCOLI_CUDA $< segment_runtime.c edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
