@@ -532,8 +532,28 @@ static void g53_cuda_init(G53Cuda *g, int nl, int ne, int D, int I, int streamin
         fprintf(stderr, "invalid GLM53_CUDA_HEAT_MIN or GLM53_CUDA_HEAT_MARGIN\n");
         exit(1);
     }
-    /* Decimal GB. Shared total cap; reserve 2 GB on EACH device for scratch.
+    /* Decimal GB. Shared total cap. By default reserve 2 GB on EACH
+     * device for scratch, matching the historical GLM53 behaviour.
+     * GLM53_CUDA_RESERVE_GB may lower or raise that per-device reserve.
      * Do not rigidly divide the cap: a small device must not strand allowance. */
+    double reserve_gb = 2.0;
+    const char *reserve = getenv("GLM53_CUDA_RESERVE_GB");
+    if (reserve && *reserve) {
+        char *reserve_end = NULL;
+        double parsed = strtod(reserve, &reserve_end);
+        if (*reserve_end || !isfinite(parsed) || parsed < 0.0 || parsed > 64.0) {
+            coli_cuda_shutdown();
+            fprintf(stderr, "invalid GLM53_CUDA_RESERVE_GB\n");
+            exit(1);
+        }
+        reserve_gb = parsed;
+    }
+    size_t reserve_bytes = (size_t)(reserve_gb * 1e9);
+
+    fprintf(stderr,
+            "[glm53-cuda] expert_reserve_gb=%.3f reserve_bytes=%zu\n",
+            reserve_gb, reserve_bytes);
+
     g->budget = 0;
     for (int i = 0; i < g->ndev; i++) {
         size_t available = 0, total = 0;
@@ -542,7 +562,7 @@ static void g53_cuda_init(G53Cuda *g, int nl, int ne, int D, int I, int streamin
                     g->devices[i]);
             coli_cuda_shutdown(); exit(1);
         }
-        g->capacity[i] = available > 2000000000ULL ? available - 2000000000ULL : 0;
+        g->capacity[i] = available > reserve_bytes ? available - reserve_bytes : 0;
         g->budget += g->capacity[i];
     }
     const char *budget = getenv("CUDA_EXPERT_GB");
