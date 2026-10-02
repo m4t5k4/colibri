@@ -4459,6 +4459,220 @@ static float *forward_decode(GModel *m, GSession *s, const int *token) {
  * Con `keep_all` si tengono i logit di ogni posizione, che serve solo al
  * confronto con l'oracolo; altrimenti si tiene l'ultima riga, che e' l'unica
  * che decide il token successivo. */
+#ifdef COLI_CUDA
+/* Prompt-local second-chance residency.
+ *
+ * The ordinary heat>=2 policy remains authoritative.  This optional pass only
+ * considers experts selected exactly once by THIS prefill, ranks those by the
+ * already-loaded route history, and uploads a bounded prefix when their host
+ * cache slot is still live.
+ *
+ * Deliberately no expert_read() here: prefill seed must not turn into another
+ * multi-GB preload or disturb the page cache.  It also never evicts an existing
+ * GPU expert merely to satisfy the requested seed count.
+ */
+static int glm53_cuda_prefill_seed_target(void) {
+    const char *value = getenv("GLM53_CUDA_PREFILL_SEED");
+    if (!value) return 0;
+    if (!*value) {
+        fprintf(stderr, "invalid GLM53_CUDA_PREFILL_SEED (expected integer >= 0)\n");
+        exit(1);
+    }
+
+    unsigned long long parsed = 0;
+    for (const char *q = value; *q; q++) {
+        if (*q < '0' || *q > '9') {
+            fprintf(stderr, "invalid GLM53_CUDA_PREFILL_SEED (expected integer >= 0)\n");
+            exit(1);
+        }
+        unsigned digit = (unsigned)(*q - '0');
+        if (parsed > ((unsigned long long)INT_MAX - digit) / 10) {
+            fprintf(stderr, "invalid GLM53_CUDA_PREFILL_SEED (too large)\n");
+            exit(1);
+        }
+        parsed = parsed * 10 + digit;
+    }
+    return (int)parsed;
+}
+
+static int glm53_cuda_prefill_seed_upload(G53Cuda *g, int layer, int eid,
+                                           uint8_t *const *pieces,
+                                           double *upload_s) {
+    if (!g->active || g->failed || g->expert_bytes > g->budget)
+        return 0;
+
+    G53CudaExpert *e = &g->experts[layer * g->ne + eid];
+    if (e->w[0]) return 0;
+
+    if (g->bytes > g->budget - g->expert_bytes)
+        return 0;
+
+    int owner = g53_cuda_place(g);
+    if (owner < 0) return 0;
+
+    ColiCudaTensor *w[3] = {NULL, NULL, NULL};
+    int failed_k = -1;
+    double started = now_s();
+
+    for (int k = 0; k < 3; k++) {
+        if (!coli_cuda_tensor_upload_g(
+                &w[k],
+                pieces[k * 2],
+                (const float *)pieces[k * 2 + 1],
+                4,
+                k == 2 ? g->I : g->D,
+                k == 2 ? g->D : g->I,
+                g->devices[owner],
+                64)) {
+            failed_k = k;
+            break;
+        }
+    }
+
+    if (failed_k < 0 &&
+        !coli_cuda_tensor_upload_complete(g->devices[owner]))
+        failed_k = 3;
+
+    double elapsed = now_s() - started;
+    *upload_s += elapsed;
+    if (g->profile.clock)
+        g->profile.seconds[G53_UPLOAD] += elapsed;
+
+    if (failed_k >= 0) {
+        for (int k = 0; k < 3; k++)
+            coli_cuda_tensor_free(w[k]);
+
+        g->errors++;
+        g->failed = 1;
+
+        fprintf(stderr,
+                "[glm53-cuda] prefill seed upload failed device=%d stage=%s; "
+                "host fallback enabled\n",
+                g->devices[owner],
+                (const char *const[]){"gate", "up", "down", "complete"}[failed_k]);
+        return -1;
+    }
+
+    /* Normal publication is intentional: the ordinary eviction/cache
+     * accounting must know that this expert became resident here. */
+    g53_cuda_publish(g, layer, eid, owner, w);
+    return 1;
+}
+
+static void glm53_cuda_prefill_seed(GModel *m, const uint64_t *heat_before,
+                                     int target) {
+    G53Cuda *g = &m->cuda;
+    if (!target || !heat_before || !g->active || g->failed)
+        return;
+
+    g53_cuda_join_pending(g, G53_JOIN_POLICY_OR_DROP);
+
+    uint32_t **counts = rt_counts_all();
+    if (!counts || g_glm53_usage_history <= 0) {
+        fprintf(stderr,
+                "[glm53-cuda-prefill-seed] target=%d skipped=no-history\n",
+                target);
+        return;
+    }
+
+    G53CudaWarmCandidate *ranked =
+        malloc((size_t)g->count * sizeof(*ranked));
+
+    if (!ranked) {
+        fprintf(stderr,
+                "[glm53-cuda-prefill-seed] target=%d skipped=ranking-oom\n",
+                target);
+        return;
+    }
+
+    int n = 0;
+    size_t prompt_once = 0;
+    size_t already_resident = 0;
+
+    const int nl = g->count / g->ne;
+
+    for (int layer = m->c.first_dense; layer < nl; layer++) {
+        if (!counts[layer]) continue;
+
+        for (int eid = 0; eid < g->ne; eid++) {
+            int index = layer * g->ne + eid;
+            G53CudaExpert *e = &g->experts[index];
+
+            if (e->heat < heat_before[index])
+                continue;
+
+            uint64_t delta = e->heat - heat_before[index];
+            if (delta != 1)
+                continue;
+
+            prompt_once++;
+
+            if (e->w[0]) {
+                already_resident++;
+                continue;
+            }
+
+            /* This prefill contributed exactly one routing selection.
+             * Removing it recovers the score that existed before this prompt.
+             * Prior turns in a long-lived server remain useful history. */
+            uint32_t current = counts[layer][eid];
+            uint32_t history = current ? current - 1 : 0;
+
+            if (!history)
+                continue;
+
+            ranked[n++] =
+                (G53CudaWarmCandidate){layer, eid, history};
+        }
+    }
+
+    qsort(ranked, (size_t)n, sizeof(*ranked), g53_cuda_warm_cmp);
+
+    size_t cached = 0;
+    for (int i = 0; i < n; i++)
+        cached += slot_find(m, ranked[i].layer, ranked[i].eid) != NULL;
+
+    int loaded = 0;
+    int considered = 0;
+    double upload_s = 0;
+    double started = now_s();
+
+    for (int i = 0; i < n && loaded < target; i++) {
+        int layer = ranked[i].layer;
+        int eid = ranked[i].eid;
+
+        Slot *slot = slot_find(m, layer, eid);
+        if (!slot)
+            continue;
+
+        considered++;
+
+        int rc = glm53_cuda_prefill_seed_upload(
+            g, layer, eid, slot->piece, &upload_s);
+
+        if (rc < 0)
+            break;
+
+        if (rc == 0) {
+            /* With no eviction policy, failure to place one cached candidate
+             * means the free-residency budget is exhausted. */
+            break;
+        }
+
+        loaded++;
+    }
+
+    fprintf(stderr,
+            "[glm53-cuda-prefill-seed] target=%d prompt_once=%zu "
+            "already_resident=%zu history_candidates=%d cached=%zu "
+            "considered=%d loaded=%d resident=%u upload_s=%.6f total_s=%.6f\n",
+            target, prompt_once, already_resident, n, cached,
+            considered, loaded, g->resident, upload_s, now_s() - started);
+
+    free(ranked);
+}
+#endif
+
 static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
                               const float *vision, int n_vision, int keep_all) {
     const Cfg *c = &m->c;
@@ -4466,6 +4680,33 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
     int chunk = setting ? atoi(setting) : 128;
     if (chunk < 1) chunk = 1;
     if (chunk > n) chunk = n;
+
+#ifdef COLI_CUDA
+    const int prefill_seed_target = glm53_cuda_prefill_seed_target();
+    uint64_t *prefill_seed_heat_before = NULL;
+
+    if (prefill_seed_target > 0 &&
+        m->cuda.active &&
+        g_glm53_usage_history > 0) {
+        prefill_seed_heat_before =
+            malloc((size_t)m->cuda.count * sizeof(*prefill_seed_heat_before));
+
+        if (!prefill_seed_heat_before) {
+            fprintf(stderr,
+                    "[glm53-cuda-prefill-seed] target=%d skipped=snapshot-oom\n",
+                    prefill_seed_target);
+        } else {
+            for (int i = 0; i < m->cuda.count; i++)
+                prefill_seed_heat_before[i] = m->cuda.experts[i].heat;
+        }
+    } else if (prefill_seed_target > 0 &&
+               m->cuda.active &&
+               g_glm53_usage_history <= 0) {
+        fprintf(stderr,
+                "[glm53-cuda-prefill-seed] target=%d skipped=no-history\n",
+                prefill_seed_target);
+    }
+#endif
 
     float *all = keep_all ? malloc((size_t)n * c->vocab * sizeof(float)) : NULL;
     if (keep_all && !all) { fprintf(stderr, "OOM allocating prefill logits\n"); exit(1); }
@@ -4526,6 +4767,15 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
                 n_vision, used_vision);
         exit(1);
     }
+
+#ifdef COLI_CUDA
+    if (prefill_seed_heat_before) {
+        glm53_cuda_prefill_seed(
+            m, prefill_seed_heat_before, prefill_seed_target);
+        free(prefill_seed_heat_before);
+    }
+#endif
+
     return keep_all ? all : last;
 }
 
