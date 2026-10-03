@@ -209,6 +209,10 @@ class _StubFixture:
         self.runtime_a_src = self.src_dir / "runtime_a.c"
         self.runtime_b_src = self.src_dir / "runtime_b.c"
         self.backend_src = self.src_dir / "backend.c"
+        self.backend_lease = self.backend_dir / "coli_hip_leasevariant.dll"
+        self.backend_lease_src = self.src_dir / "backend_lease.c"
+        self.backend_partial = self.backend_dir / "coli_hip_partiallease.dll"
+        self.backend_partial_src = self.src_dir / "backend_partial.c"
         # Same fake backend minus the optional available_device_count export:
         # the shape of a DLL built before #1533 added it, which the wrapper
         # must still answer from (#1577).
@@ -246,6 +250,7 @@ class _StubFixture:
 #include <tlhelp32.h>
 #include <wchar.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "backend_cuda.h"
 
@@ -390,6 +395,11 @@ int main(int argc, char **argv)
     /* Real shutdown, then look again. Production must release exactly its own
      * reference: a runtime only it loaded disappears, while one this harness
      * also holds stays mapped. */
+    if (getenv("COLI_TEST_LEASE")) {
+        const int d[] = {3, 1};
+        printf("lease_acquire=%d\n", coli_cuda_acquire(d, 2));
+        coli_cuda_release();
+    }
     coli_cuda_shutdown();
     printf("shutdown_called=1\n");
     runtime_inventory("runtime_after_shutdown");
@@ -613,8 +623,10 @@ int main(int argc, char **argv)
                   "building test dependency " + name)
         return implib
 
-    def _backend_source(self, with_dep=False, omit=()):
+    def _backend_source(self, with_dep=False, omit=(), leases=False):
         real = {"coli_cuda_init", "coli_cuda_e8_set_grid"}
+        if not leases:
+            omit = tuple(omit) + ("coli_cuda_acquire", "coli_cuda_release")
         probed = {_AVAILABLE_DEVICE_SYMBOL: _AVAILABLE_PROBE,
                   _DEVICE_COUNT_SYMBOL: _DEVICE_COUNT_PROBE}
         lines = [
@@ -640,6 +652,15 @@ int main(int argc, char **argv)
             " * path under test, so trivial bodies are enough to let symbol",
             " * resolution complete. */",
         ]
+        if leases:
+            real.update(("coli_cuda_acquire", "coli_cuda_release"))
+            lines.insert(0, "#include <stdio.h>")
+            if "coli_cuda_acquire" not in omit:
+                lines += ["__declspec(dllexport) int coli_cuda_acquire(const int *d, int n)",
+                          "{ return d && n == 2 && d[0] == 3 && d[1] == 1 ? 73 : 0; }"]
+            if "coli_cuda_release" not in omit:
+                lines += ["__declspec(dllexport) void coli_cuda_release(void)",
+                          '{ puts("lease_release_forwarded=1"); }']
         if with_dep:
             lines[3:3] = [
                 "",
@@ -673,6 +694,13 @@ int main(int argc, char **argv)
                        "-L" + str(implib_a.parent), "-lamdhip64_7"],
                       "building fake coli_hip.dll")
             shutil.copy2(self.backend, self.cuda_backend)
+            for source, target, omitted in (
+                    (self.backend_lease_src, self.backend_lease, ()),
+                    (self.backend_partial_src, self.backend_partial, ("coli_cuda_release",))):
+                source.write_text(self._backend_source(leases=True, omit=omitted), encoding="ascii")
+                self._gcc(["-O0", "-shared", str(source), "-o", str(target),
+                           "-L" + str(implib_a.parent), "-lamdhip64_7"],
+                          "building lease ABI variant")
             self._build_diagnostic_variants(implib_a)
             self._build_harness()
         except Exception:
@@ -918,7 +946,7 @@ class LoaderStubFixtureTest(unittest.TestCase):
             cls.fixture = None
 
     def test_abi_is_derived_from_the_loader_source(self):
-        """47 mandatory + 14 optional, parsed from backend_loader.c.
+        """47 mandatory + 16 optional, parsed from backend_loader.c.
 
         The counts are a deliberate tripwire: adding a RESOLVE to the loader
         widens the ABI every Windows DLL must satisfy, and that should be a
@@ -929,10 +957,12 @@ class LoaderStubFixtureTest(unittest.TestCase):
         """
         f = self.fixture
         self.assertEqual(len(f.mandatory), 47)
-        self.assertEqual(len(f.optional), 14)  # +expert_mxfp4: optional Kimi SiTU pipeline; +dn_create/free/set_state/get_state/step
-        self.assertEqual(len(f.exports), 61)
+        self.assertEqual(len(f.optional), 16)  # includes the paired optional acquire/release lease exports
+        self.assertEqual(len(f.exports), 63)
         self.assertEqual(len(f.exports), len(f.mandatory) + len(f.optional))
         self.assertIn("coli_cuda_init", f.mandatory)
+        self.assertIn("coli_cuda_acquire", f.optional)
+        self.assertIn("coli_cuda_release", f.optional)
         self.assertIn("coli_cuda_e8_set_grid", f.optional)
         self.assertIn("coli_cuda_expert_mxfp4", f.optional)
         # attention_project_ragged: paged ragged KV runtime (#795).
@@ -990,7 +1020,7 @@ class LoaderStubFixtureTest(unittest.TestCase):
     def test_backend_exports_the_complete_derived_abi(self):
         """Every loader-required symbol, plus exactly one test-only accessor."""
         f = self.fixture
-        exported = f.exported_names(f.backend)
+        exported = f.exported_names(f.backend_lease)
         missing = sorted(set(f.exports) - exported)
         self.assertEqual(missing, [], "missing production exports: %s" % missing)
         self.assertIn(_TEST_ACCESSOR, exported)
@@ -1165,6 +1195,23 @@ class LoaderRuntimeBindingTest(unittest.TestCase):
         out = self._assert_bound_to("case_b", f.runtime_b,
                                     _RUNTIME_MARKER_B, f.runtime_a)
         self.assertEqual(out.get("runtime_before_count"), "0")
+
+    def test_optional_lease_forwarding_and_legacy_fallback(self):
+        f = self.fixture
+        for name, backend, expected, retained in (
+                ("paired", f.backend_lease, "73", "1"),
+                ("missing", f.backend, "0", "0"),
+                ("partial", f.backend_partial, "0", "0")):
+            case = Path(self.cases.name) / ("lease_" + name)
+            proc, out = f.run_harness(case, "NONE", backend_override=backend,
+                env={_RUNTIME_DIR_VAR: str(f.runtime_a_dir), "COLI_TEST_LEASE": "1"})
+            detail = "\nstdout:\n%s\nstderr:\n%s" % (proc.stdout, proc.stderr)
+            self.assertEqual(proc.returncode, 0, detail)
+            self.assertEqual(out.get("loader_init"), "1", detail)
+            self.assertEqual(out.get("lease_acquire"), expected, detail)
+            self.assertEqual(out.get("lease_release_forwarded"),
+                             "1" if name == "paired" else None, detail)
+            self.assertEqual(out.get("runtime_after_shutdown_count"), retained, detail)
 
     def test_no_preload_is_now_deterministic_because_production_loads_it(self):
         """Nothing preloaded: production loads the configured runtime itself.
@@ -2216,6 +2263,24 @@ class LoaderProductionStructureTest(unittest.TestCase):
     def setUpClass(cls):
         cls.src = (HERE / "backend_loader.c").read_text(encoding="utf-8",
                                                         errors="replace")
+
+    def test_lease_exports_are_optional_paired_forwarders(self):
+        mandatory, optional = _derive_backend_abi()
+        for name in ("coli_cuda_acquire", "coli_cuda_release"):
+            self.assertIn(name, optional)
+            self.assertNotIn(name, mandatory)
+        acquire = self.src.split("int coli_cuda_acquire(", 1)[1].split("void coli_cuda_release", 1)[0]
+        self.assertIn("if(!coli_cuda_load()) return 0;", acquire)
+        self.assertIn("!g_cuda.acquire || !g_cuda.release", acquire)
+        self.assertIn("return g_cuda.acquire(devices, count);", acquire)
+        self.assertNotIn("g_cuda.init(", acquire)
+        release = self.src.split("void coli_cuda_release", 1)[1].split("void coli_cuda_shutdown", 1)[0]
+        self.assertIn("g_cuda.acquire && g_cuda.release", release)
+        self.assertIn("g_cuda.release();", release)
+        self.assertNotIn("g_cuda.shutdown", release)
+        shutdown = self.src.split("void coli_cuda_shutdown", 1)[1].split("int coli_cuda_device_count", 1)[0]
+        self.assertLess(shutdown.index("if(g_cuda.acquire && g_cuda.release) return;"),
+                        shutdown.index("FreeLibrary(g_cuda.dll)"))
 
     def _index(self, needle):
         at = self.src.find(needle)
