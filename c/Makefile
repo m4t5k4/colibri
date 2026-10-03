@@ -2241,6 +2241,14 @@ SEGMENT_BUILD_DIR = build/segment
 SEGMENT_CPU_CFLAGS = $(filter-out -DCOLI_CUDA -DCOLI_ANS -DCOLI_METAL \
 	-DCOLI_VULKAN,$(CFLAGS)) -include pthread.h \
 	-DCOLI_SEGMENT_ADAPTER -DCOLI_EDGE_ADAPTER
+
+.PHONY: glm53-session-range-check
+glm53-session-range-check: tests/test_glm53_session_range$(EXE)
+	./tests/test_glm53_session_range$(EXE)
+
+tests/test_glm53_session_range$(EXE): tests/test_glm53_session_range.c glm53.c delta_attention.h pin_pool.h segment_adapter_internal.h segment_runtime.h segment_runtime.c edge_runtime.c
+	$(CC) $(SEGMENT_CPU_CFLAGS) $< segment_runtime.c edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
+
 SEGMENT_ENGINE_OBJS = \
 	$(SEGMENT_BUILD_DIR)/glm.o \
 	$(SEGMENT_BUILD_DIR)/glm53.o \
