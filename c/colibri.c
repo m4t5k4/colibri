@@ -849,22 +849,8 @@ static void cuda_stats_print(void){
         "[CUDA] overlap window: pack+issue %.2fs | cpu-rows %.2fs | take(sync+acc) %.2fs\n",
         g_ovl_issue,g_ovl_cpu,g_ovl_take);
 }
-static int parse_cuda_devices(const char *list, int *out){
-    if(!list||!*list) return 0;
-    int n=0; const char *p=list;
-    while(*p){
-        char *end=NULL; long v=strtol(p,&end,10);
-        if(end==p||v<0||v>INT_MAX||n>=COLI_CUDA_MAX_DEVICES) return 0;
-        for(int i=0;i<n;i++) if(out[i]==(int)v) return 0;
-        out[n++]=(int)v; p=end;
-        while(*p==' '||*p=='\t') p++;
-        if(!*p) break;
-        if(*p++!=',') return 0;
-        while(*p==' '||*p=='\t') p++;
-        if(!*p) return 0;
-    }
-    return n;
-}
+#include "cuda_device_config.h"
+
 #endif
 static double now_s(void){
 #ifdef _WIN32
@@ -12734,9 +12720,7 @@ int main(int argc, char **argv){
     if(getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))){
         const char *one=getenv("COLI_GPU"), *many=getenv("COLI_GPUS");
         if(one&&many){ fprintf(stderr,"use COLI_GPU or COLI_GPUS, not both\n"); return 2; }
-        if(many) g_cuda_ndev=parse_cuda_devices(many,g_cuda_devices);
-        else if(one) g_cuda_ndev=parse_cuda_devices(one,g_cuda_devices);
-        else { g_cuda_ndev=1; g_cuda_devices[0]=0; }
+        g_cuda_ndev=coli_cuda_configured_devices(g_cuda_devices);
         if(g_cuda_ndev<1){ fprintf(stderr,"invalid COLI_GPUS: use a list such as 0,1,2\n"); return 2; }
         g_cuda_enabled=coli_cuda_init(g_cuda_devices,g_cuda_ndev);
         if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] requested backend is unavailable\n"); return 2; }
