@@ -106,7 +106,19 @@ typedef struct ColiCudaTensor ColiCudaTensor;
 /* Devices are CUDA ordinals, not positions in the input list.
  * Repeating the same ordered list preserves active contexts. Changing an
  * active list returns 0 without replacing it; release tensors and shut down
- * before selecting a different list. Init/shutdown require caller serialization. */
+ * before selecting a different list. Callers must serialize teardown with work. */
+/* Legacy raw ownership is exclusive: shut it down before acquiring leases.
+ * With live leases, raw init only accepts the matching ordered list (no new
+ * ownership), and raw shutdown is a no-op. Leases are counted inside the
+ * backend library; matching acquires share it, the last release shuts it down.
+ * Before releasing: drain work, free ColiCudaDn objects, then free tensors and
+ * other owner resources. The lifetime API does not own those resources.
+ * Init/shutdown/acquire/release are serialized, not concurrent inference.
+ * Older DLLs may lack the optional lease exports: acquire then fails safely.
+ * The HIP loader keeps lease-capable DLL/runtime modules mapped until process
+ * exit; backend CUDA allocations are still freed by final release. */
+COLI_CUDA_DLLEXPORT int coli_cuda_acquire(const int *devices, int count);
+COLI_CUDA_DLLEXPORT void coli_cuda_release(void);
 COLI_CUDA_DLLEXPORT int coli_cuda_init(const int *devices, int count);
 COLI_CUDA_DLLEXPORT void coli_cuda_shutdown(void);
 /* Number of CUDA devices visible to this process, before a device list is

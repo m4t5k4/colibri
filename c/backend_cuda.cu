@@ -1,4 +1,5 @@
 #include "backend_cuda.h"
+#include "backend_cuda_lifetime.h"
 #include "fp8_format.h"   /* FP8_BLOCK: the shared fmt=8 scale-block edge (see that header) */
 
 #include "backend_gpu_compat.h"
@@ -1269,7 +1270,8 @@ extern "C" int coli_cuda_fp8_set_lut(const float *lut) {
     return 1;
 }
 
-extern "C" int coli_cuda_init(const int *devices, int count) {
+static void cuda_shutdown_impl(void);
+static int cuda_init_impl(const int *devices, int count) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
     /* #509: the ROCm runtime (comgr, MIOpen, roctracer) reads $TEMP as a temp-dir
      * path. A stray numeric TEMP (the engine's legacy sampling alias) makes comgr's
@@ -1323,12 +1325,12 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         DeviceContext *ctx = &g_ctx[g_nctx];
         *ctx = {};
         ctx->device = device;
-        if (!select_ctx(ctx)) { coli_cuda_shutdown(); return 0; }
+        if (!select_ctx(ctx)) { cuda_shutdown_impl(); return 0; }
         cudaDeviceProp prop{};
-        if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) { coli_cuda_shutdown(); return 0; }
+        if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) { cuda_shutdown_impl(); return 0; }
         ctx->compute_major=prop.major;ctx->compute_minor=prop.minor;
         if(!cuda_ok(cudaStreamCreateWithFlags(&ctx->stream,cudaStreamNonBlocking),"stream creation")){
-            coli_cuda_shutdown();return 0;
+            cuda_shutdown_impl();return 0;
         }
 #ifdef COLI_ANS
         if(std::getenv("CUDA_RAW_EXPERTS")){
@@ -1343,13 +1345,33 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
     return 1;
 }
 
+static ColiCudaLifetime g_lifetime = {};
+static std::mutex g_lifetime_mu;
+
+extern "C" int coli_cuda_init(const int *devices, int count) {
+    std::lock_guard<std::mutex> lock(g_lifetime_mu);
+    return coli_cuda_lifetime_raw_init(&g_lifetime, devices, count, cuda_init_impl);
+}
+extern "C" void coli_cuda_shutdown(void) {
+    std::lock_guard<std::mutex> lock(g_lifetime_mu);
+    coli_cuda_lifetime_raw_shutdown(&g_lifetime, cuda_shutdown_impl);
+}
+extern "C" int coli_cuda_acquire(const int *devices, int count) {
+    std::lock_guard<std::mutex> lock(g_lifetime_mu);
+    return coli_cuda_lifetime_acquire(&g_lifetime, devices, count, cuda_init_impl);
+}
+extern "C" void coli_cuda_release(void) {
+    std::lock_guard<std::mutex> lock(g_lifetime_mu);
+    coli_cuda_lifetime_release(&g_lifetime, cuda_shutdown_impl);
+}
+
 extern "C" int coli_cuda_available_device_count(void) {
     int available = 0;
     if (cudaGetDeviceCount(&available) != cudaSuccess) return 0;
     return available;
 }
 
-extern "C" void coli_cuda_shutdown(void) {
+static void cuda_shutdown_impl(void) {
     for (int i = 0; i < g_nctx; i++) {
         DeviceContext *ctx = &g_ctx[i];
         if (!select_ctx(ctx)) continue;
