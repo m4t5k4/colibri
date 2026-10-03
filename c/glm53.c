@@ -2586,12 +2586,10 @@ static GSession *session_open(const GModel *m, int cap) {
     GSession *s = calloc(1, sizeof(*s));
     if (!s) { fprintf(stderr, "OOM allocating session\n"); exit(1); }
     s->cap = cap;
+    /* Keep absolute layer indices; only owned slots receive recurrent state. */
     s->layer = calloc((size_t)c->n_layers, sizeof(*s->layer));
     if (!s->layer) { fprintf(stderr, "OOM allocating layer states\n"); exit(1); }
-    if (c->kda_proj)
-        s->kda_scratch = malloc((size_t)coli_kda_scratch_floats(c->kda_heads, c->kda_hd,
-                                                                c->kda_hd) * sizeof(float));
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = m->layer_begin; i < m->layer_end; i++) {
         GLayerState *st = &s->layer[i];
         if (c->is_full[i]) {
             st->latent = malloc((size_t)cap * c->kv_lora * sizeof(float));
@@ -2601,6 +2599,13 @@ static GSession *session_open(const GModel *m, int cap) {
                 fprintf(stderr, "OOM allocating cache for layer %d\n", i); exit(1);
             }
         } else if (c->kda_proj) {
+            if (!s->kda_scratch) {
+                s->kda_scratch = malloc((size_t)coli_kda_scratch_floats(
+                    c->kda_heads, c->kda_hd, c->kda_hd) * sizeof(float));
+                if (!s->kda_scratch) {
+                    fprintf(stderr, "OOM allocating KDA scratch\n"); exit(1);
+                }
+            }
             st->kda_state = calloc((size_t)c->kda_heads * c->kda_hd * c->kda_hd,
                                    sizeof(float));
             st->kda_window = calloc((size_t)3 * c->kda_proj * c->conv_k, sizeof(float));
@@ -2611,7 +2616,7 @@ static GSession *session_open(const GModel *m, int cap) {
     }
     if (getenv("GLM53_VERBOSE")) {
         int full = 0;
-        for (int i = 0; i < c->n_layers; i++) if (c->is_full[i]) full++;
+        for (int i = m->layer_begin; i < m->layer_end; i++) if (c->is_full[i]) full++;
         const double per_token = (double)full * (c->kv_lora + 2 * c->index_hd) * sizeof(float);
         fprintf(stderr, "cache: %.1f KB per token across %d DSA layers "
                         "(%.2f GB at %d positions)\n",
@@ -2625,6 +2630,7 @@ static void session_close(const GModel *m, GSession *s) {
 #ifdef COLI_VULKAN
     g53c_session_gone(s);   /* the dense chain's copy of its state goes with it */
 #endif
+    /* Non-owned slots are NULL, so the absolute-indexed table is safe to scan. */
     for (int i = 0; i < m->c.n_layers; i++) {
         GLayerState *st = &s->layer[i];
         free(st->latent); free(st->ikeys); free(st->igates);
