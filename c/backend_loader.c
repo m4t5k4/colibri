@@ -170,6 +170,8 @@ static struct {
 #endif
     fn_init            init;
     fn_shutdown        shutdown;
+    fn_init            acquire;
+    fn_shutdown        release;
     fn_device_count    device_count;
     fn_available_device_count available_device_count;
     fn_device_at       device_at;
@@ -1422,6 +1424,8 @@ static int coli_cuda_load(void){
 
     RESOLVE(init,           fn_init)
     RESOLVE(shutdown,       fn_shutdown)
+    RESOLVE_OPT(acquire,    fn_init)
+    RESOLVE_OPT(release,    fn_shutdown)
     RESOLVE(device_count,   fn_device_count)
     RESOLVE(device_at,      fn_device_at)
     RESOLVE(mem_info,       fn_mem_info)
@@ -1518,9 +1522,26 @@ int coli_cuda_init(const int *devices, int count){
     return g_cuda.init(devices, count);
 }
 
+/* No loader-side ownership count: both optional exports must be present. */
+int coli_cuda_acquire(const int *devices, int count){
+    if(!coli_cuda_load()) return 0;
+    if(!g_cuda.acquire || !g_cuda.release){
+        fprintf(stderr, "%s shared CUDA lifetime requires a rebuilt backend DLL\n", COLI_VENDOR_TAG);
+        return 0;
+    }
+    return g_cuda.acquire(devices, count);
+}
+void coli_cuda_release(void){
+    if(g_cuda.available && g_cuda.acquire && g_cuda.release) g_cuda.release();
+}
+
 void coli_cuda_shutdown(void){
     if(g_cuda.available && g_cuda.shutdown) g_cuda.shutdown();
 #ifdef COLI_HIP_DLL
+    /* A lease-capable backend can refuse raw shutdown. Keep its DLL and runtime
+     * mapped until process exit: the loader cannot infer backend ownership and
+     * must not unload live leases. Legacy DLL cleanup below stays unchanged. */
+    if(g_cuda.acquire && g_cuda.release) return;
     /* Backend first, then the runtime it imports: releasing the runtime while
      * the backend is still mapped would leave the backend holding the only
      * reference to a module we no longer track. Safe after a failed
