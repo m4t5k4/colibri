@@ -1133,6 +1133,15 @@ cuda-bench: backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tes
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE) $(ANS_NVCC_LIBS)
 	./backend_cuda_bench$(EXE)
 
+# Phase 4A0 topology/transport probe. CUDA + Linux only: it intentionally uses
+# c/uring.h and O_DIRECT because those are the production primitives Phase 4
+# will build on. It is a benchmark, not a CI gate.
+phase4_transport_bench$(EXE): tests/bench_phase4_transport.cu uring.h
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) tests/bench_phase4_transport.cu -o $@
+phase4-transport-bench: phase4_transport_bench$(EXE)
+	./phase4_transport_bench$(EXE)
+
 # fmt=8 kernel bench: old vs COLI_CUDA_F8_WARP kernels per decode path, census
 # expert shapes, JSON on stdout (kernel time only). The build is a separate
 # file target so tools/run_f8_bench.sh can keep stdout pure JSON.
