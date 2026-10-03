@@ -1347,6 +1347,13 @@ glm53-cuda-tier-check: tests/test_glm53_phase3b_profile$(EXE) tests/test_glm53_c
 	./tests/test_glm53_mla_absorbed_batch$(EXE)
 	./tests/test_glm53_kda_lifecycle$(EXE)
 
+.PHONY: glm53-session-range-check
+glm53-session-range-check: tests/test_glm53_session_range$(EXE)
+	./tests/test_glm53_session_range$(EXE)
+
+tests/test_glm53_session_range$(EXE): tests/test_glm53_session_range.c glm53.c delta_attention.h pin_pool.h segment_adapter_internal.h segment_runtime.h segment_runtime.c edge_runtime.c
+	$(CC) $(filter-out -DCOLI_METAL -DCOLI_VULKAN,$(NOCUDA_CFLAGS)) $< segment_runtime.c edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_glm53_mla_rows4$(EXE): tests/test_glm53_mla_rows4.c glm53.c quant.h segment_runtime.c edge_runtime.c
 	$(CC) $(filter-out -DCOLI_METAL -DCOLI_VULKAN,$(NOCUDA_CFLAGS)) $< segment_runtime.c edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
 

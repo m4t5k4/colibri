@@ -80,6 +80,7 @@ static void fixture(LifecycleFixture *f) {
     GModel *m = &f->model;
     m->c = (Cfg){.hidden=LX, .n_layers=1, .vocab=4, .kda_heads=LH,
         .kda_hd=LD, .kda_proj=LP, .conv_k=4, .gate_lb=-3.0f, .eps=1e-6f};
+    m->layer_begin = 0; m->layer_end = m->c.n_layers;
     m->layer = &f->layer; m->kda_gpu = &f->entry;
     m->kda_tier.enabled = 1; m->kda_tier.ndev = 1;
     f->entry.object = &f->device; f->entry.usable = 1;
