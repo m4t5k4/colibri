@@ -29,6 +29,7 @@ enum { G53_JOIN_NEXT_FFN, G53_JOIN_LAST_LAYER, G53_JOIN_PROFILE,
 typedef struct {
     ColiCudaTensor *w[3];
     uint64_t heat;
+    uint64_t last_use;
     int owner; /* index in G53Cuda.devices; all three tensors share it */
     unsigned char warm_state; /* 0 other, 1 warm unhit, 2 warm hit, 3/4 evicted */
 } G53CudaExpert;
@@ -99,6 +100,8 @@ struct G53Cuda {
     int failure_stage;
     size_t budget, bytes, expert_bytes;
     uint64_t heat_min, heat_margin;
+    uint64_t recency_tick;
+    int recency_tie;
     int parallel_promote;
     int promote_overlap;
     int promote_late_join;
@@ -580,6 +583,15 @@ static void g53_cuda_init(G53Cuda *g, int nl, int ne, int D, int I, int streamin
     if (!g->experts) { coli_cuda_shutdown(); fprintf(stderr, "OOM CUDA expert table\n"); exit(1); }
     g53_cuda_warm_config(g);
     g->active = 1;
+
+    const char *recency_tie = getenv("GLM53_CUDA_RECENCY_TIE");
+    if (recency_tie && strcmp(recency_tie, "0") && strcmp(recency_tie, "1")) {
+        fprintf(stderr,
+                "invalid GLM53_CUDA_RECENCY_TIE (expected 0 or 1)\n");
+        exit(1);
+    }
+    g->recency_tie = recency_tie && !strcmp(recency_tie, "1");
+
     g->parallel_promote = g->ndev > 1 && getenv("GLM53_CUDA_PARALLEL_PROMOTE") &&
                           !strcmp(getenv("GLM53_CUDA_PARALLEL_PROMOTE"), "1");
     g->promote_overlap = g->parallel_promote && getenv("GLM53_CUDA_PROMOTE_OVERLAP") &&
@@ -594,8 +606,9 @@ static void g53_cuda_init(G53Cuda *g, int nl, int ne, int D, int I, int streamin
                 g->capacity[i] < g->budget ? g->capacity[i] : g->budget,
                 (g->capacity[i] < g->budget ? g->capacity[i] : g->budget) / g->expert_bytes);
     fputc('\n', stderr);
-    fprintf(stderr, "[glm53-cuda] parallel_promotion=%d promotion_overlap=%d promotion_late_join=%d\n",
-            g->parallel_promote, g->promote_overlap, g->promote_late_join);
+    fprintf(stderr, "[glm53-cuda] parallel_promotion=%d promotion_overlap=%d promotion_late_join=%d recency_tie=%d\n",
+            g->parallel_promote, g->promote_overlap, g->promote_late_join,
+            g->recency_tie);
     g53_cuda_stats(g);
 }
 /* Called once per routed expert union, with its actual selected-row count. */
@@ -621,6 +634,8 @@ static void g53_cuda_heat(G53Cuda *g, int layer, int eid, int rows) {
                     (unsigned long long)(p->decode ? p->decode_tokens + 1 : 0),
                     layer, eid, rows, resident);
     }
+    if (g->recency_tie && e->w[0])
+        e->last_use = ++g->recency_tick;
     e->heat += (uint64_t)rows;
     if (e->w[0] && (e->warm_state == 1 || e->warm_state == 2)) {
         g->warm_hits++;
@@ -647,6 +662,8 @@ static void g53_cuda_publish_ex(G53Cuda *g, int layer, int eid, int owner,
         g->bytes += bytes; g->used[owner] += bytes;
     }
     g->resident++;
+    if (g->recency_tie)
+        e->last_use = ++g->recency_tick;
     if (warm) {
         e->warm_state = 1;
         g->warm_loaded++;
@@ -726,7 +743,12 @@ static void g53_cuda_promote_impl(G53Cuda *g, int layer, int eid, uint8_t *const
     if (owner < 0 || g->bytes > g->budget - g->expert_bytes) {
         G53CudaExpert *victim = NULL;
         for (int j = 0; j < g->count; j++)
-            if (g->experts[j].w[0] && (!victim || g->experts[j].heat < victim->heat))
+            if (g->experts[j].w[0] &&
+                (!victim ||
+                 g->experts[j].heat < victim->heat ||
+                 (g->recency_tie &&
+                  g->experts[j].heat == victim->heat &&
+                  g->experts[j].last_use < victim->last_use)))
                 victim = &g->experts[j];
         if (!victim || e->heat <= victim->heat ||
             e->heat - victim->heat <= g->heat_margin) return;
