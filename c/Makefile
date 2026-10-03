@@ -530,6 +530,8 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract
 TEST_EXCLUDE += test_vk_chain
+# The real CUDA lifetime probe requires nvcc and hardware; keep it opt-in.
+TEST_EXCLUDE += test_cuda_lifetime_live
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -2151,6 +2153,10 @@ tests/test_cuda_lifetime$(EXE): tests/test_cuda_lifetime.c backend_cuda_lifetime
 tests/test_cuda_lifetime_live$(EXE): tests/test_cuda_lifetime_live.cu backend_cuda.o backend_cuda.h
 	"$(GPUCC)" $(GPUFLAGS) $< backend_cuda.o -o $@ $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS) -lcublasLt -lcublas
 
+# Live production stage-owner regression; run explicitly on eight physical GPUs.
+tests/test_glm53_cuda_stage_live$(EXE): tests/test_glm53_cuda_stage_live.cu glm53_cuda.h cuda_device_config.h segment_adapters.h backend_cuda.o backend_cuda.h
+	"$(GPUCC)" $(GPUFLAGS) $< backend_cuda.o -o $@ $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS) -lcublasLt -lcublas
+
 tests/test_cuda_fmt_guard$(EXE): tests/test_cuda_fmt_guard.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -2947,3 +2953,7 @@ AUTODEP_DEPS      = $(addsuffix .d,$(basename $(AUTODEP_BINS)))
 $(foreach b,$(AUTODEP_BINS),$(eval $(b): $(basename $(b)).d))
 $(AUTODEP_DEPS): ;
 -include $(wildcard $(AUTODEP_DEPS))
+
+# Ownership metadata and production lifetime bookkeeping; no GPU/toolkit.
+tests/test_glm53_cuda_stage$(EXE): tests/test_glm53_cuda_stage.c glm53.c glm53_cuda.h cuda_device_config.h segment_adapters.h backend_cuda_lifetime.h segment_runtime.c
+	$(CC) $(NOCUDA_CFLAGS) $< segment_runtime.c -o $@ $(NOCUDA_LDFLAGS)

@@ -4610,10 +4610,12 @@ int main(int argc, char **argv) {
 #include <pthread.h>
 #include "segment_runtime.h"
 #include "segment_adapters.h"
+#include "glm53_cuda.h"
 #include "segment_adapter_internal.h"
 
 typedef struct {
     GModel model;
+    ColiGlm53CudaStage cuda_stage;
     uint32_t layer_begin, layer_end, context_tokens, state_width;
     pthread_mutex_t run_lock;
 } Glm53SegmentEngine;
@@ -4664,6 +4666,12 @@ static int glm53_segment_engine_open(void **engine_impl,
     if (!engine)
         return coli_segment_adapter_error(error, error_size,
                                           "out of memory opening GLM-5.3 Segment");
+    if (coli_glm53_cuda_stage_open(&engine->cuda_stage, options->resource_plan,
+                                  options->resource_plan_size) < 0) {
+        free(engine);
+        return coli_segment_adapter_error(error, error_size,
+            "invalid or unavailable GLM-5.3 CUDA stage plan/process device set");
+    }
 
     /* Solo i layer chiesti: e' quello che promette RANGE_NATIVE, e caricare il
      * resto vorrebbe dire tenere in RAM i pesi che macina un'altra macchina. */
@@ -4706,6 +4714,7 @@ static void glm53_segment_engine_destroy(void *engine_impl) {
     if (!engine) return;
     pthread_mutex_destroy(&engine->run_lock);
     model_release(&engine->model);
+    coli_glm53_cuda_stage_close(&engine->cuda_stage);
     free(engine);
 }
 
