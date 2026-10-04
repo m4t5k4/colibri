@@ -11,6 +11,7 @@
 static ColiCudaLifetime lifetime;
 static int inits, shutdowns, fail_init;
 static int live_buffers, allocations, fail_alloc;
+static int live_pinned, pinned_allocs, pinned_frees, fail_pinned, fail_download, fail_upload;
 typedef struct { void *pointer; size_t bytes; int owner; } FakeBuffer;
 static FakeBuffer buffers[16];
 typedef struct {
@@ -31,7 +32,21 @@ static int init(const int *devices, int count) {
     if (fail_init) return 0;
     inits++; return 1;
 }
-static void shutdown_backend(void) { assert(!live_buffers); shutdowns++; }
+static void shutdown_backend(void) { assert(!live_buffers && !live_pinned); shutdowns++; }
+int coli_cuda_device_count(void) { return lifetime.users ? lifetime.count : 0; }
+int coli_cuda_device_at(int index) { return index >= 0 && index < coli_cuda_device_count() ? lifetime.devices[index] : -1; }
+void *coli_cuda_host_alloc(size_t bytes) {
+    Event *event = record('P'); event->bytes = bytes;
+    assert(lifetime.users && bytes);
+    if (fail_pinned) return NULL;
+    void *p = malloc(bytes); assert(p); event->resource = p;
+    live_pinned++; pinned_allocs++; return p;
+}
+void coli_cuda_host_free(void *p) {
+    Event *event = record('Q'); event->resource = p;
+    assert(lifetime.users && p && live_pinned);
+    free(p); live_pinned--; pinned_frees++;
+}
 int coli_cuda_acquire(const int *devices, int count) {
     Event *event = record('A');
     assert(count > 0 && count <= COLI_CUDA_MAX_DEVICES);
@@ -79,11 +94,11 @@ static void validate_copy(int device, const void *pointer, size_t bytes) {
 }
 int coli_cuda_pipe_upload(int device, void *dst, const void *src, size_t bytes) {
     Event *event = record('U'); event->owner = device; event->resource = dst; event->bytes = bytes;
-    validate_copy(device, dst, bytes); memcpy(dst, src, bytes); return 1;
+    validate_copy(device, dst, bytes); if (fail_upload) return 0; memcpy(dst, src, bytes); return 1;
 }
 int coli_cuda_pipe_download(int device, const void *src, void *dst, size_t bytes) {
     Event *event = record('D'); event->owner = device; event->resource = src; event->bytes = bytes;
-    validate_copy(device, src, bytes); memcpy(dst, src, bytes); return 1;
+    validate_copy(device, src, bytes); if (fail_download) return 0; memcpy(dst, src, bytes); return 1;
 }
 static void roundtrip(ColiGlm53CudaStage *s) {
     float input[16384], output[16384];
@@ -186,6 +201,104 @@ static void resource_checks(void) {
     puts("resource E,L-M: no-plan inactivity, zero/overflow rejection, fresh reacquire and allocation: OK");
 }
 
+static void handoff_checks(void) {
+    const int pairs[][2] = {{0,1},{1,0},{2,6},{0,7}};
+    for (size_t pair = 0; pair < 4; pair++) {
+        event_count = 0;
+        setenv("COLI_GPUS", pair == 2 ? "2,4,6" : "0,1,2,3,4,5,6,7", 1);
+        ColiGlm53CudaStage src, dst, absent;
+        ColiGlm53StagePlan plan = {12,1,pairs[pair][0]};
+        assert(coli_glm53_cuda_stage_open(&src, &plan, 12) == 1);
+        assert(coli_glm53_cuda_stage_wire_create(&src, 4, 4096) == 1);
+        plan.cuda_device_ordinal = pairs[pair][1];
+        assert(coli_glm53_cuda_stage_open(&dst, &plan, 12) == 1);
+        assert(coli_glm53_cuda_stage_wire_create(&dst, 4, 4096) == 1);
+        ColiGlm53CudaHandoff h;
+        fail_pinned = 1;
+        assert(!coli_glm53_cuda_handoff_open(&h, &src, &dst));
+        assert(!h.bounce && !h.bytes && !h.lease_live && lifetime.users == 2 && !live_pinned);
+        fail_pinned = 0;
+        assert(coli_glm53_cuda_handoff_open(&h, &src, &dst));
+        assert(h.bytes == 65536 && live_pinned == 1 && lifetime.users == 3);
+        int allocs = pinned_allocs;
+        void *bounce = h.bounce;
+        unsigned char input[65536], output[65536], initial[65536];
+        for (size_t i = 0; i < sizeof(input); i++) input[i] = (unsigned char)(i * 17 + pair);
+        memset(initial, 0x5a, sizeof(initial));
+        assert(coli_glm53_cuda_stage_upload(&src, input, sizeof(input), 0));
+        assert(coli_glm53_cuda_stage_upload(&dst, initial, sizeof(initial), 0));
+        for (int repeat = 0; repeat < 3; repeat++) {
+            size_t before = event_count;
+            assert(coli_glm53_cuda_handoff(&h, &src, &dst, repeat ? 65536 : 123));
+            assert(events[before].kind == 'D' && events[before].owner == pairs[pair][0]);
+            assert(events[before+1].kind == 'U' && events[before+1].owner == pairs[pair][1]);
+            assert(coli_glm53_cuda_stage_download(&dst, output, sizeof(output), 0));
+            assert(!memcmp(input, output, repeat ? sizeof(input) : 123));
+            if (!repeat) assert(!memcmp(initial+123, output+123, sizeof(input)-123));
+        }
+        assert(h.bounce == bounce && pinned_allocs == allocs);
+        assert(coli_glm53_cuda_stage_open(&absent, NULL, 0) == 0);
+        size_t before = event_count;
+        assert(coli_glm53_cuda_handoff(&h, &src, &dst, 0));
+        assert(!coli_glm53_cuda_handoff(&h, &src, &dst, 65537));
+        assert(!coli_glm53_cuda_handoff(&h, &src, &dst, SIZE_MAX));
+        assert(!coli_glm53_cuda_handoff(&h, &absent, &dst, 1));
+        assert(!coli_glm53_cuda_handoff(&h, &src, &absent, 1));
+        assert(!coli_glm53_cuda_handoff(&h, NULL, &dst, 1));
+        assert(!coli_glm53_cuda_handoff(NULL, &src, &dst, 1));
+        ColiGlm53CudaStage bad = dst;
+        bad.cuda_device_ordinal = 99;
+        assert(!coli_glm53_cuda_handoff(&h, &src, &bad, 1));
+        bad = dst; bad.wire = NULL;
+        assert(!coli_glm53_cuda_handoff(&h, &src, &bad, 1));
+        bad = dst; bad.wire_bytes = 4;
+        assert(!coli_glm53_cuda_handoff(&h, &src, &bad, 5));
+        assert(!coli_glm53_cuda_handoff(&h, &bad, &dst, 5));
+        h.bytes = 4;
+        assert(!coli_glm53_cuda_handoff(&h, &src, &dst, 5)); h.bytes = 65536;
+        assert(event_count == before);
+        ColiGlm53CudaHandoff rejected;
+        bad = src; bad.wire_bytes = SIZE_MAX;
+        assert(!coli_glm53_cuda_handoff_open(&rejected, &bad, &dst));
+        setenv("COLI_GPUS", "0", 1); plan.cuda_device_ordinal = 0;
+        assert(coli_glm53_cuda_stage_open(&bad, &plan, 12) == -1);
+        assert(lifetime.users == 3);
+        fail_download = 1; before = event_count;
+        assert(!coli_glm53_cuda_handoff(&h, &src, &dst, 65536));
+        assert(event_count == before + 1 && events[before].kind == 'D');
+        fail_download = 0; fail_upload = 1; before = event_count;
+        assert(!coli_glm53_cuda_handoff(&h, &src, &dst, 65536));
+        assert(event_count == before + 2 && events[before+1].kind == 'U');
+        fail_upload = 0;
+        assert(src.lease_live && dst.lease_live && lifetime.users == 3);
+        assert(coli_glm53_cuda_handoff(&h, &src, &dst, 65536));
+        int frees = pinned_frees, shutdown_before = shutdowns;
+        if (pair % 2) {
+            coli_glm53_cuda_handoff_close(&h);
+            assert(events[event_count-2].kind == 'Q' && events[event_count-1].kind == 'R');
+            assert(lifetime.users == 2 && shutdowns == shutdown_before);
+            roundtrip(&src); roundtrip(&dst);
+            coli_glm53_cuda_stage_close(&dst); coli_glm53_cuda_stage_close(&src);
+        } else {
+            coli_glm53_cuda_stage_close(&src);
+            assert(!coli_glm53_cuda_handoff(&h, &src, &dst, 1));
+            coli_glm53_cuda_stage_close(&dst);
+            assert(lifetime.users == 1 && live_pinned == 1 && shutdowns == shutdown_before);
+            before = event_count;
+            assert(!coli_glm53_cuda_handoff(&h, &src, &dst, 65536));
+            assert(event_count == before);
+            coli_glm53_cuda_handoff_close(&h);
+            assert(events[event_count-2].kind == 'Q' && events[event_count-1].kind == 'R');
+        }
+        coli_glm53_cuda_handoff_close(&h);
+        assert(pinned_frees == frees + 1 && !live_pinned && !lifetime.users);
+        assert(shutdowns == shutdown_before + 1);
+        printf("handoff %d -> %d: exact/partial bytes, reuse, failures, teardown/reacquire: OK\n",
+               pairs[pair][0], pairs[pair][1]);
+    }
+    puts("handoff A-O: persistent pinned bounce, synchronous D2H/H2D, safe independent leases: PASS");
+}
+
 int main(void) {
     _Static_assert(sizeof(ColiGlm53StagePlan) == 12, "stage ABI");
     ColiGlm53StagePlan plan = {12, 1, 0}, parsed;
@@ -286,6 +399,7 @@ int main(void) {
     assert(!lifetime.users);
     puts("Production Segment engine teardown preserves survivor and releases final lease: OK");
     resource_checks();
+    handoff_checks();
     puts("GLM53 CUDA stage tests: PASS");
     return 0;
 }
