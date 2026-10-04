@@ -142,6 +142,10 @@ typedef int (*fn_pipe_download)(int device,const void *src,void *dst,size_t byte
 typedef void (*fn_pipe_free)(int device,void *p);
 typedef int (*fn_pipe_gemm)(ColiCudaTensor *t,float *y_dev,const float *x_dev,int S);
 typedef int (*fn_pipe_peer_copy)(int dst_dev,float *dst,int src_dev, const float *src,size_t bytes);
+typedef int (*fn_pipe_kda_recur)(int device, float *state_dev, float *out_dev,
+    const float *q_dev, const float *k_dev, const float *v_dev,
+    const float *log_decay_dev, const float *beta_dev,
+    int heads, int kdim, int vdim, float norm_eps);
 typedef int (*fn_pipe_rmsnorm)(int device,float *y_dev,const float *x_dev, const float *w_dev,int S,int D,float eps);
 typedef int (*fn_pipe_rmsnorm_s)(int device,float *y_dev,const float *x_dev, const float *w_dev,int S,int D,float eps, int xstride,int ystride);
 typedef int (*fn_group_resident_issue)(ColiCudaTensor *const *gates,ColiCudaTensor *const *ups,ColiCudaTensor *const *downs,const float *weights,int count,int home_device,const float *x_src_dev,float *partial_slot_dev);
@@ -219,6 +223,7 @@ static struct {
     fn_pipe_free pipe_free;
     fn_pipe_gemm pipe_gemm;
     fn_pipe_peer_copy pipe_peer_copy;
+    fn_pipe_kda_recur pipe_kda_recur;
     fn_pipe_rmsnorm pipe_rmsnorm;
     fn_pipe_rmsnorm_s pipe_rmsnorm_s;
     fn_group_resident_issue expert_group_resident_issue;
@@ -1490,6 +1495,7 @@ static int coli_cuda_load(void){
     RESOLVE(pipe_free, fn_pipe_free)
     RESOLVE(pipe_gemm, fn_pipe_gemm)
     RESOLVE(pipe_peer_copy, fn_pipe_peer_copy)
+    RESOLVE_OPT(pipe_kda_recur, fn_pipe_kda_recur) /* additive; older DLLs remain usable */
     RESOLVE(pipe_rmsnorm, fn_pipe_rmsnorm)
     RESOLVE(pipe_rmsnorm_s, fn_pipe_rmsnorm_s)
     RESOLVE(expert_group_resident_issue, fn_group_resident_issue)
@@ -1848,6 +1854,14 @@ int coli_cuda_pipe_peer_copy(int dst_dev,float *dst,int src_dev, const float *sr
     return g_cuda.pipe_peer_copy(dst_dev, dst, src_dev, src, bytes);
 }
 
+int coli_cuda_pipe_kda_recur(int device, float *state_dev, float *out_dev,
+        const float *q_dev, const float *k_dev, const float *v_dev,
+        const float *log_decay_dev, const float *beta_dev,
+        int heads, int kdim, int vdim, float norm_eps){
+    if(!g_cuda.available || !g_cuda.pipe_kda_recur) return 0;
+    return g_cuda.pipe_kda_recur(device, state_dev, out_dev, q_dev, k_dev,
+        v_dev, log_decay_dev, beta_dev, heads, kdim, vdim, norm_eps);
+}
 int coli_cuda_pipe_rmsnorm(int device,float *y_dev,const float *x_dev, const float *w_dev,int S,int D,float eps){
     if(!g_cuda.available){ return 0; }
     return g_cuda.pipe_rmsnorm(device, y_dev, x_dev, w_dev, S, D, eps);
