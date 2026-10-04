@@ -532,7 +532,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract
 TEST_EXCLUDE += test_vk_chain test_glm53_vk_f32
 # The real CUDA lifetime probe requires nvcc and hardware; keep it opt-in.
-TEST_EXCLUDE += test_cuda_lifetime_live
+TEST_EXCLUDE += test_cuda_lifetime_live test_glm53_cuda_stage_live
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
