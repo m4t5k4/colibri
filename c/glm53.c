@@ -4678,10 +4678,22 @@ static int glm53_segment_engine_open(void **engine_impl,
     const int begin = (int)options->layer_begin;
     const int end = options->layer_end ? (int)options->layer_end : -1;
     model_load_range(&engine->model, options->model_dir, begin, end, 0);
+    if (engine->cuda_stage.lease_live &&
+        coli_glm53_cuda_stage_wire_create(&engine->cuda_stage,
+            engine->model.c.hc_mult > 0 ? (size_t)engine->model.c.hc_mult : 0,
+            engine->model.c.hidden > 0 ? (size_t)engine->model.c.hidden : 0) < 0) {
+        model_release(&engine->model);
+        coli_glm53_cuda_stage_close(&engine->cuda_stage);
+        free(engine);
+        return coli_segment_adapter_error(error, error_size,
+            "GLM-5.3 CUDA stage activation allocation/geometry failed");
+    }
     engine->layer_begin = (uint32_t)engine->model.layer_begin;
     engine->layer_end = (uint32_t)engine->model.layer_end;
     engine->context_tokens = options->context_tokens ? options->context_tokens : 4096u;
-    engine->state_width = (uint32_t)(engine->model.c.hc_mult * engine->model.c.hidden);
+    engine->state_width = engine->cuda_stage.lease_live
+        ? (uint32_t)(engine->cuda_stage.wire_bytes / sizeof(float))
+        : (uint32_t)(engine->model.c.hc_mult * engine->model.c.hidden);
     pthread_mutex_init(&engine->run_lock, NULL);
 
     memset(capabilities, 0, sizeof(*capabilities));
