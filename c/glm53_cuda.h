@@ -12,6 +12,107 @@ typedef struct {
     size_t wire_bytes;
 } ColiGlm53CudaStage;
 
+/* Session resources, never part of the stage workspace. The parent stage lease
+ * must outlive these buffers. State and window are one coherence unit. */
+typedef enum {
+    G53_KDA_HOST, G53_KDA_DEVICE, G53_KDA_BOTH
+} ColiGlm53KdaAuthority;
+typedef struct {
+    void *state, *window;
+    size_t state_bytes, window_bytes;
+    ColiGlm53KdaAuthority authority;
+} ColiGlm53CudaKdaLayer;
+
+static inline int coli_glm53_cuda_size_mul(size_t a, size_t b, size_t *out) {
+    if (b && a > SIZE_MAX / b) return 0;
+    *out = a * b;
+    return 1;
+}
+static inline int coli_glm53_cuda_kda_geometry(size_t heads, size_t dim,
+        size_t proj, size_t kernel, size_t *state_bytes, size_t *window_bytes) {
+    size_t p, state, window;
+    if (!heads || !dim || !kernel ||
+        !coli_glm53_cuda_size_mul(heads, dim, &p) || p != proj ||
+        !coli_glm53_cuda_size_mul(p, dim, &state) ||
+        !coli_glm53_cuda_size_mul(state, sizeof(float), &state) ||
+        !coli_glm53_cuda_size_mul(3, proj, &window) ||
+        !coli_glm53_cuda_size_mul(window, kernel, &window) ||
+        !coli_glm53_cuda_size_mul(window, sizeof(float), &window)) return 0;
+    *state_bytes = state; *window_bytes = window;
+    return 1;
+}
+static inline void coli_glm53_cuda_kda_close(const ColiGlm53CudaStage *stage,
+                                           ColiGlm53CudaKdaLayer *layer) {
+#ifdef COLI_CUDA
+    if (layer->state) coli_cuda_pipe_free(stage->cuda_device_ordinal, layer->state);
+    if (layer->window) coli_cuda_pipe_free(stage->cuda_device_ordinal, layer->window);
+#else
+    (void)stage;
+#endif
+    memset(layer, 0, sizeof(*layer));
+}
+/* Fresh record only. No initialization upload: the host starts authoritative. */
+static inline int coli_glm53_cuda_kda_open(const ColiGlm53CudaStage *stage,
+        ColiGlm53CudaKdaLayer *layer, size_t heads, size_t dim,
+        size_t proj, size_t kernel) {
+    size_t sb, wb;
+    if (!stage || !stage->lease_live || stage->cuda_device_ordinal < 0 ||
+        layer->state || layer->window ||
+        !coli_glm53_cuda_kda_geometry(heads, dim, proj, kernel, &sb, &wb)) return 0;
+#ifdef COLI_CUDA
+    layer->state = coli_cuda_pipe_alloc(stage->cuda_device_ordinal, sb);
+    if (layer->state) layer->window = coli_cuda_pipe_alloc(stage->cuda_device_ordinal, wb);
+    if (!layer->state || !layer->window) {
+        coli_glm53_cuda_kda_close(stage, layer); return 0;
+    }
+    layer->state_bytes = sb; layer->window_bytes = wb;
+    layer->authority = G53_KDA_HOST;
+    return 1;
+#else
+    return 0;
+#endif
+}
+static inline void coli_glm53_cuda_kda_host_written(ColiGlm53CudaKdaLayer *layer) {
+    layer->authority = G53_KDA_HOST;
+}
+static inline int coli_glm53_cuda_kda_prepare(const ColiGlm53CudaStage *stage,
+        ColiGlm53CudaKdaLayer *layer, const float *state, const float *window) {
+    if (!stage || !stage->lease_live || !layer->state || !layer->window ||
+        !layer->state_bytes || !layer->window_bytes || !state || !window) return 0;
+    if (layer->authority == G53_KDA_BOTH || layer->authority == G53_KDA_DEVICE) return 1;
+    if (layer->authority != G53_KDA_HOST) return 0;
+#ifdef COLI_CUDA
+    if (!coli_cuda_pipe_upload(stage->cuda_device_ordinal, layer->state, state, layer->state_bytes) ||
+        !coli_cuda_pipe_upload(stage->cuda_device_ordinal, layer->window, window, layer->window_bytes)) return 0;
+    layer->authority = G53_KDA_BOTH;
+    return 1;
+#else
+    return 0;
+#endif
+}
+static inline int coli_glm53_cuda_kda_ensure_host(const ColiGlm53CudaStage *stage,
+        ColiGlm53CudaKdaLayer *layer, float *state, float *window) {
+    if (layer->authority == G53_KDA_HOST || layer->authority == G53_KDA_BOTH) return 1;
+    if (layer->authority != G53_KDA_DEVICE || !stage || !stage->lease_live ||
+        !layer->state || !layer->window || !layer->state_bytes ||
+        !layer->window_bytes || !state || !window) return 0;
+#ifdef COLI_CUDA
+    /* Call-local, pageable staging. Never publish half of a recurrent pair. */
+    void *s = malloc(layer->state_bytes), *w = malloc(layer->window_bytes);
+    int ok = s && w &&
+        coli_cuda_pipe_download(stage->cuda_device_ordinal, layer->state, s, layer->state_bytes) &&
+        coli_cuda_pipe_download(stage->cuda_device_ordinal, layer->window, w, layer->window_bytes);
+    if (ok) {
+        memcpy(state, s, layer->state_bytes); memcpy(window, w, layer->window_bytes);
+        layer->authority = G53_KDA_BOTH;
+    }
+    free(s); free(w);
+    return ok;
+#else
+    return 0;
+#endif
+}
+
 /* 0 absent, 1 valid, -1 malformed. Copy only the known prefix: the pointer
  * need not be aligned, and neither external nor declared sizes drive a copy. */
 static inline int coli_glm53_stage_plan_parse(const void *data, size_t bytes,
