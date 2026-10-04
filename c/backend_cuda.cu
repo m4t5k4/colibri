@@ -2943,6 +2943,73 @@ extern "C" int coli_cuda_pipe_download(int device,const void *src,void *dst,size
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
     return cuda_ok(cudaMemcpy(dst,src,bytes,cudaMemcpyDeviceToHost),"pipe download");
 }
+/* Recurrence only; caller owns every device buffer. Volatile float products
+ * prevent multiply/add contraction without changing global compiler flags or
+ * relying on vendor-specific rounding intrinsics. The CPU reference's
+ * left-associated key * residual * beta order is intentional. */
+__device__ static float pipe_kda_product(float a, float b) {
+    volatile float product = a * b;
+    return product;
+}
+__global__ void __launch_bounds__(256) pipe_kda_recur_kernel(
+        float *__restrict__ state, float *__restrict__ out,
+        const float *__restrict__ q, const float *__restrict__ k,
+        const float *__restrict__ v, const float *__restrict__ log_decay,
+        const float *__restrict__ beta, int kdim, int vdim, float norm_eps) {
+    __shared__ float qn[256], kn[256], alpha[256], norms[2];
+    int h = blockIdx.x, t = threadIdx.x;
+    size_t key_base = (size_t)h * kdim, value_base = (size_t)h * vdim;
+    if (t == 0) {
+        float qs = norm_eps, ks = norm_eps;
+        for (int i = 0; i < kdim; i++) {
+            qs += pipe_kda_product(q[key_base + i], q[key_base + i]);
+            ks += pipe_kda_product(k[key_base + i], k[key_base + i]);
+        }
+        float query_scale = 1.f / sqrtf((float)kdim);
+        norms[0] = query_scale / sqrtf(qs);
+        norms[1] = 1.f / sqrtf(ks);
+    }
+    __syncthreads();
+    if (t < kdim) {
+        qn[t] = pipe_kda_product(q[key_base + t], norms[0]);
+        kn[t] = pipe_kda_product(k[key_base + t], norms[1]);
+        alpha[t] = expf(log_decay[key_base + t]);
+    }
+    __syncthreads();
+    if (t >= vdim) return;
+    float *column = state + (size_t)h * kdim * vdim + t;
+    float memory = 0.f;
+    /* Complete the decay/prediction pass for this value column before writes. */
+    for (int i = 0; i < kdim; i++) {
+        float *cell = column + (size_t)i * vdim;
+        *cell = pipe_kda_product(*cell, alpha[i]);
+        memory += pipe_kda_product(kn[i], *cell);
+    }
+    float residual = v[value_base + t] - memory, result = 0.f;
+    for (int i = 0; i < kdim; i++) {
+        float *cell = column + (size_t)i * vdim;
+        float correction = pipe_kda_product(pipe_kda_product(kn[i], residual), beta[h]);
+        *cell += correction;
+        result += pipe_kda_product(qn[i], *cell);
+    }
+    out[value_base + t] = result;
+}
+extern "C" int coli_cuda_pipe_kda_recur(int device,
+        float *state_dev, float *out_dev, const float *q_dev, const float *k_dev,
+        const float *v_dev, const float *log_decay_dev, const float *beta_dev,
+        int heads, int kdim, int vdim, float norm_eps) {
+    if (fault_injected()) return 0;
+    if (!state_dev || !out_dev || !q_dev || !k_dev || !v_dev || !log_decay_dev || !beta_dev ||
+        heads < 1 || heads > 65535 || kdim < 1 || kdim > 256 || vdim < 1 || vdim > 256 ||
+        !std::isfinite(norm_eps) || norm_eps <= 0.f ||
+        (size_t)heads > SIZE_MAX / sizeof(float) / (size_t)kdim / (size_t)vdim) return 0;
+    if (!select_ctx(find_ctx(device))) return 0;
+    int threads = kdim > vdim ? kdim : vdim;
+    threads = ((threads + 31) / 32) * 32;
+    pipe_kda_recur_kernel<<<heads, threads>>>(state_dev, out_dev, q_dev, k_dev,
+        v_dev, log_decay_dev, beta_dev, kdim, vdim, norm_eps);
+    return cuda_ok(cudaGetLastError(), "pipe kda recurrence launch");
+}
 extern "C" int coli_cuda_pipe_rmsnorm(int device,float *y_dev,const float *x_dev,
                                       const float *w_dev,int S,int D,float eps){
     if (fault_injected()) return 0;
