@@ -27,9 +27,32 @@ class StageSource(unittest.TestCase):
         self.assertLess(engine.index("model_release"),
                         engine.index("coli_glm53_cuda_stage_close"))
         self.assertIn("options->resource_plan_size", engine)
+        self.assertLess(engine.index("model_load_range"),
+                        engine.index("coli_glm53_cuda_stage_wire_create"))
+        self.assertLess(engine.index("coli_glm53_cuda_stage_wire_create"),
+                        engine.index("*engine_impl = engine"))
+        self.assertIn("engine->model.c.hc_mult", engine)
+        self.assertIn("engine->model.c.hidden", engine)
         self.assertNotIn("coli_cuda_shutdown", engine)
         cli = (ROOT / "colibri.c").read_text()
         self.assertIn("coli_cuda_configured_devices(g_cuda_devices)", cli)
+
+    def test_resource_order_and_scope(self):
+        source = (ROOT / "glm53_cuda.h").read_text()
+        close = source[source.index("static inline void coli_glm53_cuda_stage_close"):
+                       source.index("static inline int coli_glm53_cuda_stage_wire_create")]
+        self.assertLess(close.index("coli_cuda_pipe_free"), close.index("coli_cuda_release"))
+        self.assertLess(close.index("stage->wire = NULL"), close.index("coli_cuda_release"))
+        self.assertIn("coli_cuda_pipe_alloc(stage->cuda_device_ordinal", source)
+        self.assertIn("bytes > stage->wire_bytes - offset", source)
+        self.assertNotIn("cudaMalloc", source)
+        self.assertNotIn("cuda_runtime", source)
+        self.assertNotIn("safetensors", source)
+        header = (ROOT / "backend_cuda.h").read_text()
+        loader = (ROOT / "backend_loader.c").read_text()
+        for operation in ("alloc", "free", "upload", "download"):
+            self.assertIn("coli_cuda_pipe_" + operation, header)
+            self.assertIn("coli_cuda_pipe_" + operation, loader)
 
 if __name__ == "__main__":
     unittest.main()
