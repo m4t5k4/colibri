@@ -532,7 +532,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract
 TEST_EXCLUDE += test_vk_chain test_glm53_vk_f32
 # The real CUDA lifetime probe requires nvcc and hardware; keep it opt-in.
-TEST_EXCLUDE += test_cuda_lifetime_live test_glm53_cuda_stage_live
+TEST_EXCLUDE += test_cuda_lifetime_live test_glm53_cuda_stage_live test_glm53_cuda_kda_state_live
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -2177,6 +2177,10 @@ tests/test_cuda_lifetime_live$(EXE): tests/test_cuda_lifetime_live.cu backend_cu
 tests/test_glm53_cuda_stage_live$(EXE): tests/test_glm53_cuda_stage_live.cu glm53_cuda.h cuda_device_config.h segment_adapters.h backend_cuda.o backend_cuda.h
 	"$(GPUCC)" $(GPUFLAGS) $< backend_cuda.o -o $@ $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS) -lcublasLt -lcublas
 
+# Opt-in checkpoint-free session-state resource/coherence regression on eight GPUs.
+tests/test_glm53_cuda_kda_state_live$(EXE): tests/test_glm53_cuda_kda_state_live.cu glm53_cuda.h cuda_device_config.h segment_adapters.h backend_cuda.o backend_cuda.h
+	"$(GPUCC)" $(GPUFLAGS) $< backend_cuda.o -o $@ $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS) -lcublasLt -lcublas
+
 tests/test_cuda_fmt_guard$(EXE): tests/test_cuda_fmt_guard.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -3000,3 +3004,6 @@ $(AUTODEP_DEPS): ;
 # Ownership metadata and production lifetime bookkeeping; no GPU/toolkit.
 tests/test_glm53_cuda_stage$(EXE): tests/test_glm53_cuda_stage.c glm53.c glm53_cuda.h cuda_device_config.h segment_adapters.h backend_cuda_lifetime.h segment_runtime.c
 	$(CC) $(NOCUDA_CFLAGS) $< segment_runtime.c -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_glm53_cuda_kda_state$(EXE): tests/test_glm53_cuda_kda_state.c glm53.c glm53_cuda.h backend_cuda_lifetime.h segment_runtime.c segment_adapter_internal.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
