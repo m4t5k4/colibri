@@ -94,6 +94,8 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaEventSynchronize     hipEventSynchronize
 #define cudaEventElapsedTime     hipEventElapsedTime
 #define cudaMallocHost           hipHostMalloc
+#define cudaHostAlloc            hipHostMalloc
+#define cudaHostAllocPortable    hipHostMallocPortable
 #define cudaFreeHost             hipHostFree
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define cudaMemcpyPeer           hipMemcpyPeer

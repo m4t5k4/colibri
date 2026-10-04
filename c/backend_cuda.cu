@@ -2922,6 +2922,15 @@ extern "C" void *coli_cuda_pipe_alloc(int device,size_t bytes){
     if(!cuda_ok(cudaMalloc(&p,bytes),"pipe alloc")) return NULL;
     return p;
 }
+extern "C" void *coli_cuda_host_alloc(size_t bytes){
+    if (!bytes || !g_nctx || !select_ctx(&g_ctx[0])) return NULL;
+    void *p = NULL;
+    if (!cuda_ok(cudaHostAlloc(&p, bytes, cudaHostAllocPortable), "portable pinned allocation")) return NULL;
+    return p;
+}
+extern "C" void coli_cuda_host_free(void *p){
+    if (p) (void)cuda_ok(cudaFreeHost(p), "portable pinned free");
+}
 extern "C" void coli_cuda_pipe_free(int device,void *p){
     DeviceContext *ctx=find_ctx(device); if(!p||!select_ctx(ctx)) return;
     cudaFree(p);

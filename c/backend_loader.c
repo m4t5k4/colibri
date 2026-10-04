@@ -134,6 +134,8 @@ typedef int (*fn_attention_project_batch_dev)(ColiCudaTensor *kv_b,ColiCudaTenso
 typedef int (*fn_attention_project_batch_dev_out)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale);
 typedef int (*fn_pipe_add)(int device,float *x_dev,const float *t_dev,size_t n);
 typedef void * (*fn_pipe_alloc)(int device,size_t bytes);
+typedef void * (*fn_host_alloc)(size_t bytes);
+typedef void (*fn_host_free)(void *p);
 typedef int (*fn_pipe_copy2d)(int device,float *dst,int dpitch,const float *src, int spitch,int width,int height);
 typedef int (*fn_pipe_download)(int device,const void *src,void *dst,size_t bytes);
 typedef void (*fn_pipe_free)(int device,void *p);
@@ -208,6 +210,8 @@ static struct {
     fn_attention_project_batch_dev_out attention_project_batch_dev_out;
     fn_pipe_add pipe_add;
     fn_pipe_alloc pipe_alloc;
+    fn_host_alloc host_alloc;
+    fn_host_free host_free;
     fn_pipe_copy2d pipe_copy2d;
     fn_pipe_download pipe_download;
     fn_pipe_free pipe_free;
@@ -1476,6 +1480,8 @@ static int coli_cuda_load(void){
     RESOLVE(attention_project_batch_dev_out, fn_attention_project_batch_dev_out)
     RESOLVE(pipe_add, fn_pipe_add)
     RESOLVE(pipe_alloc, fn_pipe_alloc)
+    RESOLVE_OPT(host_alloc, fn_host_alloc)
+    RESOLVE_OPT(host_free, fn_host_free)
     RESOLVE(pipe_copy2d, fn_pipe_copy2d)
     RESOLVE(pipe_download, fn_pipe_download)
     RESOLVE(pipe_free, fn_pipe_free)
@@ -1799,6 +1805,14 @@ int coli_cuda_pipe_add(int device,float *x_dev,const float *t_dev,size_t n){
 void * coli_cuda_pipe_alloc(int device,size_t bytes){
     if(!g_cuda.available){ return NULL; }
     return g_cuda.pipe_alloc(device, bytes);
+}
+/* Keep old DLLs usable: transport requires both optional pinned exports. */
+void *coli_cuda_host_alloc(size_t bytes){
+    if (!bytes || !g_cuda.available || !g_cuda.host_alloc || !g_cuda.host_free) return NULL;
+    return g_cuda.host_alloc(bytes);
+}
+void coli_cuda_host_free(void *p){
+    if (p && g_cuda.available && g_cuda.host_free) g_cuda.host_free(p);
 }
 
 int coli_cuda_pipe_copy2d(int device,float *dst,int dpitch,const float *src, int spitch,int width,int height){
