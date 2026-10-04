@@ -54,5 +54,25 @@ class StageSource(unittest.TestCase):
             self.assertIn("coli_cuda_pipe_" + operation, header)
             self.assertIn("coli_cuda_pipe_" + operation, loader)
 
+    def test_pinned_handoff_contract(self):
+        source = (ROOT / "glm53_cuda.h").read_text()
+        transport = source[source.index("} ColiGlm53CudaHandoff;"):]
+        self.assertNotIn("cudaMemcpyPeer", transport)
+        self.assertNotIn("coli_cuda_pipe_peer_copy", transport)
+        self.assertNotIn("malloc(", transport)
+        self.assertNotIn("cudaStream", transport)
+        self.assertLess(transport.index("coli_cuda_host_free"), transport.index("coli_cuda_release"))
+        copy = transport[transport.index("static inline int coli_glm53_cuda_handoff("):]
+        self.assertLess(copy.index("coli_glm53_cuda_stage_download"), copy.index("coli_glm53_cuda_stage_upload"))
+        self.assertNotIn("alloc(", copy)
+        backend = (ROOT / "backend_cuda.cu").read_text()
+        self.assertIn("cudaHostAllocPortable", backend)
+        pinned = backend[backend.index('extern "C" void *coli_cuda_host_alloc'):
+                         backend.index('extern "C" void coli_cuda_pipe_free')]
+        self.assertIn("cudaFreeHost", pinned)
+        live = (ROOT / "tests/test_glm53_cuda_stage_live.cu").read_text()
+        self.assertIn("cudaMemoryTypeHost", live)
+        self.assertIn("coli_glm53_cuda_handoff", live)
+
 if __name__ == "__main__":
     unittest.main()
