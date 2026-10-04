@@ -298,6 +298,20 @@ COLI_CUDA_DLLEXPORT void *coli_cuda_host_alloc(size_t bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_host_free(void *p);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes);
+/* One recurrence-only token. ALL numeric buffers are non-overlapping device
+ * pointers on device: state [H][KD][VD] read/write, out/v [H][VD], q/k/decay
+ * [H][KD], beta [H]. Inputs are post-conv/SiLU and resolved log-decay/beta.
+ * Float L2 norms include norm_eps inside sqrt; q also scales by KD^-0.5.
+ * Decay precedes prediction; correction precedes raw output. No output norm,
+ * gate, transfers, allocation, synchronization or ownership changes.
+ * Requires a live context, 1<=H<=65535, 1<=KD,VD<=256, finite norm_eps>0.
+ * Success means launch accepted, not completion: use pipe_sync/download.
+ * Pre-launch validation/injected failure preserves state/out. An asynchronous
+ * execution failure may leave state/out changed; recovery is caller policy. */
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_kda_recur(int device,
+        float *state_dev, float *out_dev, const float *q_dev, const float *k_dev,
+        const float *v_dev, const float *log_decay_dev, const float *beta_dev,
+        int heads, int kdim, int vdim, float norm_eps);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rmsnorm(int device,float *y_dev,const float *x_dev,
                            const float *w_dev,int S,int D,float eps);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rope(int device,float *v_dev,const int *pos_dev,int rows,
