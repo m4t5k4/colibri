@@ -94,6 +94,7 @@ static int g_vk_dense = 0;  /* the resident matrices run there (coli_vk_dense_de
 #include "serve_poll.h"          /* CANCEL a meta' turno (#1332) */
 #include "route_trace.h"
 #include "decode_batch.h"   /* coli_submit_ext, coli_logprob_tail: canale logprobs */
+#include "glm53_cuda.h"     /* session mirrors borrow the Segment stage lease */
 #include "pin_pool.h"       /* piu scatti annidati dello stato */
 #include <time.h>
 #ifndef _WIN32
@@ -697,6 +698,7 @@ typedef struct {
 typedef struct {
     float *kda_state;                     /* [teste * k * v] */
     float *kda_window;                    /* [3 * proiezione * kernel] */
+    ColiGlm53CudaKdaLayer cuda_kda;
     float *latent;                        /* [cap][kv_lora]: MLA assorbita */
     float *ikeys, *igates;                /* [cap][dim indexer] */
 } GLayerState;
@@ -704,6 +706,7 @@ typedef struct {
 typedef struct {
     GLayerState *layer;
     float *kda_scratch;
+    const ColiGlm53CudaStage *cuda_stage;   /* borrowed; NULL for unplanned sessions */
     int filled;                           /* posizioni gia' in cache */
     int cap;
 } GSession;
@@ -738,6 +741,27 @@ typedef struct {
     ColiVisionTower vision;
     ColiVisionBlock *vblocks;
 } GModel;
+
+/* Unlocked coherence seam. Segment callers hold the existing engine run_lock;
+ * CLI/serve sessions have no CUDA attachment and keep their existing behavior. */
+static int glm53_kda_ensure_host(const GModel *m, const GSession *s) {
+#ifdef COLI_SEGMENT_ADAPTER
+    if (!s->cuda_stage) return 1;
+    for (int i = m->layer_begin; i < m->layer_end; i++) {
+        GLayerState *st = &s->layer[i];
+        if (!m->c.is_full[i] && !coli_glm53_cuda_kda_ensure_host(s->cuda_stage,
+                &st->cuda_kda, st->kda_state, st->kda_window)) return 0;
+    }
+#else
+    (void)m; (void)s; /* CLI builds need no new CUDA backend linkage. */
+#endif
+    return 1;
+}
+static void glm53_kda_host_written(const GModel *m, GSession *s) {
+    if (!s->cuda_stage) return;
+    for (int i = m->layer_begin; i < m->layer_end; i++)
+        if (!m->c.is_full[i]) coli_glm53_cuda_kda_host_written(&s->layer[i].cuda_kda);
+}
 #ifdef COLI_VULKAN
 static void glm53_vk_report(const GModel *m, const char *scope);   /* the [VK] lines of a run or turn */
 /* the dense chain (glm53_chain.h): the session's KDA state between the host and the device */
@@ -2788,10 +2812,42 @@ static GSession *session_open(const GModel *m, int cap) {
     return s;
 }
 
+/* Config and absolute host slots are authoritative. A failed attachment rolls
+ * back only this session; it never acquires/releases the parent's lease. */
+#ifdef COLI_SEGMENT_ADAPTER
+static int glm53_kda_attach(const GModel *m, GSession *s,
+                            const ColiGlm53CudaStage *stage) {
+    if (!stage->lease_live) return 1;
+    if (s->cuda_stage) return 0;
+    const Cfg *c = &m->c;
+    s->cuda_stage = stage;
+    for (int i = m->layer_begin; i < m->layer_end; i++) {
+        GLayerState *st = &s->layer[i];
+        if (c->is_full[i]) continue;
+        if (!st->kda_state || !st->kda_window || c->kda_heads < 1 ||
+            c->kda_hd < 1 || c->kda_proj < 1 || c->conv_k < 1 ||
+            !coli_glm53_cuda_kda_open(stage, &st->cuda_kda,
+                (size_t)c->kda_heads, (size_t)c->kda_hd,
+                (size_t)c->kda_proj, (size_t)c->conv_k)) {
+            for (int j = m->layer_begin; j < m->layer_end; j++)
+                coli_glm53_cuda_kda_close(stage, &s->layer[j].cuda_kda);
+            s->cuda_stage = NULL;
+            return 0;
+        }
+    }
+    return 1;
+}
+#endif
 static void session_close(const GModel *m, GSession *s) {
     if (!s) return;
 #ifdef COLI_VULKAN
     g53c_session_gone(s);   /* the dense chain's copy of its state goes with it */
+#endif
+    /* All CUDA frees precede host cleanup, under the borrowed stage lease. */
+#ifdef COLI_SEGMENT_ADAPTER
+    if (s->cuda_stage)
+        for (int i = 0; i < m->c.n_layers; i++)
+            coli_glm53_cuda_kda_close(s->cuda_stage, &s->layer[i].cuda_kda);
 #endif
     /* Non-owned slots are NULL, so the absolute-indexed table is safe to scan. */
     for (int i = 0; i < m->c.n_layers; i++) {
@@ -2827,6 +2883,7 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
         g53c_cpu_step(m, s, start);
     }
 #endif
+    if (!glm53_kda_ensure_host(m, s)) return NULL;
     float *collapsed = malloc((size_t)n * D * sizeof(float));
     float *normed = malloc((size_t)n * D * sizeof(float));
     float *branch = malloc((size_t)n * D * sizeof(float));
@@ -2856,8 +2913,11 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                  * conversazione, e azzerarlo qui vorrebbe dire ricominciare
                  * la ricorrenza a ogni token generato. */
                 if (c->is_full[i]) mla_layer(c, l, normed, n, branch, st, start);
-                else kda_layer(c, l, normed, n, branch, st->kda_state, st->kda_window,
-                               s->kda_scratch);
+                else {
+                    kda_layer(c, l, normed, n, branch, st->kda_state, st->kda_window,
+                              s->kda_scratch);
+                    coli_glm53_cuda_kda_host_written(&st->cuda_kda);
+                }
             } else {
                 ffn_layer(m, l, i, normed, n, branch);
             }
@@ -3410,6 +3470,7 @@ static int slot_pin_save(const GModel *m, KVSlot *slot, const int *tokens, int n
                          const float *logit) {
     const Cfg *c = &m->c;
     if (!slot->session || n < 1 || !logit) return 0;
+    if (!glm53_kda_ensure_host(m, slot->session)) return 0;
     /* Sessione nuova: gli scatti vecchi parlano di righe DSA che non esistono
      * piu, e rimetterli risponderebbe da posizioni inventate, in silenzio. */
     if (slot->pin_session != slot->session) slot_pin_drop(m, slot);
@@ -3474,6 +3535,7 @@ static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, in
                 memcpy(ls->kda_state,  st->state[i],  ns * sizeof(float));
                 memcpy(ls->kda_window, st->window[i], nw * sizeof(float));
             }
+            glm53_kda_host_written(m, slot->session);
 #ifdef COLI_VULKAN
             g53c_host_wrote(slot->session);   /* the dense chain's copy goes up again */
 #endif
@@ -3492,6 +3554,7 @@ static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, in
  * 64x128x128 piu' la finestra della convoluzione. */
 static int glm53_state_capture(const GModel *m, Glm53PinState **into, const GSession *s) {
     const Cfg *c = &m->c;
+    if (!glm53_kda_ensure_host(m, s)) return 0;
 #ifdef COLI_VULKAN
     g53c_sync_host(m, s);   /* the dense chain may hold the newest state */
 #endif
@@ -3533,6 +3596,7 @@ static void glm53_state_restore(const GModel *m, const Glm53PinState *st, GSessi
         memcpy(s->layer[i].kda_state,  st->state[i],  ns * sizeof(float));
         memcpy(s->layer[i].kda_window, st->window[i], nw * sizeof(float));
     }
+    glm53_kda_host_written(m, s);
 }
 
 static void slot_reset(const GModel *m, KVSlot *slot) {
@@ -4610,7 +4674,6 @@ int main(int argc, char **argv) {
 #include <pthread.h>
 #include "segment_runtime.h"
 #include "segment_adapters.h"
-#include "glm53_cuda.h"
 #include "segment_adapter_internal.h"
 
 typedef struct {
@@ -4746,7 +4809,16 @@ static int glm53_segment_session_create(void *engine_impl, void **session_impl,
                               ? options->context_tokens : engine->context_tokens;
     if (session->context_tokens > engine->context_tokens)
         session->context_tokens = engine->context_tokens;
+    pthread_mutex_lock(&engine->run_lock);
     session->session = session_open(&engine->model, (int)session->context_tokens);
+    if (!glm53_kda_attach(&engine->model, session->session, &engine->cuda_stage)) {
+        session_close(&engine->model, session->session);
+        pthread_mutex_unlock(&engine->run_lock);
+        free(session);
+        return coli_segment_adapter_error(error, error_size,
+            "GLM-5.3 CUDA session KDA allocation/geometry failed");
+    }
+    pthread_mutex_unlock(&engine->run_lock);
     session->position = 0;
     *session_impl = session;
     return 0;
@@ -4755,11 +4827,13 @@ static int glm53_segment_session_create(void *engine_impl, void **session_impl,
 static void glm53_segment_session_destroy(void *session_impl) {
     Glm53SegmentSession *session = (Glm53SegmentSession *)session_impl;
     if (!session) return;
+    pthread_mutex_lock(&session->engine->run_lock);
     session_close(&session->engine->model, session->session);
+    pthread_mutex_unlock(&session->engine->run_lock);
     free(session);
 }
 
-static int glm53_segment_session_run(void *session_impl,
+static int glm53_segment_session_run_unlocked(void *session_impl,
                                      const ColiSegmentRunRequest *request,
                                      char *error, size_t error_size) {
     Glm53SegmentSession *session = (Glm53SegmentSession *)session_impl;
@@ -4795,12 +4869,15 @@ static int glm53_segment_session_run(void *session_impl,
     }
     memcpy(streams, request->input, cells * sizeof(float));
 
-    pthread_mutex_lock(&engine->run_lock);
     float *result = run_layers(&engine->model, session->session, streams, next,
                                (int)request->rows, (int)session->position,
                                (int)engine->layer_begin, (int)engine->layer_end);
+    if (!result) {
+        free(streams); free(next);
+        return coli_segment_adapter_error(error, error_size,
+            "GLM-5.3 CUDA KDA host synchronization failed");
+    }
     session->session->filled = (int)(session->position + request->rows);
-    pthread_mutex_unlock(&engine->run_lock);
 
     memcpy(request->output, result, cells * sizeof(float));
     free(streams); free(next);
@@ -4808,7 +4885,7 @@ static int glm53_segment_session_run(void *session_impl,
     return 0;
 }
 
-static int glm53_segment_session_snapshot(void *session_impl,
+static int glm53_segment_session_snapshot_unlocked(void *session_impl,
                                           ColiSegmentWriteFn write_fn,
                                           void *write_user_data,
                                           char *error, size_t error_size) {
@@ -4816,6 +4893,9 @@ static int glm53_segment_session_snapshot(void *session_impl,
     if (!session || !write_fn)
         return coli_segment_adapter_error(error, error_size,
                                           "GLM-5.3 Segment snapshot needs a sink");
+    if (!glm53_kda_ensure_host(&session->engine->model, session->session))
+        return coli_segment_adapter_error(error, error_size,
+            "GLM-5.3 CUDA KDA snapshot synchronization failed");
     ColiSegmentStateSpan spans[GLM53_SEGMENT_MAX_SPANS];
     const size_t count = glm53_segment_spans(session->engine, session, spans,
                                              GLM53_SEGMENT_MAX_SPANS);
@@ -4836,7 +4916,7 @@ static int glm53_segment_session_snapshot(void *session_impl,
                                     error, error_size);
 }
 
-static int glm53_segment_session_restore(void *session_impl,
+static int glm53_segment_session_restore_unlocked(void *session_impl,
                                          ColiSegmentReadFn read_fn,
                                          void *read_user_data,
                                          char *error, size_t error_size) {
@@ -4864,11 +4944,41 @@ static int glm53_segment_session_restore(void *session_impl,
     if (coli_segment_spans_restore(spans, count, header.payload_hash, read_fn,
                                    read_user_data, error, error_size))
         return -1;
+    glm53_kda_host_written(&session->engine->model, session->session);
     session->position = header.position;
     session->session->filled = (int)header.position;
     return 0;
 }
 
+/* These wrappers own the lock; coherence/run_layers helpers never lock again.
+ * Snapshot stream callbacks must not re-enter this engine's state operations. */
+static int glm53_segment_session_run(void *impl, const ColiSegmentRunRequest *request,
+                                     char *error, size_t error_size) {
+    Glm53SegmentSession *s = impl;
+    if (!s) return coli_segment_adapter_error(error, error_size, "GLM-5.3 session required");
+    pthread_mutex_lock(&s->engine->run_lock);
+    int result = glm53_segment_session_run_unlocked(impl, request, error, error_size);
+    pthread_mutex_unlock(&s->engine->run_lock);
+    return result;
+}
+static int glm53_segment_session_snapshot(void *impl, ColiSegmentWriteFn write_fn,
+        void *user, char *error, size_t error_size) {
+    Glm53SegmentSession *s = impl;
+    if (!s) return coli_segment_adapter_error(error, error_size, "GLM-5.3 session required");
+    pthread_mutex_lock(&s->engine->run_lock);
+    int result = glm53_segment_session_snapshot_unlocked(impl, write_fn, user, error, error_size);
+    pthread_mutex_unlock(&s->engine->run_lock);
+    return result;
+}
+static int glm53_segment_session_restore(void *impl, ColiSegmentReadFn read_fn,
+        void *user, char *error, size_t error_size) {
+    Glm53SegmentSession *s = impl;
+    if (!s) return coli_segment_adapter_error(error, error_size, "GLM-5.3 session required");
+    pthread_mutex_lock(&s->engine->run_lock);
+    int result = glm53_segment_session_restore_unlocked(impl, read_fn, user, error, error_size);
+    pthread_mutex_unlock(&s->engine->run_lock);
+    return result;
+}
 static const ColiSegmentAdapter glm53_segment_adapter = {
     sizeof(ColiSegmentAdapter), COLI_SEGMENT_ABI_VERSION, "glm53",
     glm53_segment_engine_open, glm53_segment_engine_destroy,
