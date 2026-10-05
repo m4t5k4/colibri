@@ -674,6 +674,7 @@ typedef struct {
     /* KDA */
     Mat kq, kk, kv, ko, kga, kgb, kfa, kfb, kb;
     const float *conv, *dt, *alog, *onorm;
+    ColiGlm53CudaKdaWeights cuda_kda_weights; /* immutable, model/layer lifetime */
     /* MLA + indexer */
     Mat qa, qb, kva, kvb_kt, kvb_v, o, iwq, iwk, iwp, ikpg;
     const float *qa_ln, *kva_ln, *ik_nw, *ik_nb, *ikpa;
@@ -1279,7 +1280,8 @@ static int kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         size_t db, wb, sb, pair_wb;
         if (H < 1 || D < 1 || P < 1 || c->conv_k < 1 ||
             !coli_glm53_cuda_stage_live(s->cuda_stage) ||
-            !s->kda_staging.device || !s->kda_staging.next_window ||
+            !s->kda_staging.device || !l->cuda_kda_weights.conv ||
+            l->cuda_kda_weights.cuda_device_ordinal != s->cuda_stage->cuda_device_ordinal ||
             !coli_glm53_cuda_kda_geometry((size_t)H, (size_t)D, (size_t)P,
                 (size_t)c->conv_k, &sb, &pair_wb) ||
             !coli_glm53_cuda_kda_staging_geometry((size_t)H, (size_t)D, (size_t)P,
@@ -1287,6 +1289,7 @@ static int kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
             s->kda_staging.device_bytes != db || s->kda_staging.window_bytes != wb ||
             s->kda_staging.proj_bytes != (size_t)P * sizeof(float) ||
             st->cuda_kda.state_bytes != sb || st->cuda_kda.window_bytes != pair_wb ||
+            l->cuda_kda_weights.bytes != pair_wb ||
             !coli_glm53_cuda_kda_prepare(s->cuda_stage, &st->cuda_kda, state, window)) goto coherence_fail;
     } else
     if (s->cuda_stage && !coli_glm53_cuda_kda_ensure_host(s->cuda_stage,
@@ -1333,10 +1336,8 @@ static int kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         memcpy(qkv + P, k + t * P, (size_t)P * sizeof(float));
         memcpy(qkv + 2 * P, v + t * P, (size_t)P * sizeof(float));
         if (gpu) {
-            memcpy(s->kda_staging.next_window, window, s->kda_staging.window_bytes);
-            glm53_kda_shortconv(scratch, s->kda_staging.next_window, qkv, l->conv, P, c->conv_k);
-            if (!coli_glm53_cuda_kda_recur(s->cuda_stage, &st->cuda_kda,
-                    &s->kda_staging, window, scratch, dk, bt, core, H, D)) {
+            if (!coli_glm53_cuda_kda_decode(s->cuda_stage, &st->cuda_kda,
+                    &l->cuda_kda_weights, &s->kda_staging, qkv, dk, bt, core, H, D, c->conv_k)) {
                 s->kda_error = st->cuda_kda.authority == G53_KDA_UNKNOWN
                     ? "GLM-5.3 CUDA KDA state became indeterminate"
                     : "GLM-5.3 CUDA KDA recurrence failed before mutation";
@@ -2884,6 +2885,23 @@ static GSession *session_open(const GModel *m, int cap) {
 /* Config and absolute host slots are authoritative. A failed attachment rolls
  * back only this session; it never acquires/releases the parent's lease. */
 #ifdef COLI_SEGMENT_ADAPTER
+/* Immutable range-local weights are created once before any session exists. */
+static int glm53_kda_weights_open(GModel *m, const ColiGlm53CudaStage *stage) {
+    if (!stage->lease_live) return 1;
+    const Cfg *c = &m->c;
+    for (int i = m->layer_begin; i < m->layer_end; i++) {
+        if (c->is_full[i]) continue;
+        if (!m->layer || c->kda_heads < 1 || c->kda_hd < 1 || c->kda_proj < 1 || c->conv_k < 1 ||
+            !coli_glm53_cuda_kda_weights_open(stage, &m->layer[i].cuda_kda_weights,
+                m->layer[i].conv, (size_t)c->kda_heads, (size_t)c->kda_hd,
+                (size_t)c->kda_proj, (size_t)c->conv_k)) {
+            if (m->layer) for (int j = m->layer_begin; j < m->layer_end; j++)
+                coli_glm53_cuda_kda_weights_close(&m->layer[j].cuda_kda_weights);
+            return 0;
+        }
+    }
+    return 1;
+}
 static int glm53_kda_attach(const GModel *m, GSession *s,
                             const ColiGlm53CudaStage *stage) {
     if (!stage->lease_live) return 1;
@@ -3079,6 +3097,9 @@ static void model_release(GModel *m) {
     if (m->layer) {
         for (int i = m->layer_begin; i < m->layer_end; i++) {
             GLayer *l = &m->layer[i];
+#ifdef COLI_SEGMENT_ADAPTER
+            coli_glm53_cuda_kda_weights_close(&l->cuda_kda_weights);
+#endif
             Mat *mats[] = { &l->kq, &l->kk, &l->kv, &l->ko, &l->kga, &l->kgb,
                             &l->kfa, &l->kfb, &l->kb, &l->qa, &l->qb, &l->kva,
                             &l->kvb_kt, &l->kvb_v, &l->o, &l->iwq, &l->iwk,
@@ -4879,6 +4900,13 @@ static int glm53_segment_engine_open(void **engine_impl,
         free(engine);
         return coli_segment_adapter_error(error, error_size,
             "GLM-5.3 CUDA stage activation allocation/geometry failed");
+    }
+    if (!glm53_kda_weights_open(&engine->model, &engine->cuda_stage)) {
+        model_release(&engine->model);
+        coli_glm53_cuda_stage_close(&engine->cuda_stage);
+        free(engine);
+        return coli_segment_adapter_error(error, error_size,
+            "GLM-5.3 CUDA KDA convolution allocation/upload/geometry failed");
     }
     engine->layer_begin = (uint32_t)engine->model.layer_begin;
     engine->layer_end = (uint32_t)engine->model.layer_end;
