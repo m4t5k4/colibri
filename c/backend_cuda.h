@@ -309,6 +309,19 @@ COLI_CUDA_DLLEXPORT void *coli_cuda_host_alloc(size_t bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_host_free(void *p);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes);
+/* One token of causal depthwise ShortConv + SiLU. ALL numeric pointers are
+ * non-overlapping DEVICE buffers on physical ordinal device. window/conv_w
+ * [channels][kernel], mixed/qkv [channels]. Window is FULL K samples per
+ * channel, oldest first: shift, append qkv at K-1, then increasing-tap sum.
+ * Mutates window and writes mixed; K=1 is supported. Caller owns every buffer.
+ * Requires positive channels/kernel and size_t-safe channels*kernel*sizeof(float).
+ * No allocation, transfers, synchronization or lifetime ownership changes.
+ * Success means launch accepted, not completion: use pipe_sync/download.
+ * Pre-launch validation/injected failure preserves window/mixed. Async execution
+ * failure may leave either changed; recovery is caller responsibility. */
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_kda_shortconv(int device,
+        float *window_dev, float *mixed_dev, const float *qkv_dev,
+        const float *conv_w_dev, int channels, int kernel);
 /* One recurrence-only token. ALL numeric buffers are non-overlapping device
  * pointers on device: state [H][KD][VD] read/write, out/v [H][VD], q/k/decay
  * [H][KD], beta [H]. Inputs are post-conv/SiLU and resolved log-decay/beta.
