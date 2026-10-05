@@ -158,9 +158,10 @@ int main(void) {
             return text[text.index("/* Recurrence only; caller owns every device buffer."):
                         text.index('extern "C" int coli_cuda_pipe_rmsnorm(')]
         self.assertEqual(recur(current), recur(original))
-        for path in ("glm53.c", "glm53_cuda.h", "delta_attention.h"):
-            self.assertEqual((ROOT / path).read_text(), base(path), path)
-            self.assertNotIn("coli_cuda_pipe_kda_shortconv", (ROOT / path).read_text())
+        self.assertEqual((ROOT / "delta_attention.h").read_text(), base("delta_attention.h"))
+        integration = (ROOT / "glm53_cuda.h").read_text()
+        self.assertIn("coli_cuda_pipe_kda_shortconv(owner,", integration)
+        self.assertNotIn("coli_cuda_dn_", integration)
         for path in ("test_cuda_kda_recur_ref.c", "cuda_kda_recur_ref.h",
                      "test_cuda_kda_recur_source.py", "test_cuda_kda_recur_live.cu"):
             self.assertEqual((ROOT / "tests" / path).read_text(), base("tests/" + path), path)

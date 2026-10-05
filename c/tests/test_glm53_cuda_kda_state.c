@@ -8,11 +8,16 @@
 #include "../backend_cuda_lifetime.h"
 #include <assert.h>
 #include "cuda_kda_recur_ref.h"
+#include "cuda_kda_shortconv_ref.h"
 
 static ColiCudaLifetime lifetime;
 static int inits, shutdowns, allocs, frees, uploads, downloads, acquires;
 static int fail_alloc_at, fail_upload_at, fail_download_at, live;
-static int recurrence_calls, sync_calls, fail_recurrence, fail_sync;
+static int recurrence_calls, shortconv_calls, sync_calls, fail_recurrence, fail_shortconv, fail_sync;
+static int fail_recurrence_at, synthetic_numeric;
+static size_t upload_bytes, download_bytes;
+static Glm53SegmentEngine *watch_engine;
+static float reference_state[18], reference_window[72], reference_core[6];
 static GSession *watch_session;
 static ColiGlm53CudaKdaLayer *watch_layer;
 typedef struct { void *p; size_t bytes; int owner; } Buffer;
@@ -65,20 +70,46 @@ void coli_cuda_pipe_free(int owner, void *p) {
     free(p); memset(b, 0, sizeof(*b)); live--; frees++;
 }
 int coli_cuda_pipe_upload(int owner, void *dst, const void *src, size_t bytes) {
-    find(owner, dst, bytes); uploads++; event('U', owner, dst, bytes);
-    if (watch_session && watch_layer && dst == watch_layer->window)
-        assert(watch_layer->authority == G53_KDA_UNKNOWN);
+    find(owner, dst, bytes); uploads++; upload_bytes+=bytes; event('U', owner, dst, bytes);
+    if (watch_session) for (int i=0; i<32; i++)
+        if (dst==watch_session->layer[i].cuda_kda.state || dst==watch_session->layer[i].cuda_kda.window)
+            assert(watch_session->layer[i].cuda_kda.authority==G53_KDA_HOST);
     if (uploads == fail_upload_at) return 0;
     memcpy(dst, src, bytes); return 1;
 }
 int coli_cuda_pipe_download(int owner, const void *src, void *dst, size_t bytes) {
-    find(owner, src, bytes); downloads++; event('D', owner, src, bytes);
+    find(owner, src, bytes); downloads++; download_bytes+=bytes; event('D', owner, src, bytes);
     if (watch_session && watch_layer && src == watch_session->kda_staging.raw_out)
         assert(watch_layer->authority == G53_KDA_UNKNOWN);
     if (downloads == fail_download_at) return 0;
     memcpy(dst, src, bytes); return 1;
 }
 
+int coli_cuda_pipe_kda_shortconv(int owner, float *window, float *mixed,
+        const float *qkv, const float *conv, int channels, int kernel) {
+    shortconv_calls++; event('C',owner,window,(size_t)channels*kernel*sizeof(float));
+    find(owner,window,(size_t)channels*kernel*sizeof(float));
+    find(owner,conv,(size_t)channels*kernel*sizeof(float));
+    find(owner,mixed,(size_t)channels*sizeof(float));find(owner,qkv,(size_t)channels*sizeof(float));
+    watch_layer=NULL;
+    if (watch_session) for (int i=0; i<32; i++) if (watch_session->layer[i].cuda_kda.window==window) {
+        watch_layer=&watch_session->layer[i].cuda_kda;
+        assert(watch_engine && watch_engine->model.layer[i].cuda_kda_weights.conv==conv);
+        assert(watch_layer->authority==G53_KDA_BOTH || watch_layer->authority==G53_KDA_DEVICE);
+        assert(mixed==watch_session->kda_staging.mixed_qkv && qkv==watch_session->kda_staging.projected_qkv);
+    }
+    if (fail_shortconv) return 0;
+    if (watch_session) {
+        assert(watch_layer && channels==18 && kernel==4);
+        memcpy(reference_state,watch_layer->state,72);memcpy(reference_window,window,288);
+        int n=coli_kda_scratch_floats(2,3,3);float scratch[n];
+        assert(!coli_kda_step(reference_core,reference_state,reference_window,qkv,conv,
+            watch_session->kda_staging.decay,watch_session->kda_staging.beta,2,3,3,kernel,1e-6f,scratch));
+    }
+    kda_shortconv_ref(window,mixed,qkv,conv,channels,kernel);
+    if (watch_session) assert(!memcmp(window,reference_window,288));
+    return 1;
+}
 int coli_cuda_pipe_kda_recur(int owner, float *st, float *out,
         const float *q, const float *k, const float *v, const float *decay,
         const float *beta, int h, int kd, int vd, float eps) {
@@ -87,11 +118,16 @@ int coli_cuda_pipe_kda_recur(int owner, float *st, float *out,
     find(owner,q,(size_t)h*kd*sizeof(float)); find(owner,k,(size_t)h*kd*sizeof(float));
     find(owner,v,(size_t)h*vd*sizeof(float)); find(owner,decay,(size_t)h*kd*sizeof(float));
     find(owner,beta,(size_t)h*sizeof(float));
-    if (fail_recurrence) return 0;
-    watch_layer=NULL;
-    if (watch_session) for (int i=0; i<32; i++)
-        if (watch_session->layer[i].cuda_kda.state==st) watch_layer=&watch_session->layer[i].cuda_kda;
+    if (watch_session) {
+        assert(watch_layer && watch_layer->state==st && watch_layer->authority==G53_KDA_UNKNOWN);
+        assert(q==watch_session->kda_staging.mixed_qkv && k==q+(size_t)h*kd && v==q+2*(size_t)h*kd);
+    }
+    if (fail_recurrence || recurrence_calls==fail_recurrence_at) return 0;
     kda_recur_ref(st,out,q,k,v,decay,beta,h,kd,vd,eps);
+    if (watch_session) {
+        for (int i=0;i<18;i++) assert(fabsf(st[i]-reference_state[i])<=1e-5f*(1.f+fabsf(reference_state[i])));
+        for (int i=0;i<6;i++) assert(fabsf(out[i]-reference_core[i])<=1e-5f*(1.f+fabsf(reference_core[i])));
+    }
     return 1;
 }
 int coli_cuda_pipe_sync(int owner) {
@@ -115,6 +151,15 @@ static int synthetic_open(void **impl, ColiSegmentCapabilities *caps,
         free(e); return -1;
     }
     if (e->cuda_stage.lease_live) assert(coli_glm53_cuda_stage_wire_create(&e->cuda_stage, 1, 2) == 1);
+    e->model.layer=calloc(32,sizeof(GLayer));assert(e->model.layer);
+    for (int i=e->model.layer_begin; i<e->model.layer_end; i++) if (!e->model.c.is_full[i]) {
+        e->model.layer[i].conv=calloc(72,sizeof(float));assert(e->model.layer[i].conv);
+        if (synthetic_numeric) for (int j=0; j<72; j++)
+            ((float *)e->model.layer[i].conv)[j]=(float)((j*3+i)%11-5)*0.09f;
+    }
+    if (!glm53_kda_weights_open(&e->model,&e->cuda_stage)) {
+        model_release(&e->model);coli_glm53_cuda_stage_close(&e->cuda_stage);free(e);return -1;
+    }
     assert(!pthread_mutex_init(&e->run_lock, NULL));
     *caps = (ColiSegmentCapabilities){.struct_size=sizeof(*caps), .abi_version=COLI_SEGMENT_ABI_VERSION,
         .flags=COLI_SEGMENT_CAP_CPU | COLI_SEGMENT_CAP_MULTI_SESSION | COLI_SEGMENT_CAP_RANGE_NATIVE | COLI_SEGMENT_CAP_SNAPSHOT,
@@ -145,7 +190,7 @@ static GSession *state(ColiSegmentSession *s) { return ((Glm53SegmentSession *)s
 static void fill(float *p, size_t bytes, float value) {
     for (size_t i=0; i<bytes/sizeof(float); i++) p[i] = value + (float)i;
 }
-/* Test-only device mutation seam; no production code marks DEVICE. */
+/* Test-only external device mutation seam for coherence/resource probes. */
 static void device_write(GSession *s, int i, float value) {
     GLayerState *st = &s->layer[i]; ColiGlm53CudaKdaLayer *d = &st->cuda_kda;
     fill(d->state, d->state_bytes, value); fill(d->window, d->window_bytes, value+100);
@@ -303,13 +348,12 @@ static void cpu_run(void) {
     Cfg *c=&ge->model.c;
     c->first_dense=32; c->dense_inter=1; c->hc_iters=1;
     c->eps=c->hc_eps=1e-6f; c->gate_lb=-5.f; c->swiglu_limit=1.f;
-    ge->model.layer=calloc(32,sizeof(GLayer)); assert(ge->model.layer);
     GLayer *l=&ge->model.layer[4];
     l->in_ln=ones(2); l->post_ln=ones(2); l->onorm=ones(3);
     l->hc_attn_fn=calloc(6,sizeof(float)); l->hc_ffn_fn=calloc(6,sizeof(float));
     l->hc_attn_base=calloc(3,sizeof(float)); l->hc_ffn_base=calloc(3,sizeof(float));
     l->hc_attn_scale=calloc(3,sizeof(float)); l->hc_ffn_scale=calloc(3,sizeof(float));
-    l->conv=calloc(72,sizeof(float)); l->dt=calloc(6,sizeof(float)); l->alog=calloc(2,sizeof(float));
+    l->dt=calloc(6,sizeof(float)); l->alog=calloc(2,sizeof(float));
     zero_mat(&l->kq,6,2); zero_mat(&l->kk,6,2); zero_mat(&l->kv,6,2); zero_mat(&l->ko,2,6);
     zero_mat(&l->kfa,3,2); zero_mat(&l->kfb,6,3); zero_mat(&l->kga,3,2); zero_mat(&l->kgb,6,3);
     zero_mat(&l->kb,2,2); zero_mat(&l->dg,1,2); zero_mat(&l->du,1,2); zero_mat(&l->dd,2,1);
