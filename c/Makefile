@@ -3067,11 +3067,11 @@ $(AUTODEP_DEPS): ;
 -include $(wildcard $(AUTODEP_DEPS))
 
 # Ownership metadata and production lifetime bookkeeping; no GPU/toolkit.
-tests/test_glm53_cuda_stage$(EXE): tests/test_glm53_cuda_stage.c glm53.c glm53_cuda.h cuda_device_config.h segment_adapters.h backend_cuda_lifetime.h segment_runtime.c
-	$(CC) $(NOCUDA_CFLAGS) $< segment_runtime.c -o $@ $(NOCUDA_LDFLAGS)
+tests/test_glm53_cuda_stage$(EXE): tests/test_glm53_cuda_stage.c glm53.c glm53_cuda.h cuda_device_config.h segment_adapters.h backend_cuda_lifetime.h segment_runtime.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< segment_runtime.c $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_glm53_cuda_kda_state$(EXE): tests/test_glm53_cuda_kda_state.c glm53.c glm53_cuda.h backend_cuda_lifetime.h segment_runtime.c segment_adapter_internal.h
-	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+tests/test_glm53_cuda_kda_state$(EXE): tests/test_glm53_cuda_kda_state.c glm53.c glm53_cuda.h backend_cuda_lifetime.h segment_runtime.c segment_adapter_internal.h $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 # Recurrence-only oracle: disable contraction for exact scalar CPU order checks.
 tests/test_cuda_kda_recur_ref$(EXE): tests/test_cuda_kda_recur_ref.c
@@ -3082,5 +3082,5 @@ tests/test_cuda_kda_recur_live$(EXE): tests/test_cuda_kda_recur_live.cu tests/cu
 	"$(GPUCC)" $(GPUFLAGS) $< backend_cuda.o -o $@ $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS) -lcublasLt -lcublas
 
 # Production decode integration with an isolated numerical fake backend.
-tests/test_glm53_cuda_kda_recur_integration$(EXE): tests/test_glm53_cuda_kda_recur_integration.c
-	$(CC) $(NOCUDA_CFLAGS) -ffp-contract=off $< -o $@ $(NOCUDA_LDFLAGS)
+tests/test_glm53_cuda_kda_recur_integration$(EXE): tests/test_glm53_cuda_kda_recur_integration.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) -ffp-contract=off $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
