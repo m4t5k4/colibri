@@ -30,7 +30,7 @@ class KdaRecurSource(unittest.TestCase):
         self.assertIn("vdim > 256", entry)
         self.assertIn("SIZE_MAX / sizeof(float)", entry)
 
-    def test_optional_loader_and_no_engine_integration(self):
+    def test_optional_loader_and_shared_backend_boundary(self):
         loader = (ROOT / "backend_loader.c").read_text()
         self.assertIn("RESOLVE_OPT(pipe_kda_recur, fn_pipe_kda_recur)", loader)
         self.assertNotIn("RESOLVE(pipe_kda_recur,", loader)
@@ -38,8 +38,9 @@ class KdaRecurSource(unittest.TestCase):
                          loader.index("int coli_cuda_pipe_rmsnorm(")]
         self.assertIn("!g_cuda.available || !g_cuda.pipe_kda_recur", wrapper)
         self.assertIn("return 0", wrapper)
-        for name in ("glm53.c", "glm53_cuda.h"):
-            self.assertNotIn("coli_cuda_pipe_kda_recur", (ROOT / name).read_text())
+        integration = (ROOT / "glm53_cuda.h").read_text()
+        self.assertIn("coli_cuda_pipe_kda_recur(owner,", integration)
+        self.assertNotIn("coli_cuda_dn_", integration)
         header = (ROOT / "backend_cuda.h").read_text()
         self.assertIn("COLI_CUDA_DLLEXPORT int coli_cuda_pipe_kda_recur", header)
 

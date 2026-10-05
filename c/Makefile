@@ -2978,3 +2978,7 @@ tests/test_cuda_kda_recur_ref$(EXE): tests/test_cuda_kda_recur_ref.c
 # Opt-in numerical CUDA recurrence, no model/checkpoint; enumerate configured ordinals.
 tests/test_cuda_kda_recur_live$(EXE): tests/test_cuda_kda_recur_live.cu tests/cuda_kda_recur_ref.h backend_cuda.o backend_cuda.h cuda_device_config.h
 	"$(GPUCC)" $(GPUFLAGS) $< backend_cuda.o -o $@ $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS) -lcublasLt -lcublas
+
+# Production decode integration with an isolated numerical fake backend.
+tests/test_glm53_cuda_kda_recur_integration$(EXE): tests/test_glm53_cuda_kda_recur_integration.c
+	$(CC) $(NOCUDA_CFLAGS) -ffp-contract=off $< -o $@ $(NOCUDA_LDFLAGS)

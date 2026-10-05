@@ -7,10 +7,14 @@
 #include "../segment_runtime.c"
 #include "../backend_cuda_lifetime.h"
 #include <assert.h>
+#include "cuda_kda_recur_ref.h"
 
 static ColiCudaLifetime lifetime;
 static int inits, shutdowns, allocs, frees, uploads, downloads, acquires;
 static int fail_alloc_at, fail_upload_at, fail_download_at, live;
+static int recurrence_calls, sync_calls, fail_recurrence, fail_sync;
+static GSession *watch_session;
+static ColiGlm53CudaKdaLayer *watch_layer;
 typedef struct { void *p; size_t bytes; int owner; } Buffer;
 static Buffer buffers[128];
 typedef struct { char op; int owner; const void *p; size_t bytes; } Event;
@@ -34,9 +38,12 @@ void coli_cuda_release(void) {
 int coli_cuda_device_count(void) { return lifetime.users ? lifetime.count : 0; }
 int coli_cuda_device_at(int i) { return i >= 0 && i < coli_cuda_device_count() ? lifetime.devices[i] : -1; }
 static Buffer *find(int owner, const void *p, size_t bytes) {
-    for (size_t i = 0; i < 128; i++) if (buffers[i].p == p) {
-        assert(lifetime.users && buffers[i].owner == owner && bytes <= buffers[i].bytes);
-        return &buffers[i];
+    for (size_t i = 0; i < 128; i++) if (buffers[i].p) {
+        uintptr_t start=(uintptr_t)buffers[i].p, at=(uintptr_t)p;
+        if (at >= start && at-start <= buffers[i].bytes) {
+            assert(lifetime.users && buffers[i].owner == owner && bytes <= buffers[i].bytes-(at-start));
+            return &buffers[i];
+        }
     }
     assert(0); return NULL;
 }
@@ -59,13 +66,38 @@ void coli_cuda_pipe_free(int owner, void *p) {
 }
 int coli_cuda_pipe_upload(int owner, void *dst, const void *src, size_t bytes) {
     find(owner, dst, bytes); uploads++; event('U', owner, dst, bytes);
+    if (watch_session && watch_layer && dst == watch_layer->window)
+        assert(watch_layer->authority == G53_KDA_UNKNOWN);
     if (uploads == fail_upload_at) return 0;
     memcpy(dst, src, bytes); return 1;
 }
 int coli_cuda_pipe_download(int owner, const void *src, void *dst, size_t bytes) {
     find(owner, src, bytes); downloads++; event('D', owner, src, bytes);
+    if (watch_session && watch_layer && src == watch_session->kda_staging.raw_out)
+        assert(watch_layer->authority == G53_KDA_UNKNOWN);
     if (downloads == fail_download_at) return 0;
     memcpy(dst, src, bytes); return 1;
+}
+
+int coli_cuda_pipe_kda_recur(int owner, float *st, float *out,
+        const float *q, const float *k, const float *v, const float *decay,
+        const float *beta, int h, int kd, int vd, float eps) {
+    recurrence_calls++; event('K', owner, st, (size_t)h*kd*vd*sizeof(float));
+    find(owner,st,(size_t)h*kd*vd*sizeof(float)); find(owner,out,(size_t)h*vd*sizeof(float));
+    find(owner,q,(size_t)h*kd*sizeof(float)); find(owner,k,(size_t)h*kd*sizeof(float));
+    find(owner,v,(size_t)h*vd*sizeof(float)); find(owner,decay,(size_t)h*kd*sizeof(float));
+    find(owner,beta,(size_t)h*sizeof(float));
+    if (fail_recurrence) return 0;
+    watch_layer=NULL;
+    if (watch_session) for (int i=0; i<32; i++)
+        if (watch_session->layer[i].cuda_kda.state==st) watch_layer=&watch_session->layer[i].cuda_kda;
+    kda_recur_ref(st,out,q,k,v,decay,beta,h,kd,vd,eps);
+    return 1;
+}
+int coli_cuda_pipe_sync(int owner) {
+    sync_calls++; event('Y',owner,NULL,0);
+    if (watch_session) assert(watch_layer && watch_layer->authority==G53_KDA_UNKNOWN);
+    return !fail_sync;
 }
 
 /* Only model loading is replaced: all lifecycle/state callbacks are real. */
@@ -160,7 +192,7 @@ static void range_check(int begin, int end, int owner) {
         assert(sa->layer[i].kda_state[0] == 50 && sa->layer[i].kda_window[0] == 150);
         assert(sb->layer[i].kda_state[0] == 30 && ((float *)db->state)[0] == 30);
     }
-    assert(allocs == before+4*count && acquires == leases);
+    assert(allocs == before+4*count+2*(count>0 && owner>=0) && acquires == leases);
     char error[128]; assert(coli_segment_engine_close(e,error,sizeof(error)) != 0);
     Stream snapshot={.engine=ge};
     assert(!coli_segment_snapshot(a,write_stream,&snapshot,error,sizeof(error)));
@@ -179,7 +211,7 @@ static void failures(void) {
     ColiSegmentEngine *e=engine_open(4,8,4); Glm53SegmentEngine *ge=e->impl;
     ColiSegmentSession *a=create(e); GSession *s=state(a); GLayerState *st=&s->layer[4];
     int existing=live, leases=acquires;
-    for (int n=1; n<=6; n++) { /* every allocation, including later layers */
+    for (int n=1; n<=7; n++) { /* every layer allocation and shared staging block */
         fail_alloc_at=allocs+n; ColiSegmentSession *bad=NULL; char error[128];
         ColiSegmentSessionOptions opts={.struct_size=sizeof(opts), .context_tokens=8};
         assert(coli_segment_session_create(e,&opts,&bad,error,sizeof(error)) != 0 && !bad);
@@ -204,8 +236,8 @@ static void failures(void) {
     Stream snapshot={.engine=ge}; char error[128]; device_write(s,4,66);
     fail_download_at=downloads+2;
     assert(coli_segment_snapshot(a,write_stream,&snapshot,error,sizeof(error)) != 0 && !snapshot.size);
-    float input[2]={0}, output[2]={123,456};
-    ColiSegmentRunRequest run={.struct_size=sizeof(run), .rows=1, .input=input,
+    float input[4]={0}, output[4]={123,456,123,456};
+    ColiSegmentRunRequest run={.struct_size=sizeof(run), .rows=2, .input=input,
         .input_bytes=sizeof(input), .output=output, .output_bytes=sizeof(output)};
     fail_download_at=downloads+1;
     assert(coli_segment_run(a,&run,error,sizeof(error)) != 0);
@@ -282,12 +314,12 @@ static void cpu_run(void) {
     zero_mat(&l->kfa,3,2); zero_mat(&l->kfb,6,3); zero_mat(&l->kga,3,2); zero_mat(&l->kgb,6,3);
     zero_mat(&l->kb,2,2); zero_mat(&l->dg,1,2); zero_mat(&l->du,1,2); zero_mat(&l->dd,2,1);
     ColiSegmentSession *s=create(e); GLayerState *st=&state(s)->layer[4]; device_write(state(s),4,12);
-    float input[2]={1,2},output[2]={0}; char error[128];
-    ColiSegmentRunRequest r={.struct_size=sizeof(r), .rows=1, .input=input,
+    float input[4]={1,2,2,1},output[4]={0}; char error[128];
+    ColiSegmentRunRequest r={.struct_size=sizeof(r), .rows=2, .input=input,
         .input_bytes=sizeof(input), .output=output, .output_bytes=sizeof(output)};
     int u=uploads,d=downloads;
     assert(!coli_segment_run(s,&r,error,sizeof(error)));
-    assert(downloads==d+2 && uploads==u && state(s)->filled==1);
+    assert(downloads==d+2 && uploads==u && state(s)->filled==2);
     assert(st->cuda_kda.authority==G53_KDA_HOST && st->kda_state[0]>0 && st->kda_state[0]<12);
     assert(st->kda_window[3]==0 && ((float *)st->cuda_kda.state)[0]==12);
     assert(isfinite(output[0]) && isfinite(output[1]));
