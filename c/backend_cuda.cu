@@ -2969,6 +2969,38 @@ extern "C" int coli_cuda_pipe_download(int device,const void *src,void *dst,size
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
     return cuda_ok(cudaMemcpy(dst,src,bytes,cudaMemcpyDeviceToHost),"pipe download");
 }
+/* Full-K, oldest-first history: one independent channel per thread.
+ * Shift first, append current, then visit taps in CPU order. */
+__global__ void pipe_kda_shortconv_kernel(float *__restrict__ window,
+        float *__restrict__ mixed, const float *__restrict__ qkv,
+        const float *__restrict__ conv_w, int channels, int kernel) {
+    size_t channel = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= (size_t)channels) return;
+    size_t base = channel * (size_t)kernel;
+    float *history = window + base;
+    for (int tap = 0; tap < kernel - 1; tap++) history[tap] = history[tap + 1];
+    history[kernel - 1] = qkv[channel];
+    float sum = 0.f;
+    for (int tap = 0; tap < kernel; tap++) {
+        /* Separate FP32 multiplication/addition, without global math flags. */
+        volatile float product = conv_w[base + tap] * history[tap];
+        sum += product;
+    }
+    mixed[channel] = sum / (1.f + expf(-sum));
+}
+extern "C" int coli_cuda_pipe_kda_shortconv(int device,
+        float *window_dev, float *mixed_dev, const float *qkv_dev,
+        const float *conv_w_dev, int channels, int kernel) {
+    if (fault_injected()) return 0;
+    if (!window_dev || !mixed_dev || !qkv_dev || !conv_w_dev ||
+        channels < 1 || kernel < 1 ||
+        (size_t)channels > SIZE_MAX / sizeof(float) / (size_t)kernel) return 0;
+    if (!select_ctx(find_ctx(device))) return 0;
+    unsigned blocks = (unsigned)((channels - 1) / 256 + 1);
+    pipe_kda_shortconv_kernel<<<blocks, 256>>>(window_dev, mixed_dev, qkv_dev,
+        conv_w_dev, channels, kernel);
+    return cuda_ok(cudaGetLastError(), "pipe kda shortconv launch");
+}
 /* Recurrence only; caller owns every device buffer. Volatile float products
  * prevent multiply/add contraction without changing global compiler flags or
  * relying on vendor-specific rounding intrinsics. The CPU reference's
