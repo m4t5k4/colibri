@@ -4,6 +4,7 @@
 #include "segment_adapters.h"
 #include "cuda_device_config.h"
 #include <string.h>
+#include <limits.h>
 
 typedef struct {
     int cuda_device_ordinal; /* meaningful only while lease_live is true */
@@ -13,7 +14,8 @@ typedef struct {
 } ColiGlm53CudaStage;
 
 /* Session resources, never part of the stage workspace. The parent stage lease
- * must outlive these buffers. State and window are one coherence unit. */
+ * must outlive these buffers. State and window are one coherence unit.
+ * DEVICE permits BOTH host components to be stale until ensure_host. */
 typedef enum {
     G53_KDA_HOST, G53_KDA_DEVICE, G53_KDA_BOTH, G53_KDA_UNKNOWN
 } ColiGlm53KdaAuthority;
@@ -115,21 +117,54 @@ static inline int coli_glm53_cuda_kda_ensure_host(const ColiGlm53CudaStage *stag
 #endif
 }
 
-/* One session workspace, reused under its engine run_lock. It borrows the
- * stage lease; neither the stage wire nor another session owns these bytes. */
+/* Immutable model/layer weights. Sessions borrow this record, never copy it.
+ * The parent stage lease protects allocation/upload and final engine free. */
 typedef struct {
-    float *device, *q, *k, *v, *decay, *beta, *raw_out;
-    float *next_window;
+    float *conv;
+    size_t bytes;
+    int cuda_device_ordinal;
+} ColiGlm53CudaKdaWeights;
+static inline void coli_glm53_cuda_kda_weights_close(ColiGlm53CudaKdaWeights *weights) {
+#ifdef COLI_CUDA
+    if (weights->conv) coli_cuda_pipe_free(weights->cuda_device_ordinal, weights->conv);
+#endif
+    memset(weights, 0, sizeof(*weights));
+}
+static inline int coli_glm53_cuda_kda_weights_open(const ColiGlm53CudaStage *stage,
+        ColiGlm53CudaKdaWeights *weights, const float *conv, size_t heads,
+        size_t dim, size_t proj, size_t kernel) {
+    size_t sb, wb;
+    if (!stage || !stage->lease_live || stage->cuda_device_ordinal < 0 ||
+        weights->conv || !conv || proj > INT_MAX / 3 ||
+        !coli_glm53_cuda_kda_geometry(heads, dim, proj, kernel, &sb, &wb)) return 0;
+#ifdef COLI_CUDA
+    weights->cuda_device_ordinal = stage->cuda_device_ordinal;
+    weights->conv = (float *)coli_cuda_pipe_alloc(stage->cuda_device_ordinal, wb);
+    if (!weights->conv) return 0;
+    weights->bytes = wb;
+    if (!coli_cuda_pipe_upload(stage->cuda_device_ordinal, weights->conv, conv, wb)) {
+        coli_glm53_cuda_kda_weights_close(weights); return 0;
+    }
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+/* One session device workspace, reused under its engine run_lock. It borrows
+ * the stage lease; neither the stage wire nor another session owns these bytes. */
+typedef struct {
+    float *device, *projected_qkv, *mixed_qkv, *decay, *beta, *raw_out;
     size_t proj_bytes, window_bytes, device_bytes;
 } ColiGlm53CudaKdaStaging;
 static inline int coli_glm53_cuda_kda_staging_geometry(size_t heads, size_t dim,
         size_t proj, size_t kernel, size_t *device_bytes, size_t *window_bytes) {
     size_t state_bytes, floats;
-    if (heads > 65535 || dim > 256 ||
+    if (heads > 65535 || dim > 256 || proj > INT_MAX / 3 ||
         !coli_glm53_cuda_kda_geometry(heads, dim, proj, kernel, &state_bytes, window_bytes) ||
-        !coli_glm53_cuda_size_mul(5, proj, &floats) || heads > SIZE_MAX - floats ||
+        !coli_glm53_cuda_size_mul(8, proj, &floats) || heads > SIZE_MAX - floats ||
         !coli_glm53_cuda_size_mul(floats + heads, sizeof(float), device_bytes)) return 0;
-    return 1; /* q/k/v/decay/raw_out = 5*P; beta = H */
+    return 1; /* projected[3P] + mixed[3P] + decay[P] + beta[H] + raw[P] */
 }
 static inline void coli_glm53_cuda_kda_staging_close(const ColiGlm53CudaStage *stage,
         ColiGlm53CudaKdaStaging *work) {
@@ -138,62 +173,58 @@ static inline void coli_glm53_cuda_kda_staging_close(const ColiGlm53CudaStage *s
 #else
     (void)stage;
 #endif
-    free(work->next_window);
     memset(work, 0, sizeof(*work));
 }
 static inline int coli_glm53_cuda_kda_staging_open(const ColiGlm53CudaStage *stage,
         ColiGlm53CudaKdaStaging *work, size_t heads, size_t dim, size_t proj, size_t kernel) {
     size_t db, wb;
-    if (!stage || !stage->lease_live || stage->cuda_device_ordinal < 0 ||
-        work->device || work->next_window ||
+    if (!stage || !stage->lease_live || stage->cuda_device_ordinal < 0 || work->device ||
         !coli_glm53_cuda_kda_staging_geometry(heads, dim, proj, kernel, &db, &wb)) return 0;
 #ifdef COLI_CUDA
-    work->next_window = (float *)malloc(wb);
-    if (work->next_window) work->device = (float *)coli_cuda_pipe_alloc(stage->cuda_device_ordinal, db);
-    if (!work->device) { coli_glm53_cuda_kda_staging_close(stage, work); return 0; }
+    work->device = (float *)coli_cuda_pipe_alloc(stage->cuda_device_ordinal, db);
+    if (!work->device) return 0;
     work->device_bytes = db; work->window_bytes = wb;
     work->proj_bytes = proj * sizeof(float); /* checked by geometry above */
-    work->q = work->device; work->k = work->q + proj; work->v = work->k + proj;
-    work->decay = work->v + proj; work->beta = work->decay + proj;
+    work->projected_qkv = work->device; work->mixed_qkv = work->projected_qkv + 3*proj;
+    work->decay = work->mixed_qkv + 3*proj; work->beta = work->decay + proj;
     work->raw_out = work->beta + heads;
     return 1;
 #else
     return 0;
 #endif
 }
-/* mixed/decay/beta/core are host buffers; all backend numeric arguments are
- * slices of the persistent device block. Caller has prepared BOTH/DEVICE and
- * computed ShortConv into next_window, leaving the canonical window untouched.
- * A rejected launch preserves valid authority. Accepted mutation is UNKNOWN
- * until completion, output readback and complete window publication succeed. */
-static inline int coli_glm53_cuda_kda_recur(const ColiGlm53CudaStage *stage,
-        ColiGlm53CudaKdaLayer *layer, ColiGlm53CudaKdaStaging *work,
-        float *window, const float *mixed, const float *decay, const float *beta,
-        float *core, int heads, int dim) {
+/* Prepared BOTH/DEVICE pair. Only non-mutating host inputs cross before the
+ * first launch. Accepted ShortConv already advances the canonical device window:
+ * even recurrence rejection must remain UNKNOWN. Both launches use the existing
+ * same-device default pipeline ordering; one final sync proves their completion.
+ * No host window publication: DEVICE leaves both host components stale. */
+static inline int coli_glm53_cuda_kda_decode(const ColiGlm53CudaStage *stage,
+        ColiGlm53CudaKdaLayer *layer, const ColiGlm53CudaKdaWeights *weights,
+        ColiGlm53CudaKdaStaging *work, const float *qkv, const float *decay,
+        const float *beta, float *core, int heads, int dim, int kernel) {
     size_t db, wb;
     if (!stage || !stage->lease_live || !layer->state || !layer->window ||
         (layer->authority != G53_KDA_BOTH && layer->authority != G53_KDA_DEVICE) ||
-        !work->device || !work->next_window || !window || !mixed || !decay || !beta || !core ||
-        heads < 1 || dim < 1 ||
+        !weights || !weights->conv || weights->cuda_device_ordinal != stage->cuda_device_ordinal ||
+        !work->device || !qkv || !decay || !beta || !core || heads < 1 || dim < 1 || kernel < 1 ||
         !coli_glm53_cuda_kda_staging_geometry((size_t)heads, (size_t)dim,
-            work->proj_bytes / sizeof(float), 1, &db, &wb) ||
+            work->proj_bytes / sizeof(float), (size_t)kernel, &db, &wb) ||
         db != work->device_bytes || layer->state_bytes != work->proj_bytes * (size_t)dim ||
-        layer->window_bytes != work->window_bytes) return 0;
+        wb != work->window_bytes || wb != layer->window_bytes || wb != weights->bytes) return 0;
 #ifdef COLI_CUDA
     int owner = stage->cuda_device_ordinal;
     size_t p = work->proj_bytes / sizeof(float);
-    if (!coli_cuda_pipe_upload(owner, work->q, mixed, work->proj_bytes) ||
-        !coli_cuda_pipe_upload(owner, work->k, mixed + p, work->proj_bytes) ||
-        !coli_cuda_pipe_upload(owner, work->v, mixed + 2*p, work->proj_bytes) ||
+    if (!coli_cuda_pipe_upload(owner, work->projected_qkv, qkv, 3*work->proj_bytes) ||
         !coli_cuda_pipe_upload(owner, work->decay, decay, work->proj_bytes) ||
         !coli_cuda_pipe_upload(owner, work->beta, beta, (size_t)heads * sizeof(float))) return 0;
-    if (!coli_cuda_pipe_kda_recur(owner, (float *)layer->state, work->raw_out,
-            work->q, work->k, work->v, work->decay, work->beta, heads, dim, dim, 1e-6f)) return 0;
+    if (!coli_cuda_pipe_kda_shortconv(owner, (float *)layer->window, work->mixed_qkv,
+            work->projected_qkv, weights->conv, (int)(3*p), kernel)) return 0;
     layer->authority = G53_KDA_UNKNOWN;
-    if (!coli_cuda_pipe_sync(owner) ||
-        !coli_cuda_pipe_download(owner, work->raw_out, core, work->proj_bytes) ||
-        !coli_cuda_pipe_upload(owner, layer->window, work->next_window, work->window_bytes)) return 0;
-    memcpy(window, work->next_window, work->window_bytes);
+    if (!coli_cuda_pipe_kda_recur(owner, (float *)layer->state, work->raw_out,
+            work->mixed_qkv, work->mixed_qkv + p, work->mixed_qkv + 2*p,
+            work->decay, work->beta, heads, dim, dim, 1e-6f) ||
+        !coli_cuda_pipe_sync(owner) ||
+        !coli_cuda_pipe_download(owner, work->raw_out, core, work->proj_bytes)) return 0;
     layer->authority = G53_KDA_DEVICE;
     return 1;
 #else

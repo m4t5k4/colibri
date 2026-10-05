@@ -112,23 +112,34 @@ class StageSource(unittest.TestCase):
         header = (ROOT / "glm53_cuda.h").read_text()
         layer = source[source.index("static int kda_layer"):source.index("/* ---------- MLA")]
         self.assertIn("gpu = tokens == 1 && s->cuda_stage", layer)
-        self.assertIn("memcpy(s->kda_staging.next_window, window", layer)
-        self.assertIn("glm53_kda_shortconv(scratch, s->kda_staging.next_window", layer)
+        self.assertNotIn("next_window", source + header)
+        self.assertNotIn("glm53_kda_shortconv(", layer)
+        self.assertIn("&l->cuda_kda_weights", layer)
         self.assertIn("if (st->cuda_kda.authority != G53_KDA_UNKNOWN)", layer)
-        recur = header[header.index("static inline int coli_glm53_cuda_kda_recur("):header.index("/* 0 absent")]
+        recur = header[header.index("static inline int coli_glm53_cuda_kda_decode("):header.index("/* 0 absent")]
         positions = [recur.index(text) for text in (
-            "coli_cuda_pipe_kda_recur(", "authority = G53_KDA_UNKNOWN", "coli_cuda_pipe_sync(",
-            "coli_cuda_pipe_download(", "coli_cuda_pipe_upload(owner, layer->window",
-            "memcpy(window, work->next_window", "authority = G53_KDA_DEVICE")]
+            "coli_cuda_pipe_kda_shortconv(", "authority = G53_KDA_UNKNOWN", "coli_cuda_pipe_kda_recur(",
+            "coli_cuda_pipe_sync(", "coli_cuda_pipe_download(", "authority = G53_KDA_DEVICE")]
         self.assertEqual(positions, sorted(positions))
         self.assertIn("heads, dim, dim, 1e-6f", recur)
+        self.assertEqual(recur.count("coli_cuda_pipe_sync("), 1)
+        self.assertEqual(recur.count("coli_cuda_pipe_upload("), 3)
+        self.assertNotIn("memcpy(", recur)
+        self.assertNotIn("pipe_upload(owner, layer->window", recur)
+        self.assertIn("3*work->proj_bytes", recur)
+        self.assertIn("work->mixed_qkv + p, work->mixed_qkv + 2*p", recur)
+        backend = (ROOT / "backend_cuda.cu").read_text()
+        self.assertIn("pipe_kda_shortconv_kernel<<<blocks, 256>>>", backend)
+        self.assertIn("pipe_kda_recur_kernel<<<heads, threads>>>", backend)
+        # Both launches omit a stream argument, on the same calling thread/device.
+
         for forbidden in ("alloc(", "free(", "acquire(", "release(", "stage->wire", "coli_cuda_dn_", "cudaStream"):
             self.assertNotIn(forbidden, recur)
         session = source[source.index("float *kda_scratch;"):source.index("} GSession;")]
         self.assertIn("ColiGlm53CudaKdaStaging kda_staging", session)
         geometry = header[header.index("static inline int coli_glm53_cuda_kda_staging_geometry"):
                           header.index("static inline void coli_glm53_cuda_kda_staging_close")]
-        self.assertIn("coli_glm53_cuda_size_mul(5, proj", geometry)
+        self.assertIn("coli_glm53_cuda_size_mul(8, proj", geometry)
         self.assertIn("heads > SIZE_MAX - floats", geometry)
         self.assertIn("coli_glm53_cuda_size_mul(floats + heads", geometry)
         run = source[source.index("static float *run_layers"):source.index("static void mat_release")]
@@ -138,6 +149,27 @@ class StageSource(unittest.TestCase):
         restore = source[source.index("static void glm53_state_restore"):source.index("static void slot_reset")]
         self.assertLess(restore.index("glm53_kda_pin_complete"), restore.index("memcpy("))
         self.assertIn("COMPLETE trusted host state+window overwrite", header)
+
+    def test_static_convolution_ownership(self):
+        source = (ROOT / "glm53.c").read_text()
+        header = (ROOT / "glm53_cuda.h").read_text()
+        model_layer = source[source.index("Mat kq, kk"):source.index("} GLayer;")]
+        session_layer = source[source.index("float *kda_state;"):source.index("} GLayerState;")]
+        session = source[source.index("float *kda_scratch;"):source.index("} GSession;")]
+        self.assertIn("ColiGlm53CudaKdaWeights cuda_kda_weights", model_layer)
+        self.assertNotIn("CudaKdaWeights", session_layer + session)
+        engine = source[source.index("static int glm53_segment_engine_open"):
+                        source.index("static int glm53_segment_session_create")]
+        self.assertLess(engine.index("model_load_range"), engine.index("glm53_kda_weights_open"))
+        self.assertLess(engine.index("glm53_kda_weights_open"), engine.index("*engine_impl = engine"))
+        release = source[source.index("static void model_release"):source.index("/*", source.index("    free(m->layer);"))]
+        self.assertLess(release.index("coli_glm53_cuda_kda_weights_close"), release.index("free((void *)vectors"))
+        weights = header[header.index("/* Immutable model/layer weights"):header.index("/* One session device workspace")]
+        self.assertNotIn("coli_cuda_acquire", weights)
+        self.assertNotIn("coli_cuda_release", weights)
+        self.assertIn("coli_cuda_pipe_upload(stage->cuda_device_ordinal", weights)
+        close = source[source.index("static void session_close"):source.index("static float *run_layers")]
+        self.assertNotIn("weights_close", close)
 
 if __name__ == "__main__":
     unittest.main()
