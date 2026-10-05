@@ -100,6 +100,16 @@ int coli_cuda_pipe_download(int device, const void *src, void *dst, size_t bytes
     Event *event = record('D'); event->owner = device; event->resource = src; event->bytes = bytes;
     validate_copy(device, src, bytes); if (fail_download) return 0; memcpy(dst, src, bytes); return 1;
 }
+int coli_cuda_pipe_kda_recur(int device, float *state, float *out, const float *q,
+        const float *k, const float *v, const float *decay, const float *beta,
+        int heads, int kd, int vd, float eps) {
+    (void)device; (void)state; (void)out; (void)q; (void)k; (void)v;
+    (void)decay; (void)beta; (void)heads; (void)kd; (void)vd; (void)eps;
+    assert(0 && "ownership probe must not execute recurrence"); return 0;
+}
+int coli_cuda_pipe_sync(int device) {
+    (void)device; assert(0 && "ownership probe must not sync recurrence"); return 0;
+}
 static void roundtrip(ColiGlm53CudaStage *s) {
     float input[16384], output[16384];
     assert(s->wire_bytes == sizeof(input));
