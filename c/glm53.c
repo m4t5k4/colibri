@@ -706,6 +706,9 @@ typedef struct {
 typedef struct {
     GLayerState *layer;
     float *kda_scratch;
+    ColiGlm53CudaKdaStaging kda_staging;
+    const char *kda_error;                /* borrowed diagnostic; no public ABI */
+    int kda_poisoned;                     /* failed request after any layer mutation */
     const ColiGlm53CudaStage *cuda_stage;   /* borrowed; NULL for unplanned sessions */
     int filled;                           /* posizioni gia' in cache */
     int cap;
@@ -747,6 +750,7 @@ typedef struct {
 static int glm53_kda_ensure_host(const GModel *m, const GSession *s) {
 #ifdef COLI_SEGMENT_ADAPTER
     if (!s->cuda_stage) return 1;
+    if (s->kda_poisoned) return 0;
     for (int i = m->layer_begin; i < m->layer_end; i++) {
         GLayerState *st = &s->layer[i];
         if (!m->c.is_full[i] && !coli_glm53_cuda_kda_ensure_host(s->cuda_stage,
@@ -759,6 +763,7 @@ static int glm53_kda_ensure_host(const GModel *m, const GSession *s) {
 }
 static void glm53_kda_host_written(const GModel *m, GSession *s) {
     if (!s->cuda_stage) return;
+    s->kda_poisoned = 0; /* called only after complete trusted pair overwrite */
     for (int i = m->layer_begin; i < m->layer_end; i++)
         if (!m->c.is_full[i]) coli_glm53_cuda_kda_host_written(&s->layer[i].cuda_kda);
 }
@@ -1245,9 +1250,48 @@ static void mlp3_rows(float *out, const float *x, int S, const Mat *g, const Mat
 }
 
 /* ---------- KDA: proiezioni, gate, ricorrenza ---------- */
-static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
-                      float *out, float *state, float *window, float *scratch) {
+/* Exactly the ShortConv half of coli_kda_step; only the provided window moves. */
+static void glm53_kda_shortconv(float *mixed, float *window, const float *qkv,
+                               const float *conv, int proj, int kernel) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int channel = 0; channel < 3 * proj; channel++) {
+        float *history = window + (size_t)channel * kernel;
+        memmove(history, history + 1, (size_t)(kernel - 1) * sizeof(*history));
+        history[kernel - 1] = qkv[channel];
+        const float *taps = conv + (size_t)channel * kernel;
+        float sum = 0.0f;
+        for (int tap = 0; tap < kernel; tap++) sum += taps[tap] * history[tap];
+        mixed[channel] = coli_kda_silu(sum);
+    }
+}
+static int kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
+                     float *out, GLayerState *st, GSession *s) {
     const int P = c->kda_proj, H = c->kda_heads, D = c->kda_hd;
+    float *state = st->kda_state, *window = st->kda_window, *scratch = s->kda_scratch;
+    int gpu = 0, ok = 1;
+    ColiGlm53KdaAuthority prior = st->cuda_kda.authority;
+    if (s->kda_poisoned) goto coherence_fail;
+#if defined(COLI_CUDA) && defined(COLI_SEGMENT_ADAPTER)
+    gpu = tokens == 1 && s->cuda_stage;
+    if (gpu) {
+        size_t db, wb, sb, pair_wb;
+        if (H < 1 || D < 1 || P < 1 || c->conv_k < 1 ||
+            !coli_glm53_cuda_stage_live(s->cuda_stage) ||
+            !s->kda_staging.device || !s->kda_staging.next_window ||
+            !coli_glm53_cuda_kda_geometry((size_t)H, (size_t)D, (size_t)P,
+                (size_t)c->conv_k, &sb, &pair_wb) ||
+            !coli_glm53_cuda_kda_staging_geometry((size_t)H, (size_t)D, (size_t)P,
+                (size_t)c->conv_k, &db, &wb) ||
+            s->kda_staging.device_bytes != db || s->kda_staging.window_bytes != wb ||
+            s->kda_staging.proj_bytes != (size_t)P * sizeof(float) ||
+            st->cuda_kda.state_bytes != sb || st->cuda_kda.window_bytes != pair_wb ||
+            !coli_glm53_cuda_kda_prepare(s->cuda_stage, &st->cuda_kda, state, window)) goto coherence_fail;
+    } else
+    if (s->cuda_stage && !coli_glm53_cuda_kda_ensure_host(s->cuda_stage,
+            &st->cuda_kda, state, window)) goto coherence_fail;
+#endif
     const size_t T = (size_t)tokens;
     /* Every projection reads only its own token's row, so they all run
      * batched over the block; only the recurrence walks token by token. */
@@ -1262,7 +1306,10 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     float *qkv = malloc((size_t)3 * P * sizeof(float));
     float *core = malloc((size_t)P * sizeof(float));
     if (!q || !k || !v || !low || !decay || !beta || !gate || !normed || !qkv || !core) {
-        fprintf(stderr, "OOM in KDA\n"); exit(1);
+        if (!s->cuda_stage) { fprintf(stderr, "OOM in KDA\n"); exit(1); }
+        s->kda_error = "GLM-5.3 CUDA KDA recurrence failed before mutation";
+        if (gpu) st->cuda_kda.authority = prior;
+        ok = 0; goto done;
     }
     mm(q, &l->kq, x, tokens);
     mm(k, &l->kk, x, tokens);
@@ -1285,8 +1332,22 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         memcpy(qkv, q + t * P, (size_t)P * sizeof(float));
         memcpy(qkv + P, k + t * P, (size_t)P * sizeof(float));
         memcpy(qkv + 2 * P, v + t * P, (size_t)P * sizeof(float));
-        coli_kda_step(core, state, window, qkv, l->conv, dk, bt,
-                      H, D, D, c->conv_k, 1e-6f, scratch);
+        if (gpu) {
+            memcpy(s->kda_staging.next_window, window, s->kda_staging.window_bytes);
+            glm53_kda_shortconv(scratch, s->kda_staging.next_window, qkv, l->conv, P, c->conv_k);
+            if (!coli_glm53_cuda_kda_recur(s->cuda_stage, &st->cuda_kda,
+                    &s->kda_staging, window, scratch, dk, bt, core, H, D)) {
+                s->kda_error = st->cuda_kda.authority == G53_KDA_UNKNOWN
+                    ? "GLM-5.3 CUDA KDA state became indeterminate"
+                    : "GLM-5.3 CUDA KDA recurrence failed before mutation";
+                if (st->cuda_kda.authority != G53_KDA_UNKNOWN) st->cuda_kda.authority = prior;
+                ok = 0; goto done;
+            }
+        } else {
+            coli_kda_step(core, state, window, qkv, l->conv, dk, bt,
+                          H, D, D, c->conv_k, 1e-6f, scratch);
+            coli_glm53_cuda_kda_host_written(&st->cuda_kda);
+        }
         /* uscita: RMSNorm per testa, pesata da o_norm, moltiplicata dal gate
          * low-rank, poi la proiezione di uscita (dopo il ciclo, in blocco). */
         const float *gt = gate + t * P;
@@ -1301,8 +1362,16 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         }
     }
     mm(out, &l->ko, normed, tokens);
+done:
     free(core); free(qkv); free(normed); free(gate); free(beta); free(decay);
     free(low); free(v); free(k); free(q);
+    return ok;
+coherence_fail:
+    st->cuda_kda.authority = prior;
+    s->kda_error = st->cuda_kda.authority == G53_KDA_UNKNOWN
+        ? "GLM-5.3 CUDA KDA state became indeterminate"
+        : "GLM-5.3 CUDA KDA recurrence failed before mutation";
+    return 0;
 }
 
 /* ---------- MLA + indexer con k-pool ---------- */
@@ -2829,13 +2898,18 @@ static int glm53_kda_attach(const GModel *m, GSession *s,
             !coli_glm53_cuda_kda_open(stage, &st->cuda_kda,
                 (size_t)c->kda_heads, (size_t)c->kda_hd,
                 (size_t)c->kda_proj, (size_t)c->conv_k)) {
-            for (int j = m->layer_begin; j < m->layer_end; j++)
-                coli_glm53_cuda_kda_close(stage, &s->layer[j].cuda_kda);
-            s->cuda_stage = NULL;
-            return 0;
+            goto fail;
         }
     }
+    if (s->kda_scratch && !coli_glm53_cuda_kda_staging_open(stage, &s->kda_staging,
+            (size_t)c->kda_heads, (size_t)c->kda_hd, (size_t)c->kda_proj, (size_t)c->conv_k)) goto fail;
     return 1;
+fail:
+    coli_glm53_cuda_kda_staging_close(stage, &s->kda_staging);
+    for (int j = m->layer_begin; j < m->layer_end; j++)
+        coli_glm53_cuda_kda_close(stage, &s->layer[j].cuda_kda);
+    s->cuda_stage = NULL;
+    return 0;
 }
 #endif
 static void session_close(const GModel *m, GSession *s) {
@@ -2845,9 +2919,11 @@ static void session_close(const GModel *m, GSession *s) {
 #endif
     /* All CUDA frees precede host cleanup, under the borrowed stage lease. */
 #ifdef COLI_SEGMENT_ADAPTER
-    if (s->cuda_stage)
+    if (s->cuda_stage) {
+        coli_glm53_cuda_kda_staging_close(s->cuda_stage, &s->kda_staging);
         for (int i = 0; i < m->c.n_layers; i++)
             coli_glm53_cuda_kda_close(s->cuda_stage, &s->layer[i].cuda_kda);
+    }
 #endif
     /* Non-owned slots are NULL, so the absolute-indexed table is safe to scan. */
     for (int i = 0; i < m->c.n_layers; i++) {
@@ -2878,12 +2954,25 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
     const int H = c->hc_mult, D = c->hidden;
 #ifdef COLI_VULKAN
     /* every layer on the device (glm53_chain.h); 0: the CPU below, its state current first */
-    if (g_vk_chain && begin == 0 && end == c->n_layers) {
+    /* Planned CUDA sessions use their session authority, not the Vulkan chain. */
+    if (g_vk_chain && !s->cuda_stage && begin == 0 && end == c->n_layers) {
         if (g53c_forward(m, s, streams, n, start)) return streams;
         g53c_cpu_step(m, s, start);
     }
 #endif
-    if (!glm53_kda_ensure_host(m, s)) return NULL;
+    s->kda_error = NULL;
+    int committed_end = begin; /* completed layers in this run, not a lifetime counter */
+    if (s->kda_poisoned) {
+        s->kda_error = "GLM-5.3 CUDA KDA session became indeterminate";
+        return NULL;
+    }
+    /* Metadata-only preflight: an UNKNOWN layer blocks the whole session run,
+     * including earlier layers, until a complete restore/reset. No D2H here. */
+    if (s->cuda_stage) for (int i = begin; i < end; i++)
+        if (!c->is_full[i] && s->layer[i].cuda_kda.authority == G53_KDA_UNKNOWN) {
+            s->kda_error = "GLM-5.3 CUDA KDA state became indeterminate";
+            return NULL;
+        }
     float *collapsed = malloc((size_t)n * D * sizeof(float));
     float *normed = malloc((size_t)n * D * sizeof(float));
     float *branch = malloc((size_t)n * D * sizeof(float));
@@ -2895,6 +2984,17 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
 
     for (int i = begin; i < end; i++) {
         GLayer *l = &m->layer[i];
+        /* CPU multi-row recurrence needs only this layer's pair, before its
+         * layer work. kda_layer's check also protects direct internal callers. */
+
+#if defined(COLI_CUDA) && defined(COLI_SEGMENT_ADAPTER)
+        if (n != 1 && s->cuda_stage && !c->is_full[i] &&
+            !coli_glm53_cuda_kda_ensure_host(s->cuda_stage, &s->layer[i].cuda_kda,
+                s->layer[i].kda_state, s->layer[i].kda_window)) {
+            s->kda_error = "GLM-5.3 CUDA KDA recurrence failed before mutation";
+            goto fail;
+        }
+#endif
         for (int site = 0; site < 2; site++) {
             const float *fn = site ? l->hc_ffn_fn : l->hc_attn_fn;
             const float *base = site ? l->hc_ffn_base : l->hc_attn_base;
@@ -2914,9 +3014,7 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                  * la ricorrenza a ogni token generato. */
                 if (c->is_full[i]) mla_layer(c, l, normed, n, branch, st, start);
                 else {
-                    kda_layer(c, l, normed, n, branch, st->kda_state, st->kda_window,
-                              s->kda_scratch);
-                    coli_glm53_cuda_kda_host_written(&st->cuda_kda);
+                    if (!kda_layer(c, l, normed, n, branch, st, s)) goto fail;
                 }
             } else {
                 ffn_layer(m, l, i, normed, n, branch);
@@ -2930,9 +3028,28 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                              comb + (size_t)t * H * H, H, D);
             float *swap = streams; streams = next; next = swap;
         }
+        committed_end = i + 1;
     }
     free(comb); free(post); free(branch); free(normed); free(collapsed);
     return streams;
+fail:
+    /* Position will not advance. Earlier accepted KDA updates cannot form a
+     * usable session prefix with a later failed layer: require complete restore,
+     * rather than expose that mixed prefix through snapshot or numerical retry.
+     * The rejecting layer retains valid authority if its launch was rejected. */
+    if (s->cuda_stage) {
+        if (committed_end > begin) s->kda_poisoned = 1;
+        for (int i = begin; i < end; i++)
+            if (!c->is_full[i] && s->layer[i].cuda_kda.authority == G53_KDA_UNKNOWN)
+                s->kda_poisoned = 1;
+    }
+    if (n == 1 && s->cuda_stage) for (int i = begin; i < committed_end; i++)
+        if (!c->is_full[i] && s->layer[i].cuda_kda.authority == G53_KDA_DEVICE) {
+            s->layer[i].cuda_kda.authority = G53_KDA_UNKNOWN;
+            s->kda_error = "GLM-5.3 CUDA KDA state became indeterminate";
+        }
+    free(comb); free(post); free(branch); free(normed); free(collapsed);
+    return NULL;
 }
 #ifdef COLI_VULKAN
 #include "glm53_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
@@ -3398,6 +3515,16 @@ static int sample_token(const float *logits, int vocab) {
 
 /* la ricorrenza KDA di uno scatto: stato e finestra di ogni strato lineare */
 typedef struct { float **state, **window; int n_layers; } Glm53PinState;
+/* Preflight the entire owned recurrent pair before publishing any pin bytes.
+ * A partial/malformed pin must never clear UNKNOWN on untouched layers. */
+static int glm53_kda_pin_complete(const GModel *m, const Glm53PinState *pin,
+                                  const GSession *s) {
+    if (!pin || pin->n_layers != m->c.n_layers || !pin->state || !pin->window) return 0;
+    for (int i = m->layer_begin; i < m->layer_end; i++)
+        if (!m->c.is_full[i] && s->layer[i].kda_state &&
+            (!pin->state[i] || !pin->window[i])) return 0;
+    return 1;
+}
 
 typedef struct {
     GSession *session;
@@ -3527,7 +3654,8 @@ static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, in
          * non basta; devono combaciare con la storia dello slot, che e' la
          * sola descrizione di cosa le righe tengono davvero (come
          * kv_prefix_holds per gli altri motori, #1650). */
-        if (st && k->len <= slot->session->filled && k->len <= slot->n &&
+        if (glm53_kda_pin_complete(m, st, slot->session) &&
+            k->len <= slot->session->filled && k->len <= slot->n &&
             !memcmp(k->ids, slot->tokens, (size_t)k->len * sizeof(int))) {
             for (int i = 0; i < c->n_layers; i++) {
                 GLayerState *ls = &slot->session->layer[i];
@@ -3585,6 +3713,7 @@ static int glm53_state_capture(const GModel *m, Glm53PinState **into, const GSes
 }
 
 static void glm53_state_restore(const GModel *m, const Glm53PinState *st, GSession *s) {
+    if (!glm53_kda_pin_complete(m, st, s)) return;
     const Cfg *c = &m->c;
 #ifdef COLI_VULKAN
     g53c_host_wrote(s);   /* the dense chain's copy goes up again */
@@ -4875,7 +5004,8 @@ static int glm53_segment_session_run_unlocked(void *session_impl,
     if (!result) {
         free(streams); free(next);
         return coli_segment_adapter_error(error, error_size,
-            "GLM-5.3 CUDA KDA host synchronization failed");
+            session->session->kda_error ? session->session->kda_error
+                : "GLM-5.3 CUDA KDA host synchronization failed");
     }
     session->session->filled = (int)(session->position + request->rows);
 
