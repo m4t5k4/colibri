@@ -121,11 +121,17 @@ static inline int coli_glm53_cuda_kda_ensure_host(const ColiGlm53CudaStage *stag
  * The parent stage lease protects allocation/upload and final engine free. */
 typedef struct {
     float *conv;
+    ColiCudaTensor *q, *k, *v;
+    size_t projection_bytes[3], projection_vram[3];
+    int hidden, proj;
     size_t bytes;
     int cuda_device_ordinal;
 } ColiGlm53CudaKdaWeights;
 static inline void coli_glm53_cuda_kda_weights_close(ColiGlm53CudaKdaWeights *weights) {
 #ifdef COLI_CUDA
+    if (weights->q) coli_cuda_tensor_free(weights->q);
+    if (weights->k) coli_cuda_tensor_free(weights->k);
+    if (weights->v) coli_cuda_tensor_free(weights->v);
     if (weights->conv) coli_cuda_pipe_free(weights->cuda_device_ordinal, weights->conv);
 #endif
     memset(weights, 0, sizeof(*weights));
@@ -154,17 +160,18 @@ static inline int coli_glm53_cuda_kda_weights_open(const ColiGlm53CudaStage *sta
 /* One session device workspace, reused under its engine run_lock. It borrows
  * the stage lease; neither the stage wire nor another session owns these bytes. */
 typedef struct {
-    float *device, *projected_qkv, *mixed_qkv, *decay, *beta, *raw_out;
-    size_t proj_bytes, window_bytes, device_bytes;
+    float *device, *input_x, *projected_qkv, *mixed_qkv, *decay, *beta, *raw_out;
+    size_t input_bytes, proj_bytes, window_bytes, device_bytes;
 } ColiGlm53CudaKdaStaging;
 static inline int coli_glm53_cuda_kda_staging_geometry(size_t heads, size_t dim,
-        size_t proj, size_t kernel, size_t *device_bytes, size_t *window_bytes) {
+        size_t proj, size_t kernel, size_t hidden, size_t *device_bytes, size_t *window_bytes) {
     size_t state_bytes, floats;
-    if (heads > 65535 || dim > 256 || proj > INT_MAX / 3 ||
+    if (!hidden || hidden > INT_MAX || heads > 65535 || dim > 256 || proj > INT_MAX / 3 ||
         !coli_glm53_cuda_kda_geometry(heads, dim, proj, kernel, &state_bytes, window_bytes) ||
         !coli_glm53_cuda_size_mul(8, proj, &floats) || heads > SIZE_MAX - floats ||
-        !coli_glm53_cuda_size_mul(floats + heads, sizeof(float), device_bytes)) return 0;
-    return 1; /* projected[3P] + mixed[3P] + decay[P] + beta[H] + raw[P] */
+        hidden > SIZE_MAX - (floats + heads) ||
+        !coli_glm53_cuda_size_mul(hidden + floats + heads, sizeof(float), device_bytes)) return 0;
+    return 1; /* input[hidden] + projected[3P] + mixed[3P] + decay[P] + beta[H] + raw[P] */
 }
 static inline void coli_glm53_cuda_kda_staging_close(const ColiGlm53CudaStage *stage,
         ColiGlm53CudaKdaStaging *work) {
@@ -176,16 +183,17 @@ static inline void coli_glm53_cuda_kda_staging_close(const ColiGlm53CudaStage *s
     memset(work, 0, sizeof(*work));
 }
 static inline int coli_glm53_cuda_kda_staging_open(const ColiGlm53CudaStage *stage,
-        ColiGlm53CudaKdaStaging *work, size_t heads, size_t dim, size_t proj, size_t kernel) {
+        ColiGlm53CudaKdaStaging *work, size_t heads, size_t dim, size_t proj, size_t kernel, size_t hidden) {
     size_t db, wb;
     if (!stage || !stage->lease_live || stage->cuda_device_ordinal < 0 || work->device ||
-        !coli_glm53_cuda_kda_staging_geometry(heads, dim, proj, kernel, &db, &wb)) return 0;
+        !coli_glm53_cuda_kda_staging_geometry(heads, dim, proj, kernel, hidden, &db, &wb)) return 0;
 #ifdef COLI_CUDA
     work->device = (float *)coli_cuda_pipe_alloc(stage->cuda_device_ordinal, db);
     if (!work->device) return 0;
     work->device_bytes = db; work->window_bytes = wb;
-    work->proj_bytes = proj * sizeof(float); /* checked by geometry above */
-    work->projected_qkv = work->device; work->mixed_qkv = work->projected_qkv + 3*proj;
+    work->input_bytes = hidden * sizeof(float); work->proj_bytes = proj * sizeof(float);
+    work->input_x = work->device; work->projected_qkv = work->input_x + hidden;
+    work->mixed_qkv = work->projected_qkv + 3*proj;
     work->decay = work->mixed_qkv + 3*proj; work->beta = work->decay + proj;
     work->raw_out = work->beta + heads;
     return 1;
@@ -193,6 +201,33 @@ static inline int coli_glm53_cuda_kda_staging_open(const ColiGlm53CudaStage *sta
     return 0;
 #endif
 }
+/* Scratch-only launches: rejection never changes recurrent authority. All three
+ * output slices are overwritten on a retry. No intermediate sync or readback;
+ * the caller can compute independent CPU gates before issuing ShortConv. */
+static inline int coli_glm53_cuda_kda_project_qkv(const ColiGlm53CudaStage *stage,
+        const ColiGlm53CudaKdaWeights *weights, ColiGlm53CudaKdaStaging *work, const float *x) {
+    if (!stage || !stage->lease_live || !weights || !work || !x || !work->device ||
+        !weights->q || !weights->k || !weights->v || weights->hidden < 1 || weights->proj < 1 ||
+        weights->cuda_device_ordinal != stage->cuda_device_ordinal ||
+        work->input_bytes != (size_t)weights->hidden * sizeof(float) ||
+        work->proj_bytes != (size_t)weights->proj * sizeof(float) ||
+        work->input_x != work->device || work->projected_qkv != work->input_x + weights->hidden ||
+        work->input_bytes > work->device_bytes ||
+        work->proj_bytes > (work->device_bytes - work->input_bytes) / 8) return 0;
+#ifdef COLI_CUDA
+    size_t p = work->proj_bytes / sizeof(float);
+    if (coli_cuda_tensor_device(weights->q) != stage->cuda_device_ordinal ||
+        coli_cuda_tensor_device(weights->k) != stage->cuda_device_ordinal ||
+        coli_cuda_tensor_device(weights->v) != stage->cuda_device_ordinal) return 0;
+    return coli_cuda_pipe_upload(stage->cuda_device_ordinal, work->input_x, x, work->input_bytes) &&
+        coli_cuda_pipe_gemm(weights->q, work->projected_qkv, work->input_x, 1) &&
+        coli_cuda_pipe_gemm(weights->k, work->projected_qkv + p, work->input_x, 1) &&
+        coli_cuda_pipe_gemm(weights->v, work->projected_qkv + 2*p, work->input_x, 1);
+#else
+    return 0;
+#endif
+}
+
 /* Prepared BOTH/DEVICE pair. Only non-mutating host inputs cross before the
  * first launch. Accepted ShortConv already advances the canonical device window:
  * even recurrence rejection must remain UNKNOWN. Both launches use the existing
@@ -200,22 +235,22 @@ static inline int coli_glm53_cuda_kda_staging_open(const ColiGlm53CudaStage *sta
  * No host window publication: DEVICE leaves both host components stale. */
 static inline int coli_glm53_cuda_kda_decode(const ColiGlm53CudaStage *stage,
         ColiGlm53CudaKdaLayer *layer, const ColiGlm53CudaKdaWeights *weights,
-        ColiGlm53CudaKdaStaging *work, const float *qkv, const float *decay,
+        ColiGlm53CudaKdaStaging *work, const float *decay,
         const float *beta, float *core, int heads, int dim, int kernel) {
     size_t db, wb;
     if (!stage || !stage->lease_live || !layer->state || !layer->window ||
         (layer->authority != G53_KDA_BOTH && layer->authority != G53_KDA_DEVICE) ||
         !weights || !weights->conv || weights->cuda_device_ordinal != stage->cuda_device_ordinal ||
-        !work->device || !qkv || !decay || !beta || !core || heads < 1 || dim < 1 || kernel < 1 ||
+        !work->device || !decay || !beta || !core || heads < 1 || dim < 1 || kernel < 1 ||
         !coli_glm53_cuda_kda_staging_geometry((size_t)heads, (size_t)dim,
-            work->proj_bytes / sizeof(float), (size_t)kernel, &db, &wb) ||
+            work->proj_bytes / sizeof(float), (size_t)kernel,
+            work->input_bytes / sizeof(float), &db, &wb) ||
         db != work->device_bytes || layer->state_bytes != work->proj_bytes * (size_t)dim ||
         wb != work->window_bytes || wb != layer->window_bytes || wb != weights->bytes) return 0;
 #ifdef COLI_CUDA
     int owner = stage->cuda_device_ordinal;
     size_t p = work->proj_bytes / sizeof(float);
-    if (!coli_cuda_pipe_upload(owner, work->projected_qkv, qkv, 3*work->proj_bytes) ||
-        !coli_cuda_pipe_upload(owner, work->decay, decay, work->proj_bytes) ||
+    if (!coli_cuda_pipe_upload(owner, work->decay, decay, work->proj_bytes) ||
         !coli_cuda_pipe_upload(owner, work->beta, beta, (size_t)heads * sizeof(float))) return 0;
     if (!coli_cuda_pipe_kda_shortconv(owner, (float *)layer->window, work->mixed_qkv,
             work->projected_qkv, weights->conv, (int)(3*p), kernel)) return 0;

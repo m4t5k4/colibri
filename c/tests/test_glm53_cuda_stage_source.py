@@ -123,10 +123,10 @@ class StageSource(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertIn("heads, dim, dim, 1e-6f", recur)
         self.assertEqual(recur.count("coli_cuda_pipe_sync("), 1)
-        self.assertEqual(recur.count("coli_cuda_pipe_upload("), 3)
+        self.assertEqual(recur.count("coli_cuda_pipe_upload("), 2)
         self.assertNotIn("memcpy(", recur)
         self.assertNotIn("pipe_upload(owner, layer->window", recur)
-        self.assertIn("3*work->proj_bytes", recur)
+        self.assertNotIn("work->projected_qkv,", recur[:recur.index("coli_cuda_pipe_kda_shortconv(")])
         self.assertIn("work->mixed_qkv + p, work->mixed_qkv + 2*p", recur)
         backend = (ROOT / "backend_cuda.cu").read_text()
         self.assertIn("pipe_kda_shortconv_kernel<<<blocks, 256>>>", backend)
@@ -141,7 +141,7 @@ class StageSource(unittest.TestCase):
                           header.index("static inline void coli_glm53_cuda_kda_staging_close")]
         self.assertIn("coli_glm53_cuda_size_mul(8, proj", geometry)
         self.assertIn("heads > SIZE_MAX - floats", geometry)
-        self.assertIn("coli_glm53_cuda_size_mul(floats + heads", geometry)
+        self.assertIn("coli_glm53_cuda_size_mul(hidden + floats + heads", geometry)
         run = source[source.index("static float *run_layers"):source.index("static void mat_release")]
         self.assertIn("g_vk_chain && !s->cuda_stage", run)
         self.assertNotIn("glm53_kda_ensure_host(m, s)", run)
@@ -170,6 +170,33 @@ class StageSource(unittest.TestCase):
         self.assertIn("coli_cuda_pipe_upload(stage->cuda_device_ordinal", weights)
         close = source[source.index("static void session_close"):source.index("static float *run_layers")]
         self.assertNotIn("weights_close", close)
+
+    def test_resident_qkv_projection_scope(self):
+        source = (ROOT / "glm53.c").read_text()
+        header = (ROOT / "glm53_cuda.h").read_text()
+        layer = source[source.index("static int kda_layer"):source.index("/* ---------- MLA")]
+        for name in ("q", "k", "v", "qkv"):
+            self.assertIn("float *" + name + " = gpu ? NULL : malloc", layer)
+        project = header[header.index("static inline int coli_glm53_cuda_kda_project_qkv"):
+                         header.index("/* Prepared BOTH/DEVICE pair")]
+        self.assertEqual(project.count("coli_cuda_pipe_upload("), 1)
+        self.assertEqual(project.count("coli_cuda_pipe_gemm("), 3)
+        for forbidden in ("sync(", "download(", "authority", "malloc(", "acquire(", "stage->wire"):
+            self.assertNotIn(forbidden, project)
+        self.assertIn("work->input_x, x, work->input_bytes", project)
+        self.assertLess(layer.index("coli_glm53_cuda_kda_project_qkv"), layer.index("mm(low, &l->kfa"))
+        self.assertIn("} else {\n        mm(q, &l->kq", layer)
+        upload = source[source.index("static int glm53_kda_projection_open"):source.index("static int glm53_kda_attach")]
+        for token in ("mat->rows != c->kda_proj", "mat->columns != c->hidden", "mat->fmt", "mat->gs",
+                      "mat->q4", "mat->s", "coli_cuda_tensor_upload_g", "coli_cuda_tensor_device",
+                      "coli_cuda_tensor_bytes", "coli_cuda_tensor_vram"):
+            self.assertIn(token, upload)
+        backend = (ROOT / "backend_cuda.cu").read_text()
+        gemm = backend[backend.index('extern "C" int coli_cuda_pipe_gemm('):
+                       backend.index('extern "C" int coli_cuda_pipe_peer_copy(')]
+        self.assertIn("quant_matmul<<<grid,256>>>", gemm)
+        self.assertNotIn("Synchronize", gemm)
+        self.assertNotIn("cudaMemcpy", gemm)
 
 if __name__ == "__main__":
     unittest.main()

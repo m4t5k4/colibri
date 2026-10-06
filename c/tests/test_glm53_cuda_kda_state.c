@@ -15,6 +15,9 @@ static int inits, shutdowns, allocs, frees, uploads, downloads, acquires;
 static int fail_alloc_at, fail_upload_at, fail_download_at, live;
 static int recurrence_calls, shortconv_calls, sync_calls, fail_recurrence, fail_shortconv, fail_sync;
 static int fail_recurrence_at, synthetic_numeric;
+static int tensor_uploads, tensor_frees, live_tensors, gemm_calls, fail_tensor_at, fail_gemm_at;
+static int projection_rounding;
+struct ColiCudaTensor { Mat mat; int owner; size_t bytes, vram; };
 static size_t upload_bytes, download_bytes;
 static Glm53SegmentEngine *watch_engine;
 static float reference_state[18], reference_window[72], reference_core[6];
@@ -32,7 +35,7 @@ static void event(char op, int owner, const void *p, size_t bytes) {
 static int init(const int *devices, int count) {
     assert(devices && count); inits++; return 1;
 }
-static void shutdown_backend(void) { assert(!live); shutdowns++; event('S', -1, NULL, 0); }
+static void shutdown_backend(void) { assert(!live && !live_tensors); shutdowns++; event('S', -1, NULL, 0); }
 int coli_cuda_acquire(const int *devices, int count) {
     acquires++; event('A', -1, NULL, (size_t)count);
     return coli_cuda_lifetime_acquire(&lifetime, devices, count, init);
@@ -85,6 +88,44 @@ int coli_cuda_pipe_download(int owner, const void *src, void *dst, size_t bytes)
     memcpy(dst, src, bytes); return 1;
 }
 
+int coli_cuda_tensor_upload_g(ColiCudaTensor **out, const void *data, const float *scales,
+        int fmt, int columns, int rows, int owner, int gs) {
+    tensor_uploads++;event('T',owner,NULL,0);
+    assert(lifetime.users && !*out && data && rows>0 && columns>0);
+    int found=0;for(int i=0;i<lifetime.count;i++) found|=lifetime.devices[i]==owner;assert(found);
+    if(tensor_uploads==fail_tensor_at) return 0;
+    ColiCudaTensor *t=calloc(1,sizeof(*t));assert(t);
+    t->owner=owner;t->mat=(Mat){.fmt=fmt,.rows=rows,.columns=columns,.gs=gs};
+    size_t row=fmt==0?(size_t)columns*4:fmt==1?(size_t)columns:((size_t)columns+1)/2;
+    size_t wb=(size_t)rows*row,sb=fmt?(size_t)rows*(fmt==4?columns/gs:1)*4:0;
+    void *copy=malloc(wb);assert(copy);memcpy(copy,data,wb);
+    if(fmt==0)t->mat.f=copy;else if(fmt==1)t->mat.q8=copy;else t->mat.q4=copy;
+    if(sb){float *s=malloc(sb);assert(s && scales);memcpy(s,scales,sb);t->mat.s=s;}
+    t->bytes=t->vram=wb+sb;*out=t;live_tensors++;return 1;
+}
+int coli_cuda_tensor_upload(ColiCudaTensor **out, const void *data, const float *scales,
+        int fmt,int columns,int rows,int owner) {
+    return coli_cuda_tensor_upload_g(out,data,scales,fmt,columns,rows,owner,0);
+}
+void coli_cuda_tensor_free(ColiCudaTensor *t) {
+    assert(t && lifetime.users);event('t',t->owner,t,t->bytes);
+    mat_release(&t->mat);free(t);tensor_frees++;live_tensors--;
+}
+size_t coli_cuda_tensor_bytes(const ColiCudaTensor *t){return t?t->bytes:0;}
+size_t coli_cuda_tensor_vram(const ColiCudaTensor *t){return t?t->vram:0;}
+int coli_cuda_tensor_device(const ColiCudaTensor *t){return t?t->owner:-1;}
+int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y,const float *x,int rows) {
+    gemm_calls++;event('G',t->owner,t,0);assert(rows==1);
+    find(t->owner,y,(size_t)t->mat.rows*4);find(t->owner,x,(size_t)t->mat.columns*4);
+    if(watch_session) for(int i=0;i<32;i++) if(watch_engine->model.layer[i].cuda_kda_weights.q==t ||
+        watch_engine->model.layer[i].cuda_kda_weights.k==t || watch_engine->model.layer[i].cuda_kda_weights.v==t)
+        assert(watch_session->layer[i].cuda_kda.authority!=G53_KDA_UNKNOWN);
+    if(gemm_calls==fail_gemm_at)return 0;
+    float expected[t->mat.rows];mm(expected,&t->mat,x,1);memcpy(y,expected,(size_t)t->mat.rows*4);
+    if(projection_rounding)for(int j=0;j<t->mat.rows;j++)y[j]=nextafterf(y[j],j%2?INFINITY:-INFINITY);
+    for(int j=0;j<t->mat.rows;j++) assert(fabsf(y[j]-expected[j])<=1e-5f*(1.f+fabsf(expected[j])));
+    return 1;
+}
 int coli_cuda_pipe_kda_shortconv(int owner, float *window, float *mixed,
         const float *qkv, const float *conv, int channels, int kernel) {
     shortconv_calls++; event('C',owner,window,(size_t)channels*kernel*sizeof(float));
@@ -156,6 +197,14 @@ static int synthetic_open(void **impl, ColiSegmentCapabilities *caps,
         e->model.layer[i].conv=calloc(72,sizeof(float));assert(e->model.layer[i].conv);
         if (synthetic_numeric) for (int j=0; j<72; j++)
             ((float *)e->model.layer[i].conv)[j]=(float)((j*3+i)%11-5)*0.09f;
+    }
+    for (int i=e->model.layer_begin;i<e->model.layer_end;i++) if(!e->model.c.is_full[i]) {
+        Mat *mats[]={&e->model.layer[i].kq,&e->model.layer[i].kk,&e->model.layer[i].kv};
+        for(int j=0;j<3;j++) {
+            float *p=calloc(12,sizeof(float));assert(p);
+            *mats[j]=(Mat){.rows=6,.columns=2,.f=p};
+            if(synthetic_numeric) for(int x=0;x<12;x++)p[x]=(float)((x*7+i+2*j)%17-8)*0.045f;
+        }
     }
     if (!glm53_kda_weights_open(&e->model,&e->cuda_stage)) {
         model_release(&e->model);coli_glm53_cuda_stage_close(&e->cuda_stage);free(e);return -1;
@@ -354,7 +403,7 @@ static void cpu_run(void) {
     l->hc_attn_base=calloc(3,sizeof(float)); l->hc_ffn_base=calloc(3,sizeof(float));
     l->hc_attn_scale=calloc(3,sizeof(float)); l->hc_ffn_scale=calloc(3,sizeof(float));
     l->dt=calloc(6,sizeof(float)); l->alog=calloc(2,sizeof(float));
-    zero_mat(&l->kq,6,2); zero_mat(&l->kk,6,2); zero_mat(&l->kv,6,2); zero_mat(&l->ko,2,6);
+    zero_mat(&l->ko,2,6);
     zero_mat(&l->kfa,3,2); zero_mat(&l->kfb,6,3); zero_mat(&l->kga,3,2); zero_mat(&l->kgb,6,3);
     zero_mat(&l->kb,2,2); zero_mat(&l->dg,1,2); zero_mat(&l->du,1,2); zero_mat(&l->dd,2,1);
     ColiSegmentSession *s=create(e); GLayerState *st=&state(s)->layer[4]; device_write(state(s),4,12);

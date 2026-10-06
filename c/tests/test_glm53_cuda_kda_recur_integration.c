@@ -26,7 +26,6 @@ static ColiSegmentEngine *numerical_engine(int owner,int layers) {
         /* Host/device convolution was initialized once by engine setup. */
         for (int j=0; j<6; j++) ((float *)l->dt)[j]=(float)(j-2)*0.13f;
         ((float *)l->alog)[0]=-0.25f; ((float *)l->alog)[1]=0.3f;
-        weights(&l->kq,6,2,i); weights(&l->kk,6,2,i+2); weights(&l->kv,6,2,i+4);
         weights(&l->ko,2,6,i+6); weights(&l->kfa,3,2,i+8); weights(&l->kfb,6,3,i+10);
         weights(&l->kga,3,2,i+1); weights(&l->kgb,6,3,i+3); weights(&l->kb,2,2,i+5);
         weights(&l->dg,3,2,i+7); weights(&l->du,3,2,i+9); weights(&l->dd,2,3,i+11);
@@ -66,9 +65,9 @@ static void equal_session(ColiSegmentSession *gpu,ColiSegmentSession *cpu) {
         GLayerState *l=&a->layer[i],*r=&b->layer[i];
         const float *s=l->cuda_kda.authority==G53_KDA_DEVICE ? l->cuda_kda.state : l->kda_state;
         const float *window=l->cuda_kda.authority==G53_KDA_DEVICE ? l->cuda_kda.window : l->kda_window;
-        near(s,r->kda_state,18);assert(!memcmp(window,r->kda_window,288));
+        near(s,r->kda_state,18);near(window,r->kda_window,72);
         if (l->cuda_kda.authority==G53_KDA_DEVICE || l->cuda_kda.authority==G53_KDA_BOTH)
-            assert(!memcmp(l->cuda_kda.window,r->kda_window,288));
+            near(l->cuda_kda.window,r->kda_window,72);
     }
 }
 static void matched_run(ColiSegmentSession *gpu,ColiSegmentSession *cpu,int rows,int salt) {
@@ -103,26 +102,27 @@ static void shortconv_equivalence(void) {
         printf("ShortConv H=%d D=%d K=%d: exact window/mixed bytes PASS\n",h,d,kernel);
         free(w);free(ref);free(conv);free(qkv);free(mixed);free(scratch);free(st);free(out);free(decay);free(beta);
     }
-    size_t db,wb;assert(coli_glm53_cuda_kda_staging_geometry(64,128,8192,4,&db,&wb));
-    assert(db==262400 && wb==393216);
+    size_t db,wb;assert(coli_glm53_cuda_kda_staging_geometry(64,128,8192,4,4096,&db,&wb));
+    assert(db==278784 && wb==393216);
     size_t sb,pair;
     assert(coli_glm53_cuda_kda_geometry(64,128,8192,4,&sb,&pair));
     assert(sb==4194304 && pair==393216 && 34*pair==13369344);
-    assert(!coli_glm53_cuda_kda_staging_geometry(2,3,5,4,&db,&wb));
-    assert(!coli_glm53_cuda_kda_staging_geometry(1,257,257,4,&db,&wb));
-    assert(!coli_glm53_cuda_kda_staging_geometry(65536,1,65536,4,&db,&wb));
-    assert(!coli_glm53_cuda_kda_staging_geometry(SIZE_MAX,2,0,4,&db,&wb));
-    assert(!coli_glm53_cuda_kda_staging_geometry(64,128,8192,SIZE_MAX,&db,&wb));
+    assert(!coli_glm53_cuda_kda_staging_geometry(2,3,5,4,4096,&db,&wb));
+    assert(!coli_glm53_cuda_kda_staging_geometry(1,257,257,4,4096,&db,&wb));
+    assert(!coli_glm53_cuda_kda_staging_geometry(65536,1,65536,4,4096,&db,&wb));
+    assert(!coli_glm53_cuda_kda_staging_geometry(SIZE_MAX,2,0,4,4096,&db,&wb));
+    assert(!coli_glm53_cuda_kda_staging_geometry(64,128,8192,SIZE_MAX,4096,&db,&wb));
 }
 static void counted_token(ColiSegmentSession *s,ColiSegmentSession *control,int salt,int fresh) {
     GSession *gs=state(s);Glm53SegmentEngine *ge=((Glm53SegmentSession *)s->impl)->engine;
     int count=(int)ge->layer_end-(int)ge->layer_begin;
-    int u=uploads,d=downloads,c=shortconv_calls,k=recurrence_calls,y=sync_calls;
+    int u=uploads,d=downloads,c=shortconv_calls,k=recurrence_calls,y=sync_calls,g=gemm_calls;
     size_t ub=upload_bytes,db=download_bytes,start=nevents;
     matched_run(s,control,1,salt);
     assert(uploads==u+count*(fresh?5:3) && downloads==d+count);
     assert(shortconv_calls==c+count && recurrence_calls==k+count && sync_calls==y+count);
-    assert(upload_bytes-ub==(size_t)count*(104+(fresh?360:0)) && download_bytes-db==(size_t)count*24);
+    assert(upload_bytes-ub==(size_t)count*(40+(fresh?360:0)) && download_bytes-db==(size_t)count*24);
+    assert(gemm_calls==g+3*count);
     size_t at=start;
     for (int i=ge->layer_begin;i<(int)ge->layer_end;i++) {
         ColiGlm53CudaKdaLayer *l=&gs->layer[i].cuda_kda;
@@ -130,7 +130,11 @@ static void counted_token(ColiSegmentSession *s,ColiSegmentSession *control,int 
             assert(events[at].op=='U' && events[at].p==l->state && events[at++].bytes==72);
             assert(events[at].op=='U' && events[at].p==l->window && events[at++].bytes==288);
         }
-        assert(events[at].op=='U' && events[at].p==gs->kda_staging.projected_qkv && events[at++].bytes==72);
+        assert(events[at].op=='U' && events[at].p==gs->kda_staging.input_x && events[at++].bytes==8);
+        ColiGlm53CudaKdaWeights *w=&ge->model.layer[i].cuda_kda_weights;
+        assert(events[at].op=='G' && events[at++].p==w->q);
+        assert(events[at].op=='G' && events[at++].p==w->k);
+        assert(events[at].op=='G' && events[at++].p==w->v);
         assert(events[at].op=='U' && events[at].p==gs->kda_staging.decay && events[at++].bytes==24);
         assert(events[at].op=='U' && events[at].p==gs->kda_staging.beta && events[at++].bytes==8);
         assert(events[at].op=='C' && events[at++].p==l->window);
@@ -148,9 +152,10 @@ static void sequences(void) {
     assert(uploads==weights_before+2 && upload_bytes-weights_bytes==576);
     void *conv0=ge->model.layer[4].cuda_kda_weights.conv,*conv1=ge->model.layer[5].cuda_kda_weights.conv;
     assert(conv0!=conv1 && find(4,conv0,288) && find(4,conv1,288));
-    int setup_uploads=uploads;
+    assert(tensor_uploads>=6);
+    int setup_uploads=uploads,setup_tensors=tensor_uploads;
     ColiSegmentSession *a=create(e),*b=create(e),*ca=create(cpu),*cb=create(cpu);
-    assert(uploads==setup_uploads); /* sessions borrow the two immutable copies */
+    assert(uploads==setup_uploads && tensor_uploads==setup_tensors); /* sessions borrow all immutable copies */
     seed(a,1);seed(ca,1);seed(b,4);seed(cb,4);
     assert(state(a)->kda_staging.device!=state(b)->kda_staging.device);
     assert(state(a)->layer[4].cuda_kda.state!=state(b)->layer[4].cuda_kda.state);
@@ -183,7 +188,7 @@ static void sequences(void) {
         state(a)->layer[4].cuda_kda.authority=(ColiGlm53KdaAuthority)auth;
         assert(!restore(a,&sa));assert(state(a)->layer[4].cuda_kda.authority==G53_KDA_HOST);
     }
-    puts("Two KDA layers: each resident token U=6/208 bytes, D=2/48 bytes, ShortConv=2/recur=2/sync=2; three consecutive tokens: PASS");
+    puts("Two KDA layers: each resident token U=6/80 bytes, GEMM=6, D=2/48 bytes, ShortConv=2/recur=2/sync=2; three consecutive tokens: PASS");
     puts("BOTH -> DEVICE leaves both host components stale; complete snapshot restores BOTH: PASS");
     puts("CPU/GPU transitions, restore continuation and shared-conv/isolated-session interleave: PASS");
     coli_segment_session_destroy(a);assert(e->active_sessions==1 && lifetime.users==1);
@@ -198,21 +203,26 @@ static int pointer_live(const void *p) {
 }
 static void static_lifetime(void) {
     for (int reverse=0;reverse<2;reverse++) {
-        int u=uploads;size_t ub=upload_bytes,first=nevents;
+        int u=uploads,tu=tensor_uploads;size_t ub=upload_bytes,first=nevents;
         ColiSegmentEngine *e=numerical_engine(4,2);Glm53SegmentEngine *ge=e->impl;
         void *p0=ge->model.layer[4].cuda_kda_weights.conv,*p1=ge->model.layer[5].cuda_kda_weights.conv;
-        assert(uploads==u+2 && upload_bytes-ub==576);
+        assert(uploads==u+2 && upload_bytes-ub==576 && tensor_uploads==tu+6);
         assert(ge->model.layer[4].cuda_kda_weights.bytes==288 && ge->model.layer[5].cuda_kda_weights.bytes==288);
         assert(find(4,p0,288) && find(4,p1,288));
         assert(!memcmp(p0,ge->model.layer[4].conv,288) && !memcmp(p1,ge->model.layer[5].conv,288));
-        ColiSegmentSession *a=create(e),*b=create(e);assert(uploads==u+2);
+        ColiCudaTensor *shared[6];size_t charged=0;
+        for(int i=4;i<6;i++) {ColiGlm53CudaKdaWeights *w=&ge->model.layer[i].cuda_kda_weights;
+            shared[(i-4)*3]=w->q;shared[(i-4)*3+1]=w->k;shared[(i-4)*3+2]=w->v;
+            for(int j=0;j<3;j++){assert(w->projection_bytes[j]==48 && w->projection_vram[j]==48);charged+=w->projection_vram[j];}}
+        assert(charged==288);
+        ColiSegmentSession *a=create(e),*b=create(e);assert(uploads==u+2 && tensor_uploads==tu+6);
         assert(state(a)->layer[4].cuda_kda.state!=state(b)->layer[4].cuda_kda.state);
         assert(state(a)->layer[4].cuda_kda.window!=state(b)->layer[4].cuda_kda.window);
         assert(state(a)->kda_staging.device!=state(b)->kda_staging.device);
         assert(coli_segment_engine_close(e,NULL,0));
         coli_segment_session_destroy(reverse?b:a);assert(pointer_live(p0) && pointer_live(p1));
         coli_segment_session_destroy(reverse?a:b);assert(pointer_live(p0) && pointer_live(p1));
-        assert(live==3); /* stage wire and two static convolution copies */
+        assert(live==3 && live_tensors==6); /* wire, two conv copies and shared q/k/v */
         int seen0=0,seen1=0;
         for (size_t i=first;i<nevents;i++) if (events[i].op=='U') {
             seen0+=events[i].p==p0;seen1+=events[i].p==p1;
@@ -226,6 +236,8 @@ static void static_lifetime(void) {
             if (events[i].op=='R') release=i;
         }
         assert(freed0==1 && freed1==1 && release>closing && events[release+1].op=='S');
+        for(int t=0;t<6;t++){int n=0;for(size_t i=closing;i<release;i++)n+=events[i].op=='t' && events[i].p==shared[t];assert(n==1);}
+        assert(!live_tensors);
     }
     puts("Static conv: 576 bytes/2-layer fixture; upload once; shared by sessions; both close orders; model free before final lease: PASS");
 }
@@ -246,6 +258,73 @@ static void static_setup_failure(void) {
     float output[2];char error[128];seed(s,2);assert(!run(s,1,3,output,error));
     coli_segment_session_destroy(s);close_engine(survivor);
     puts("Static conv partial allocation/upload failures: engine fails cleanly; existing session/lease survives: PASS");
+}
+static void projection_failures(void) {
+    for(int authority=G53_KDA_HOST;authority<=G53_KDA_BOTH;authority++) for(int seam=0;seam<4;seam++) {
+        ColiSegmentEngine *e=numerical_engine(4,1),*cpu=numerical_engine(-1,1);
+        ColiSegmentSession *s=create(e),*c=create(cpu);seed(s,2);seed(c,2);
+        if(authority==G53_KDA_DEVICE)matched_run(s,c,1,2);
+        GSession *gs=state(s);GLayerState *l=&gs->layer[4];
+        if(authority==G53_KDA_BOTH)assert(coli_glm53_cuda_kda_prepare(gs->cuda_stage,&l->cuda_kda,l->kda_state,l->kda_window));
+        float hs[18],hw[72],ds[18],dw[72];memcpy(hs,l->kda_state,72);memcpy(hw,l->kda_window,288);
+        memcpy(ds,l->cuda_kda.state,72);memcpy(dw,l->cuda_kda.window,288);
+        uint32_t pos=((Glm53SegmentSession *)s->impl)->position;int filled=gs->filled,sc=shortconv_calls;
+        if(!seam)fail_upload_at=uploads+(authority==G53_KDA_HOST?3:1);
+        else fail_gemm_at=gemm_calls+seam;
+        float out[2]={91,92};char error[128];assert(run(s,1,3,out,error));fail_upload_at=fail_gemm_at=0;
+        assert(!gs->kda_poisoned && l->cuda_kda.authority==(ColiGlm53KdaAuthority)authority);
+        assert(!memcmp(hs,l->kda_state,72) && !memcmp(hw,l->kda_window,288));
+        if(authority!=G53_KDA_HOST)assert(!memcmp(ds,l->cuda_kda.state,72) && !memcmp(dw,l->cuda_kda.window,288));
+        assert(shortconv_calls==sc && pos==((Glm53SegmentSession *)s->impl)->position && filled==gs->filled && out[0]==91);
+        /* No restore: a clean retry must overwrite every projection slice. */
+        matched_run(s,c,1,3);
+        coli_segment_session_destroy(s);coli_segment_session_destroy(c);close_engine(e);close_engine(cpu);
+    }
+    puts("12 projection failures (x/q/k/v from HOST/BOTH/DEVICE): no recurrent mutation/poison; clean retry without restore PASS");
+}
+static void tensor_setup_failures(void) {
+    ColiSegmentEngine *e=numerical_engine(4,1);ColiSegmentSession *s=create(e);
+    int tensors=live_tensors,buffers_before=live;
+    for(int fail=1;fail<=6;fail++) {
+        ColiGlm53StagePlan plan={sizeof(plan),COLI_GLM53_STAGE_PLAN_VERSION,4};
+        ColiSegmentEngineOptions opts={.struct_size=sizeof(opts),.model_dir="synthetic",.layer_begin=4,.layer_end=6,
+            .context_tokens=8,.resource_plan=&plan,.resource_plan_size=sizeof(plan)};
+        fail_tensor_at=tensor_uploads+fail;ColiSegmentEngine *bad=NULL;char error[128];
+        assert(coli_segment_engine_open("kda-test",&opts,&bad,error,sizeof(error)) && !bad);fail_tensor_at=0;
+        assert(live==buffers_before && live_tensors==tensors && lifetime.users==1);
+    }
+    float out[2];char error[128];assert(!run(s,1,3,out,error));
+    coli_segment_session_destroy(s);close_engine(e);
+    puts("All six q/k/v setup failure positions cleanly destroy partial engine resources; survivor usable PASS");
+}
+static void mat_formats(void) {
+    ColiSegmentEngine *e=numerical_engine(4,1);Glm53SegmentEngine *ge=e->impl;
+    Cfg cfg=ge->model.c;cfg.hidden=64;
+    Mat mats[3]={{0}};ColiGlm53CudaKdaWeights w={.hidden=64,.proj=6,.cuda_device_ordinal=4};
+    ColiCudaTensor **slots[]={&w.q,&w.k,&w.v};
+    for(int fmt=0;fmt<3;fmt++) {
+        Mat *m=&mats[fmt];m->fmt=fmt==2?4:fmt;m->rows=6;m->columns=64;m->gs=fmt==2?64:0;
+        if(fmt==0){float *p=malloc(6*64*4);assert(p);m->f=p;for(int i=0;i<384;i++)p[i]=(float)(i%17-8)*0.019f;}
+        else if(fmt==1){int8_t *p=malloc(384);float *scale=malloc(24);assert(p&&scale);m->q8=p;m->s=scale;
+            for(int i=0;i<384;i++)p[i]=(int8_t)(i%19-9);for(int i=0;i<6;i++)scale[i]=0.023f+(float)i*0.001f;}
+        else {uint8_t *p=malloc(192);float *scale=malloc(24);assert(p&&scale);m->q4=p;m->s=scale;
+            for(int i=0;i<192;i++)p[i]=(uint8_t)((i%16)|(((i*3+1)%16)<<4));for(int i=0;i<6;i++)scale[i]=0.031f+(float)i*0.002f;}
+        assert(glm53_kda_projection_open(slots[fmt],m,&cfg,4));
+        assert((*slots[fmt])->mat.fmt==m->fmt && (*slots[fmt])->mat.gs==m->gs && coli_cuda_tensor_device(*slots[fmt])==4);
+    }
+    assert(coli_cuda_tensor_bytes(w.q)==1536 && coli_cuda_tensor_bytes(w.k)==408 && coli_cuda_tensor_bytes(w.v)==216);
+    ColiGlm53CudaKdaStaging work={0};assert(coli_glm53_cuda_kda_staging_open(&ge->cuda_stage,&work,2,3,6,4,64));
+    float x[64],out[6];for(int i=0;i<64;i++)x[i]=(float)(i%13-6)*0.057f;
+    assert(coli_glm53_cuda_kda_project_qkv(&ge->cuda_stage,&w,&work,x));
+    for(int j=0;j<3;j++){mm(out,&mats[j],x,1);near(work.projected_qkv+6*j,out,6);}
+    Mat invalid=mats[2];invalid.rows=5;ColiCudaTensor *bad=NULL;int n=tensor_uploads;
+    assert(!glm53_kda_projection_open(&bad,&invalid,&cfg,4) && !bad && tensor_uploads==n);
+    invalid=mats[2];invalid.columns=63;assert(!glm53_kda_projection_open(&bad,&invalid,&cfg,4));
+    invalid=mats[2];invalid.gs=0;assert(!glm53_kda_projection_open(&bad,&invalid,&cfg,4));
+    invalid=mats[2];invalid.s=NULL;assert(!glm53_kda_projection_open(&bad,&invalid,&cfg,4));
+    coli_glm53_cuda_kda_staging_close(&ge->cuda_stage,&work);coli_glm53_cuda_kda_weights_close(&w);
+    for(int j=0;j<3;j++)mat_release(&mats[j]);close_engine(e);
+    puts("Validated Mat fmt=0/1/4 gs64 preservation, per-projection CPU scaled errors, geometry rejection: PASS");
 }
 static void refusals(ColiSegmentSession *s,Stream *trusted) {
     GSession *gs=state(s);GLayerState *l=&gs->layer[4]; char error[128];
@@ -280,7 +359,7 @@ static void fail_case(int authority,int seam) {
     }
     float saved_s[18],saved_w[72];memcpy(saved_s,l->kda_state,72);memcpy(saved_w,l->kda_window,288);
     uint32_t pos=((Glm53SegmentSession *)s->impl)->position;int filled=gs->filled;
-    /* 0/1 = prepare state/window; 2..4 = qkv/decay/beta; 5 = SC rejection;
+    /* 0/1 = prepare state/window; 2..4 = x/decay/beta; 5 = SC rejection;
      * 6 = recurrence rejection AFTER SC acceptance; 7 = sync; 8 = raw D2H. */
     int prepare=authority==G53_KDA_HOST?2:0;
     if (seam<2) { assert(prepare);fail_upload_at=uploads+seam+1; }
@@ -365,13 +444,14 @@ static void pins_and_late_unknown(void) {
 int main(void) {
     setenv("COLI_CUDA","1",1);setenv("COLI_GPUS","2,4,6",1);unsetenv("COLI_GPU");
     assert(!coli_segment_adapter_register(&adapter));
-    shortconv_equivalence();static_lifetime();static_setup_failure();sequences();
+    shortconv_equivalence();static_lifetime();static_setup_failure();tensor_setup_failures();mat_formats();
+    projection_rounding=1;sequences();projection_rounding=0;projection_failures();
     for (int authority=G53_KDA_HOST; authority<=G53_KDA_BOTH; authority++)
         for (int seam=authority==G53_KDA_HOST?0:2; seam<=8; seam++) fail_case(authority,seam);
     puts("23 transaction failure cases: canonical host bytes/position unchanged, authority/recovery correct: PASS");
     later_layer_failure(); later_prefill_failure(); pins_and_late_unknown();
-    assert(!live && !lifetime.users && inits==shutdowns);
-    printf("Fake totals alloc attempts=%d frees=%d uploads=%d/%zu bytes downloads=%d/%zu bytes ShortConv=%d recurrence=%d sync=%d; owner 4 in {2,4,6}; no extra lease: PASS\n",
-        allocs,frees,uploads,upload_bytes,downloads,download_bytes,shortconv_calls,recurrence_calls,sync_calls);
+    assert(!live && !live_tensors && !lifetime.users && inits==shutdowns);
+    printf("Fake totals alloc attempts=%d frees=%d tensor uploads=%d frees=%d GEMMs=%d uploads=%d/%zu bytes downloads=%d/%zu bytes ShortConv=%d recurrence=%d sync=%d; owner 4 in {2,4,6}; no extra lease: PASS\n",
+        allocs,frees,tensor_uploads,tensor_frees,gemm_calls,uploads,upload_bytes,downloads,download_bytes,shortconv_calls,recurrence_calls,sync_calls);
     puts("GLM53 CUDA recurrence production Segment integration: PASS");return 0;
 }
