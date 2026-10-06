@@ -100,6 +100,17 @@ int coli_cuda_pipe_download(int device, const void *src, void *dst, size_t bytes
     Event *event = record('D'); event->owner = device; event->resource = src; event->bytes = bytes;
     validate_copy(device, src, bytes); if (fail_download) return 0; memcpy(dst, src, bytes); return 1;
 }
+int coli_cuda_tensor_upload(ColiCudaTensor **t,const void *w,const float *s,int fmt,int I,int O,int d) {
+    (void)t;(void)w;(void)s;(void)fmt;(void)I;(void)O;(void)d;assert(0);return 0;
+}
+int coli_cuda_tensor_upload_g(ColiCudaTensor **t,const void *w,const float *s,int fmt,int I,int O,int d,int gs) {
+    (void)gs;return coli_cuda_tensor_upload(t,w,s,fmt,I,O,d);
+}
+void coli_cuda_tensor_free(ColiCudaTensor *t){(void)t;assert(0);}
+size_t coli_cuda_tensor_bytes(const ColiCudaTensor *t){(void)t;return 0;}
+size_t coli_cuda_tensor_vram(const ColiCudaTensor *t){(void)t;return 0;}
+int coli_cuda_tensor_device(const ColiCudaTensor *t){(void)t;return -1;}
+int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y,const float *x,int S){(void)t;(void)y;(void)x;(void)S;assert(0);return 0;}
 int coli_cuda_pipe_kda_shortconv(int device, float *window, float *mixed,
         const float *qkv, const float *conv, int channels, int kernel) {
     (void)device; (void)window; (void)mixed; (void)qkv; (void)conv; (void)channels; (void)kernel;
