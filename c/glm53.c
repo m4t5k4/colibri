@@ -1321,11 +1321,11 @@ static int kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     float *low = malloc(T * D * sizeof(float));
     float *decay = malloc(T * P * sizeof(float));
     float *beta = malloc(T * H * sizeof(float));
-    float *gate = malloc(T * P * sizeof(float));
-    float *normed = malloc(T * P * sizeof(float));
+    float *gate = gpu ? NULL : malloc(T * P * sizeof(float));
+    float *normed = gpu ? NULL : malloc(T * P * sizeof(float));
     float *qkv = gpu ? NULL : malloc((size_t)3 * P * sizeof(float));
-    float *core = malloc((size_t)P * sizeof(float));
-    if ((!gpu && (!q || !k || !v || !qkv)) || !low || !decay || !beta || !gate || !normed || !core) {
+    float *core = gpu ? NULL : malloc((size_t)P * sizeof(float));
+    if ((!gpu && (!q || !k || !v || !qkv || !gate || !normed || !core)) || !low || !decay || !beta) {
         if (!s->cuda_stage) { fprintf(stderr, "OOM in KDA\n"); exit(1); }
         s->kda_error = "GLM-5.3 CUDA KDA recurrence failed before mutation";
         if (gpu) st->cuda_kda.authority = prior;
@@ -1346,8 +1346,10 @@ static int kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     mm(decay, &l->kfb, low, tokens);
     mm(beta, &l->kb, x, tokens);
     /* il gate low-rank dell'uscita: stessa forma, altri pesi */
-    mm(low, &l->kga, x, tokens);
-    mm(gate, &l->kgb, low, tokens);
+    if (!gpu) {
+        mm(low, &l->kga, x, tokens);
+        mm(gate, &l->kgb, low, tokens);
+    }
     for (size_t t = 0; t < T; t++) {
         float *dk = decay + t * P, *bt = beta + t * H;
         for (int h = 0; h < H; h++)
@@ -1358,7 +1360,7 @@ static int kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         for (int h = 0; h < H; h++) bt[h] = sigmoidf_(bt[h]);
         if (gpu) {
             if (!coli_glm53_cuda_kda_decode(s->cuda_stage, &st->cuda_kda,
-                    &l->cuda_kda_weights, &s->kda_staging, dk, bt, core, H, D, c->conv_k)) {
+                    &l->cuda_kda_weights, &s->kda_staging, dk, bt, out, H, D, c->conv_k, c->eps)) {
                 s->kda_error = st->cuda_kda.authority == G53_KDA_UNKNOWN
                     ? "GLM-5.3 CUDA KDA state became indeterminate"
                     : "GLM-5.3 CUDA KDA recurrence failed before mutation";
@@ -1373,6 +1375,7 @@ static int kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                           H, D, D, c->conv_k, 1e-6f, scratch);
             coli_glm53_cuda_kda_host_written(&st->cuda_kda);
         }
+        if (gpu) continue;
         /* uscita: RMSNorm per testa, pesata da o_norm, moltiplicata dal gate
          * low-rank, poi la proiezione di uscita (dopo il ciclo, in blocco). */
         const float *gt = gate + t * P;
@@ -1386,7 +1389,7 @@ static int kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                 dst[d] = src[d] * inverse * l->onorm[d] * sigmoidf_(gt[(size_t)h * D + d]);
         }
     }
-    mm(out, &l->ko, normed, tokens);
+    if (!gpu) mm(out, &l->ko, normed, tokens);
 done:
     free(core); free(qkv); free(normed); free(gate); free(beta); free(decay);
     free(low); free(v); free(k); free(q);
@@ -2944,8 +2947,8 @@ static GSession *session_open(const GModel *m, int cap) {
  * back only this session; it never acquires/releases the parent's lease. */
 #ifdef COLI_SEGMENT_ADAPTER
 static int glm53_kda_projection_open(ColiCudaTensor **tensor, const Mat *mat,
-                                    const Cfg *c, int owner) {
-    if (mat->rows != c->kda_proj || mat->columns != c->hidden || mat->rows < 1 || mat->columns < 1) return 0;
+                                    int rows, int columns, int owner) {
+    if (mat->rows != rows || mat->columns != columns || mat->rows < 1 || mat->columns < 1) return 0;
     const void *data = mat->fmt == 0 ? (const void *)mat->f :
                        mat->fmt == 1 ? (const void *)mat->q8 : (const void *)mat->q4;
     if (!data || (mat->fmt != 0 && mat->fmt != 1 && mat->fmt != 4) ||
@@ -2973,9 +2976,12 @@ static int glm53_kda_weights_open(GModel *m, const ColiGlm53CudaStage *stage) {
             !coli_glm53_cuda_kda_weights_open(stage, &m->layer[i].cuda_kda_weights,
                 m->layer[i].conv, (size_t)c->kda_heads, (size_t)c->kda_hd,
                 (size_t)c->kda_proj, (size_t)c->conv_k) ||
-            !glm53_kda_projection_open(&m->layer[i].cuda_kda_weights.q, &m->layer[i].kq, c, stage->cuda_device_ordinal) ||
-            !glm53_kda_projection_open(&m->layer[i].cuda_kda_weights.k, &m->layer[i].kk, c, stage->cuda_device_ordinal) ||
-            !glm53_kda_projection_open(&m->layer[i].cuda_kda_weights.v, &m->layer[i].kv, c, stage->cuda_device_ordinal)) {
+            !glm53_kda_projection_open(&m->layer[i].cuda_kda_weights.q, &m->layer[i].kq, c->kda_proj, c->hidden, stage->cuda_device_ordinal) ||
+            !glm53_kda_projection_open(&m->layer[i].cuda_kda_weights.k, &m->layer[i].kk, c->kda_proj, c->hidden, stage->cuda_device_ordinal) ||
+            !glm53_kda_projection_open(&m->layer[i].cuda_kda_weights.v, &m->layer[i].kv, c->kda_proj, c->hidden, stage->cuda_device_ordinal) ||
+            !glm53_kda_projection_open(&m->layer[i].cuda_kda_weights.kga, &m->layer[i].kga, c->kda_hd, c->hidden, stage->cuda_device_ordinal) ||
+            !glm53_kda_projection_open(&m->layer[i].cuda_kda_weights.kgb, &m->layer[i].kgb, c->kda_proj, c->kda_hd, stage->cuda_device_ordinal) ||
+            !glm53_kda_projection_open(&m->layer[i].cuda_kda_weights.ko, &m->layer[i].ko, c->hidden, c->kda_proj, stage->cuda_device_ordinal)) {
             if (m->layer) for (int j = m->layer_begin; j < m->layer_end; j++)
                 coli_glm53_cuda_kda_weights_close(&m->layer[j].cuda_kda_weights);
             return 0;
@@ -2983,8 +2989,16 @@ static int glm53_kda_weights_open(GModel *m, const ColiGlm53CudaStage *stage) {
         ColiGlm53CudaKdaWeights *w = &m->layer[i].cuda_kda_weights;
         w->hidden = c->hidden; w->proj = c->kda_proj;
 #ifdef COLI_CUDA
-        ColiCudaTensor *tensors[] = {w->q, w->k, w->v};
-        for (int j = 0; j < 3; j++) {
+        w->onorm_bytes = (size_t)c->kda_hd * sizeof(float);
+        if (!m->layer[i].onorm ||
+            !(w->onorm = (float *)coli_cuda_pipe_alloc(stage->cuda_device_ordinal, w->onorm_bytes)) ||
+            !coli_cuda_pipe_upload(stage->cuda_device_ordinal, w->onorm, m->layer[i].onorm, w->onorm_bytes)) {
+            for (int k = m->layer_begin; k < m->layer_end; k++)
+                coli_glm53_cuda_kda_weights_close(&m->layer[k].cuda_kda_weights);
+            return 0;
+        }
+        ColiCudaTensor *tensors[] = {w->q, w->k, w->v, w->kga, w->kgb, w->ko};
+        for (int j = 0; j < 6; j++) {
             w->projection_bytes[j] = coli_cuda_tensor_bytes(tensors[j]);
             w->projection_vram[j] = coli_cuda_tensor_vram(tensors[j]);
             if (w->projection_bytes[j] > SIZE_MAX - bytes_total || w->projection_vram[j] > SIZE_MAX - vram_total) {
@@ -2998,10 +3012,14 @@ static int glm53_kda_weights_open(GModel *m, const ColiGlm53CudaStage *stage) {
             "CUDA KDA layer %d owner %d q/k/v bytes=%zu/%zu/%zu vram=%zu/%zu/%zu\n",
             i, stage->cuda_device_ordinal, w->projection_bytes[0], w->projection_bytes[1], w->projection_bytes[2],
             w->projection_vram[0], w->projection_vram[1], w->projection_vram[2]);
+        if (getenv("GLM53_VERBOSE")) fprintf(stderr,
+            "CUDA KDA layer %d owner %d gateA/gateB/ko bytes=%zu/%zu/%zu vram=%zu/%zu/%zu onorm=%zu\n",
+            i, stage->cuda_device_ordinal, w->projection_bytes[3], w->projection_bytes[4], w->projection_bytes[5],
+            w->projection_vram[3], w->projection_vram[4], w->projection_vram[5], w->onorm_bytes);
 #endif
     }
 #ifdef COLI_CUDA
-    if (getenv("GLM53_VERBOSE")) fprintf(stderr, "CUDA KDA range [%d,%d) owner %d qkv bytes=%zu vram=%zu\n",
+    if (getenv("GLM53_VERBOSE")) fprintf(stderr, "CUDA KDA range [%d,%d) owner %d qkv+suffix tensors bytes=%zu vram=%zu\n",
         m->layer_begin, m->layer_end, stage->cuda_device_ordinal, bytes_total, vram_total);
 #endif
     return 1;

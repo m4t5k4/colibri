@@ -187,7 +187,7 @@ class StageSource(unittest.TestCase):
         self.assertLess(layer.index("coli_glm53_cuda_kda_project_qkv"), layer.index("mm(low, &l->kfa"))
         self.assertIn("} else {\n        mm(q, &l->kq", layer)
         upload = source[source.index("static int glm53_kda_projection_open"):source.index("static int glm53_kda_attach")]
-        for token in ("mat->rows != c->kda_proj", "mat->columns != c->hidden", "mat->fmt", "mat->gs",
+        for token in ("mat->rows != rows", "mat->columns != columns", "mat->fmt", "mat->gs",
                       "mat->q4", "mat->s", "coli_cuda_tensor_upload_g", "coli_cuda_tensor_device",
                       "coli_cuda_tensor_bytes", "coli_cuda_tensor_vram"):
             self.assertIn(token, upload)
