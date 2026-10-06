@@ -121,8 +121,10 @@ static inline int coli_glm53_cuda_kda_ensure_host(const ColiGlm53CudaStage *stag
  * The parent stage lease protects allocation/upload and final engine free. */
 typedef struct {
     float *conv;
-    ColiCudaTensor *q, *k, *v;
-    size_t projection_bytes[3], projection_vram[3];
+    ColiCudaTensor *q, *k, *v, *kga, *kgb, *ko;
+    float *onorm;
+    size_t onorm_bytes;
+    size_t projection_bytes[6], projection_vram[6]; /* q, k, v, kga, kgb, ko */
     int hidden, proj;
     size_t bytes;
     int cuda_device_ordinal;
@@ -132,6 +134,10 @@ static inline void coli_glm53_cuda_kda_weights_close(ColiGlm53CudaKdaWeights *we
     if (weights->q) coli_cuda_tensor_free(weights->q);
     if (weights->k) coli_cuda_tensor_free(weights->k);
     if (weights->v) coli_cuda_tensor_free(weights->v);
+    if (weights->kga) coli_cuda_tensor_free(weights->kga);
+    if (weights->kgb) coli_cuda_tensor_free(weights->kgb);
+    if (weights->ko) coli_cuda_tensor_free(weights->ko);
+    if (weights->onorm) coli_cuda_pipe_free(weights->cuda_device_ordinal, weights->onorm);
     if (weights->conv) coli_cuda_pipe_free(weights->cuda_device_ordinal, weights->conv);
 #endif
     memset(weights, 0, sizeof(*weights));
@@ -230,18 +236,20 @@ static inline int coli_glm53_cuda_kda_project_qkv(const ColiGlm53CudaStage *stag
 
 /* Prepared BOTH/DEVICE pair. Only non-mutating host inputs cross before the
  * first launch. Accepted ShortConv already advances the canonical device window:
- * even recurrence rejection must remain UNKNOWN. Both launches use the existing
+ * every suffix rejection must remain UNKNOWN. All launches use the existing
  * same-device default pipeline ordering; one final sync proves their completion.
  * No host window publication: DEVICE leaves both host components stale. */
 static inline int coli_glm53_cuda_kda_decode(const ColiGlm53CudaStage *stage,
         ColiGlm53CudaKdaLayer *layer, const ColiGlm53CudaKdaWeights *weights,
         ColiGlm53CudaKdaStaging *work, const float *decay,
-        const float *beta, float *core, int heads, int dim, int kernel) {
+        const float *beta, float *out, int heads, int dim, int kernel, float eps) {
     size_t db, wb;
     if (!stage || !stage->lease_live || !layer->state || !layer->window ||
         (layer->authority != G53_KDA_BOTH && layer->authority != G53_KDA_DEVICE) ||
         !weights || !weights->conv || weights->cuda_device_ordinal != stage->cuda_device_ordinal ||
-        !work->device || !decay || !beta || !core || heads < 1 || dim < 1 || kernel < 1 ||
+        !weights->kga || !weights->kgb || !weights->ko || !weights->onorm ||
+        weights->onorm_bytes != (size_t)dim * sizeof(float) ||
+        !work->device || !decay || !beta || !out || heads < 1 || dim < 1 || kernel < 1 ||
         !coli_glm53_cuda_kda_staging_geometry((size_t)heads, (size_t)dim,
             work->proj_bytes / sizeof(float), (size_t)kernel,
             work->input_bytes / sizeof(float), &db, &wb) ||
@@ -250,6 +258,9 @@ static inline int coli_glm53_cuda_kda_decode(const ColiGlm53CudaStage *stage,
 #ifdef COLI_CUDA
     int owner = stage->cuda_device_ordinal;
     size_t p = work->proj_bytes / sizeof(float);
+    if (coli_cuda_tensor_device(weights->kga) != owner ||
+        coli_cuda_tensor_device(weights->kgb) != owner ||
+        coli_cuda_tensor_device(weights->ko) != owner) return 0;
     if (!coli_cuda_pipe_upload(owner, work->decay, decay, work->proj_bytes) ||
         !coli_cuda_pipe_upload(owner, work->beta, beta, (size_t)heads * sizeof(float))) return 0;
     if (!coli_cuda_pipe_kda_shortconv(owner, (float *)layer->window, work->mixed_qkv,
@@ -258,8 +269,15 @@ static inline int coli_glm53_cuda_kda_decode(const ColiGlm53CudaStage *stage,
     if (!coli_cuda_pipe_kda_recur(owner, (float *)layer->state, work->raw_out,
             work->mixed_qkv, work->mixed_qkv + p, work->mixed_qkv + 2*p,
             work->decay, work->beta, heads, dim, dim, 1e-6f) ||
+        /* Same default stream: projected_qkv/decay are dead after their
+         * consumers above. No individual GEMM aliases its input and output.
+         * input_x is overwritten only after gate A has consumed it. */
+        !coli_cuda_pipe_gemm(weights->kga, work->projected_qkv, work->input_x, 1) ||
+        !coli_cuda_pipe_gemm(weights->kgb, work->decay, work->projected_qkv, 1) ||
+        !coli_cuda_pipe_kda_post(owner, work->raw_out, work->decay, weights->onorm, heads, dim, eps) ||
+        !coli_cuda_pipe_gemm(weights->ko, work->input_x, work->raw_out, 1) ||
         !coli_cuda_pipe_sync(owner) ||
-        !coli_cuda_pipe_download(owner, work->raw_out, core, work->proj_bytes)) return 0;
+        !coli_cuda_pipe_download(owner, work->input_x, out, work->input_bytes)) return 0;
     layer->authority = G53_KDA_DEVICE;
     return 1;
 #else

@@ -532,7 +532,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract
 TEST_EXCLUDE += test_vk_chain test_glm53_vk_f32
 # The real CUDA lifetime probe requires nvcc and hardware; keep it opt-in.
-TEST_EXCLUDE += test_cuda_lifetime_live test_glm53_cuda_stage_live test_glm53_cuda_kda_state_live test_cuda_kda_recur_live test_cuda_kda_shortconv_live
+TEST_EXCLUDE += test_cuda_lifetime_live test_glm53_cuda_stage_live test_glm53_cuda_kda_state_live test_cuda_kda_recur_live test_cuda_kda_shortconv_live test_cuda_kda_post_live
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -3044,7 +3044,7 @@ AUTODEP_ELSEWHERE = test_segment_adapters_registration test_segment_adapters_rea
 	test_edge_adapters_registration test_edge_adapters_real test_deepseek_v4 \
 	test_v4_serve_framing
 AUTODEP_OWN_FLAGS = bench_cuda_resident_batch bench_load_tq_peak_rss \
-	bench_indexer_allocations test_cuda_kda_recur_live test_cuda_kda_shortconv_live
+	bench_indexer_allocations test_cuda_kda_recur_live test_cuda_kda_shortconv_live test_cuda_kda_post_live
 ENGINE_RULES := $(foreach n,$(RULE_NAMES),$(if $(findstring /,$(n)),,$(if $(wildcard $(n).c),$(n))))
 AUTODEP_TESTS := $(patsubst tests/%,%,$(filter tests/%,$(RULE_NAMES)))
 AUTODEP_OBJS      = backend_vulkan.o vk_tier.o backend_loader.o backend_xdna.o qwen36_tier.o \
@@ -3088,3 +3088,11 @@ tests/test_cuda_kda_shortconv_ref$(EXE): tests/test_cuda_kda_shortconv_ref.c
 # Opt-in checkpoint-free CUDA ShortConv; callers own transfers and resources.
 tests/test_cuda_kda_shortconv_live$(EXE): tests/test_cuda_kda_shortconv_live.cu tests/cuda_kda_shortconv_ref.h backend_cuda.o backend_cuda.h cuda_device_config.h
 	"$(GPUCC)" $(GPUFLAGS) $< backend_cuda.o -o $@ $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS) -lcublasLt -lcublas
+
+# Toolkit-free output-suffix oracle; generated dependencies.
+tests/test_cuda_kda_post_ref$(EXE): tests/test_cuda_kda_post_ref.c
+	$(CC) $(NOCUDA_CFLAGS) -ffp-contract=off $< -o $@ $(NOCUDA_LDFLAGS)
+
+# Opt-in checkpoint-free post-core same-input CUDA oracle; generated dependencies.
+tests/test_cuda_kda_post_live$(EXE): tests/test_cuda_kda_post_live.cu backend_cuda.o
+	"$(GPUCC)" $(GPUFLAGS) -MMD -MP $< backend_cuda.o -o $@ $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS) -lcublasLt -lcublas

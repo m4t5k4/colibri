@@ -429,3 +429,5 @@ int main(void) {
     puts("GLM53 CUDA stage tests: PASS");
     return 0;
 }
+
+int coli_cuda_pipe_kda_post(int d,float *c,const float *g,const float *n,int h,int k,float e){(void)d;(void)c;(void)g;(void)n;(void)h;(void)k;(void)e;assert(0);return 0;}

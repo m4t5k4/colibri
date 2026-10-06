@@ -142,6 +142,7 @@ typedef int (*fn_pipe_download)(int device,const void *src,void *dst,size_t byte
 typedef void (*fn_pipe_free)(int device,void *p);
 typedef int (*fn_pipe_gemm)(ColiCudaTensor *t,float *y_dev,const float *x_dev,int S);
 typedef int (*fn_pipe_peer_copy)(int dst_dev,float *dst,int src_dev, const float *src,size_t bytes);
+typedef int (*fn_pipe_kda_post)(int, float *, const float *, const float *, int, int, float);
 typedef int (*fn_pipe_kda_shortconv)(int device, float *window_dev, float *mixed_dev,
     const float *qkv_dev, const float *conv_w_dev, int channels, int kernel);
 typedef int (*fn_pipe_kda_recur)(int device, float *state_dev, float *out_dev,
@@ -225,6 +226,7 @@ static struct {
     fn_pipe_free pipe_free;
     fn_pipe_gemm pipe_gemm;
     fn_pipe_peer_copy pipe_peer_copy;
+    fn_pipe_kda_post pipe_kda_post;
     fn_pipe_kda_shortconv pipe_kda_shortconv;
     fn_pipe_kda_recur pipe_kda_recur;
     fn_pipe_rmsnorm pipe_rmsnorm;
@@ -1498,6 +1500,7 @@ static int coli_cuda_load(void){
     RESOLVE(pipe_free, fn_pipe_free)
     RESOLVE(pipe_gemm, fn_pipe_gemm)
     RESOLVE(pipe_peer_copy, fn_pipe_peer_copy)
+    RESOLVE_OPT(pipe_kda_post, fn_pipe_kda_post) /* additive; older DLLs remain usable */
     RESOLVE_OPT(pipe_kda_shortconv, fn_pipe_kda_shortconv)
     RESOLVE_OPT(pipe_kda_recur, fn_pipe_kda_recur) /* additive; older DLLs remain usable */
     RESOLVE(pipe_rmsnorm, fn_pipe_rmsnorm)
@@ -1858,6 +1861,11 @@ int coli_cuda_pipe_peer_copy(int dst_dev,float *dst,int src_dev, const float *sr
     return g_cuda.pipe_peer_copy(dst_dev, dst, src_dev, src, bytes);
 }
 
+int coli_cuda_pipe_kda_post(int device, float *core_dev, const float *gate_dev,
+        const float *onorm_dev, int heads, int dim, float eps) {
+    if (!g_cuda.available || !g_cuda.pipe_kda_post) return 0;
+    return g_cuda.pipe_kda_post(device, core_dev, gate_dev, onorm_dev, heads, dim, eps);
+}
 int coli_cuda_pipe_kda_shortconv(int device, float *window_dev, float *mixed_dev,
         const float *qkv_dev, const float *conv_w_dev, int channels, int kernel){
     if(!g_cuda.available || !g_cuda.pipe_kda_shortconv) return 0;
