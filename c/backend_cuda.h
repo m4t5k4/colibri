@@ -309,6 +309,14 @@ COLI_CUDA_DLLEXPORT void *coli_cuda_host_alloc(size_t bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_host_free(void *p);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes);
+/* Device-only in-place per-head RMSNorm * onorm[D] * sigmoid(gate[H,D]).
+ * Requires 1<=heads<=65535, 1<=dim<=256 and finite eps>0.
+ * Increasing-d FP32 norm sum. No allocation/copy/sync; 1 is launch accepted.
+ * core/gate/onorm must be disjoint device regions on the selected owner.
+ * Prelaunch rejection preserves core; completion/failure belongs to caller. */
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_kda_post(int device, float *core_dev,
+        const float *gate_dev, const float *onorm_dev, int heads, int dim, float eps);
+
 /* One token of causal depthwise ShortConv + SiLU. ALL numeric pointers are
  * non-overlapping DEVICE buffers on physical ordinal device. window/conv_w
  * [channels][kernel], mixed/qkv [channels]. Window is FULL K samples per

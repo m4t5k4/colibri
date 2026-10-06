@@ -3,12 +3,22 @@
 #define COLI_CUDA
 #define GLM53_NO_MAIN
 #define COLI_SEGMENT_ADAPTER
+#include <stdlib.h>
+static void *counted_malloc(const char *, size_t);
+#define malloc(n) counted_malloc(__func__, (n))
 #include "../glm53.c"
+#undef malloc
+static int kda_host_allocations;
+static void *counted_malloc(const char *fn, size_t n) {
+    if (!strcmp(fn,"kda_layer")) kda_host_allocations++;
+    return malloc(n);
+}
 #include "../segment_runtime.c"
 #include "../backend_cuda_lifetime.h"
 #include <assert.h>
 #include "cuda_kda_recur_ref.h"
 #include "cuda_kda_shortconv_ref.h"
+#include "cuda_kda_post_ref.h"
 
 static ColiCudaLifetime lifetime;
 static int inits, shutdowns, allocs, frees, uploads, downloads, acquires;
@@ -16,7 +26,7 @@ static int fail_alloc_at, fail_upload_at, fail_download_at, live;
 static int recurrence_calls, shortconv_calls, sync_calls, fail_recurrence, fail_shortconv, fail_sync;
 static int fail_recurrence_at, synthetic_numeric;
 static int tensor_uploads, tensor_frees, live_tensors, gemm_calls, fail_tensor_at, fail_gemm_at;
-static int projection_rounding;
+static int projection_rounding, post_calls, fail_post;
 struct ColiCudaTensor { Mat mat; int owner; size_t bytes, vram; };
 static size_t upload_bytes, download_bytes;
 static Glm53SegmentEngine *watch_engine;
@@ -82,7 +92,7 @@ int coli_cuda_pipe_upload(int owner, void *dst, const void *src, size_t bytes) {
 }
 int coli_cuda_pipe_download(int owner, const void *src, void *dst, size_t bytes) {
     find(owner, src, bytes); downloads++; download_bytes+=bytes; event('D', owner, src, bytes);
-    if (watch_session && watch_layer && src == watch_session->kda_staging.raw_out)
+    if (watch_session && watch_layer && src == watch_session->kda_staging.input_x)
         assert(watch_layer->authority == G53_KDA_UNKNOWN);
     if (downloads == fail_download_at) return 0;
     memcpy(dst, src, bytes); return 1;
@@ -120,6 +130,18 @@ int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y,const float *x,int rows) {
     if(watch_session) for(int i=0;i<32;i++) if(watch_engine->model.layer[i].cuda_kda_weights.q==t ||
         watch_engine->model.layer[i].cuda_kda_weights.k==t || watch_engine->model.layer[i].cuda_kda_weights.v==t)
         assert(watch_session->layer[i].cuda_kda.authority!=G53_KDA_UNKNOWN);
+    assert((uintptr_t)y+(size_t)t->mat.rows*4 <= (uintptr_t)x ||
+        (uintptr_t)x+(size_t)t->mat.columns*4 <= (uintptr_t)y);
+    if(watch_session) for(int i=0;i<32;i++) {
+        ColiGlm53CudaKdaWeights *w=&watch_engine->model.layer[i].cuda_kda_weights;
+        if(t==w->kga || t==w->kgb || t==w->ko) {
+            assert(watch_layer==&watch_session->layer[i].cuda_kda && watch_layer->authority==G53_KDA_UNKNOWN);
+            ColiGlm53CudaKdaStaging *s=&watch_session->kda_staging;
+            if(t==w->kga)assert(x==s->input_x && y==s->projected_qkv);
+            if(t==w->kgb)assert(x==s->projected_qkv && y==s->decay);
+            if(t==w->ko)assert(x==s->raw_out && y==s->input_x);
+        }
+    }
     if(gemm_calls==fail_gemm_at)return 0;
     float expected[t->mat.rows];mm(expected,&t->mat,x,1);memcpy(y,expected,(size_t)t->mat.rows*4);
     if(projection_rounding)for(int j=0;j<t->mat.rows;j++)y[j]=nextafterf(y[j],j%2?INFINITY:-INFINITY);
@@ -171,6 +193,18 @@ int coli_cuda_pipe_kda_recur(int owner, float *st, float *out,
     }
     return 1;
 }
+int coli_cuda_pipe_kda_post(int owner, float *core, const float *gate,
+        const float *onorm, int h, int d, float eps) {
+    post_calls++;event('P',owner,core,(size_t)h*d*4);
+    find(owner,core,(size_t)h*d*4);find(owner,gate,(size_t)h*d*4);find(owner,onorm,(size_t)d*4);
+    if(watch_session) {
+        assert(watch_layer && watch_layer->authority==G53_KDA_UNKNOWN);
+        assert(core==watch_session->kda_staging.raw_out && gate==watch_session->kda_staging.decay);
+    }
+    if(fail_post)return 0;
+    /* Isolate post arithmetic using the actual fake device core/gate. */
+    kda_post_ref(core,gate,onorm,h,d,eps);return 1;
+}
 int coli_cuda_pipe_sync(int owner) {
     sync_calls++; event('Y',owner,NULL,0);
     if (watch_session) assert(watch_layer && watch_layer->authority==G53_KDA_UNKNOWN);
@@ -204,6 +238,18 @@ static int synthetic_open(void **impl, ColiSegmentCapabilities *caps,
             float *p=calloc(12,sizeof(float));assert(p);
             *mats[j]=(Mat){.rows=6,.columns=2,.f=p};
             if(synthetic_numeric) for(int x=0;x<12;x++)p[x]=(float)((x*7+i+2*j)%17-8)*0.045f;
+        }
+    }
+    for(int i=e->model.layer_begin;i<e->model.layer_end;i++) if(!e->model.c.is_full[i]) {
+        GLayer *l=&e->model.layer[i];
+        Mat *mats[]={&l->kga,&l->kgb,&l->ko};
+        const int rows[]={3,6,2},cols[]={2,3,6},salt[]={i+1,i+3,i+6};
+        float *norm=malloc(12);assert(norm);l->onorm=norm;
+        for(int d=0;d<3;d++)norm[d]=1.f+(synthetic_numeric?(float)(d-1)*0.07f:0.f);
+        for(int j=0;j<3;j++) {
+            float *p=calloc((size_t)rows[j]*cols[j],4);assert(p);
+            *mats[j]=(Mat){.rows=rows[j],.columns=cols[j],.f=p};
+            if(synthetic_numeric)for(int x=0;x<rows[j]*cols[j];x++)p[x]=(float)((x*7+salt[j])%17-8)*0.045f;
         }
     }
     if (!glm53_kda_weights_open(&e->model,&e->cuda_stage)) {
@@ -398,13 +444,12 @@ static void cpu_run(void) {
     c->first_dense=32; c->dense_inter=1; c->hc_iters=1;
     c->eps=c->hc_eps=1e-6f; c->gate_lb=-5.f; c->swiglu_limit=1.f;
     GLayer *l=&ge->model.layer[4];
-    l->in_ln=ones(2); l->post_ln=ones(2); l->onorm=ones(3);
+    l->in_ln=ones(2); l->post_ln=ones(2);
     l->hc_attn_fn=calloc(6,sizeof(float)); l->hc_ffn_fn=calloc(6,sizeof(float));
     l->hc_attn_base=calloc(3,sizeof(float)); l->hc_ffn_base=calloc(3,sizeof(float));
     l->hc_attn_scale=calloc(3,sizeof(float)); l->hc_ffn_scale=calloc(3,sizeof(float));
     l->dt=calloc(6,sizeof(float)); l->alog=calloc(2,sizeof(float));
-    zero_mat(&l->ko,2,6);
-    zero_mat(&l->kfa,3,2); zero_mat(&l->kfb,6,3); zero_mat(&l->kga,3,2); zero_mat(&l->kgb,6,3);
+    zero_mat(&l->kfa,3,2); zero_mat(&l->kfb,6,3);
     zero_mat(&l->kb,2,2); zero_mat(&l->dg,1,2); zero_mat(&l->du,1,2); zero_mat(&l->dd,2,1);
     ColiSegmentSession *s=create(e); GLayerState *st=&state(s)->layer[4]; device_write(state(s),4,12);
     float input[4]={1,2,2,1},output[4]={0}; char error[128];

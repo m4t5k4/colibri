@@ -2969,6 +2969,39 @@ extern "C" int coli_cuda_pipe_download(int device,const void *src,void *dst,size
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
     return cuda_ok(cudaMemcpy(dst,src,bytes,cudaMemcpyDeviceToHost),"pipe download");
 }
+/* GLM53 output suffix only; one block per head, CPU-order norm sum. */
+__global__ void pipe_kda_post_kernel(float *core, const float *gate,
+        const float *onorm, int dim, float eps) {
+    __shared__ float inverse;
+    size_t base = (size_t)blockIdx.x * dim;
+    if (threadIdx.x == 0) {
+        float square = 0.f;
+        for (int d = 0; d < dim; d++) {
+            volatile float product = core[base+d] * core[base+d];
+            square += product;
+        }
+        inverse = 1.f / sqrtf(square / dim + eps);
+    }
+    __syncthreads();
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float g = gate[base+d];
+        /* Match glm53.c's sign-stable sigmoid, including extreme gates. */
+        float sigmoid = g >= 0.f ? 1.f / (1.f + expf(-g)) : expf(g) / (1.f + expf(g));
+        core[base+d] = core[base+d] * inverse * onorm[d] * sigmoid;
+    }
+}
+extern "C" int coli_cuda_pipe_kda_post(int device, float *core_dev,
+        const float *gate_dev, const float *onorm_dev, int heads, int dim, float eps) {
+    if (fault_injected()) return 0;
+    if (!core_dev || !gate_dev || !onorm_dev || heads < 1 || heads > 65535 ||
+        dim < 1 || dim > 256 || !std::isfinite(eps) || eps <= 0.f ||
+        (size_t)heads > SIZE_MAX / (size_t)dim / sizeof(float)) return 0;
+    DeviceContext *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return 0;
+    pipe_kda_post_kernel<<<heads, 256>>>(core_dev, gate_dev, onorm_dev, dim, eps);
+    return cuda_ok(cudaGetLastError(), "pipe KDA post launch");
+}
+
 /* Full-K, oldest-first history: one independent channel per thread.
  * Shift first, append current, then visit taps in CPU order. */
 __global__ void pipe_kda_shortconv_kernel(float *__restrict__ window,
