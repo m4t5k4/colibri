@@ -23,6 +23,27 @@ static uint32_t rng_state=0xC0FFEEu;
 static uint32_t xr(void){ rng_state^=rng_state<<13; rng_state^=rng_state>>17; rng_state^=rng_state<<5; return rng_state; }
 static float frand(void){ return (float)((int)(xr()%2001)-1000)/1000.0f; }
 
+#ifdef __AVX2__
+/* Scalar oracle for the original AVX2 lane/FMA tree. Unlike the double
+ * format oracle, this catches changes to accumulation order and rounding. */
+static float ref_group64_avx_order(const float *x, const uint8_t *w,
+                                   const float *scale, int I) {
+    float total = 0;
+    for (int g = 0; g < I / 64; g++) {
+        float lane[8] = {0};
+        for (int k = 0; k < 64; k++) {
+            int i = g * 64 + k;
+            int nib = (i & 1) ? w[i / 2] >> 4 : w[i / 2] & 15;
+            lane[k & 7] = fmaf(x[i], (float)(nib - 8), lane[k & 7]);
+        }
+        float p0 = lane[0] + lane[4], p1 = lane[1] + lane[5];
+        float p2 = lane[2] + lane[6], p3 = lane[3] + lane[7];
+        total = fmaf((p0 + p2) + (p1 + p3), scale[g], total);
+    }
+    return total;
+}
+#endif
+
 /* Reference: dequantize nibble -> (v-8)*scale[group], accumulate in double.
  * Deliberately the dumbest possible expression of the format. */
 static void ref_grouped(double *y, double *mag, const float *x, const uint8_t *q4,
@@ -117,6 +138,18 @@ static int check(const char *name, int S, int I, int O, int gs, int fill_edges){
 #endif
 
     int bad=0; double worst=0;
+#ifdef __AVX2__
+    if (S == 1 && gs == 64 && !(I & 63)) {
+        for (int o = 0; o < O; o++) {
+            float exact = ref_group64_avx_order(x, q4 + (size_t)o * rb,
+                                                scale + (size_t)o * ng, I);
+            if (memcmp(y + o, &exact, sizeof exact) != 0) {
+                fprintf(stderr, "%s: AVX2 accumulation order differs at row %d\n", name, o);
+                bad++;
+            }
+        }
+    }
+#endif
     for(int i=0;i<S*O;i++){
         double d=fabs((double)y[i]-yr[i]);
         double rel = ym[i]>1e-30 ? d/ym[i] : d;   /* error relative to the summed magnitude */
@@ -262,6 +295,9 @@ int main(void){
     fail|=check("gs=64, I multiple of gs",            2, 512, 8, 64, 0);
     fail|=check("gs=64, single row single token",     1, 128, 1, 64, 0);
     fail|=check("gs=64, nibble edges (0x00/0xFF)",    1, 256, 4, 64, 1);
+    fail|=check("gs=64, one complete group",         1,  64, 7, 64, 1);
+    fail|=check("gs=64, GLM53 down input",           1,2048, 7, 64, 0);
+    fail|=check("gs=64, GLM53 gate/up input",        1,4096, 7, 64, 1);
 
     /* partial last group: glen clamp, the classic off-by-one */
     fail|=check("gs=64, partial last group (I=200)",  2, 200, 4, 64, 0);

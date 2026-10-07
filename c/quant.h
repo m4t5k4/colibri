@@ -137,6 +137,28 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
             y[(int64_t)s*O+o]=a*sc; } }
 }
 
+#ifdef __AVX2__
+/* 32 weights from one packed load, retaining the original eight-lane FMA
+ * order. Sharing the nibble masks/shift across both halves avoids repeating
+ * that work for each 16-weight chunk. */
+static inline __m256 i4_grouped_acc32(__m256 acc, const uint8_t *w, const float *x) {
+    const __m128i m4 = _mm_set1_epi8(0x0f);
+    const __m256i b8 = _mm256_set1_epi32(8);
+    __m128i by = _mm_loadu_si128((const __m128i *)w);
+    __m128i lo = _mm_and_si128(by, m4);
+    __m128i hi = _mm_and_si128(_mm_srli_epi16(by, 4), m4);
+    __m128i n0 = _mm_unpacklo_epi8(lo, hi), n1 = _mm_unpackhi_epi8(lo, hi);
+    __m256 w0 = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(n0), b8));
+    __m256 w1 = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(n0, 8)), b8));
+    __m256 w2 = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(n1), b8));
+    __m256 w3 = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(n1, 8)), b8));
+    acc = _mm256_fmadd_ps(_mm256_loadu_ps(x), w0, acc);
+    acc = _mm256_fmadd_ps(_mm256_loadu_ps(x + 8), w1, acc);
+    acc = _mm256_fmadd_ps(_mm256_loadu_ps(x + 16), w2, acc);
+    return _mm256_fmadd_ps(_mm256_loadu_ps(x + 24), w3, acc);
+}
+#endif
+
 /* ---- y[S,O] = x[S,I] @ W^T, W int4 packed + per-GROUP scales (fmt=4) ----- */
 static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
                               int S, int I, int O, int gs){
@@ -156,6 +178,17 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
         const float *scl=scale+(int64_t)o*ng;
         for(int s=0;s<S;s++){
             const float *xs=x+(int64_t)s*I; float a=0;
+#ifdef __AVX2__
+            if(S == 1 && gs == 64 && !(I & 63)) {
+                for(int g=0;g<ng;g++) {
+                    __m256 acc = i4_grouped_acc32(_mm256_setzero_ps(), w + (size_t)g*32, xs + (size_t)g*64);
+                    acc = i4_grouped_acc32(acc, w + (size_t)g*32 + 16, xs + (size_t)g*64 + 32);
+                    a = fmaf(hsum256(acc), scl[g], a);
+                }
+                y[(int64_t)s*O+o] = a;
+                continue;
+            }
+#endif
             for(int g=0; g*gs<I; g++){
                 int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base;
                 float sc=scl[g];
