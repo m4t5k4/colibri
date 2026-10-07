@@ -2601,8 +2601,8 @@ static void g53_dho_finish(GModel *m, int fit_n, int fit_tail, int partial) {
 }
 #endif
 
-static void model_load_range(GModel *m, const char *dir, int layer_begin,
-                             int layer_end, int load_io) {
+static void model_load_range_ex(GModel *m, const char *dir, int layer_begin,
+                                int layer_end, int load_io, int load_vision) {
     load_cfg(&m->c, dir);
     st_init(&m->S, dir);
     glm53_mirror_setup(m, dir);
@@ -2753,7 +2753,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
             }
         }
     }
-    vision_load(m);
+    if (load_vision) vision_load(m);
 #ifdef COLI_METAL
     /* Metal is runtime opt-in. Failure is non-fatal: the existing CPU path
      * remains authoritative and streamed routed experts are deliberately
@@ -2792,6 +2792,12 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
      * da quanto hanno gia' preso i pesi, e prima del ciclo sui layer non
      * l'avevano ancora preso. */
     if (m->streaming) expert_cache_init(m);
+}
+
+/* Existing model callers retain the multimodal loader behavior. */
+static void model_load_range(GModel *m, const char *dir, int layer_begin,
+                             int layer_end, int load_io) {
+    model_load_range_ex(m, dir, layer_begin, layer_end, load_io, 1);
 }
 
 /* ---------- vision ----------
@@ -5057,7 +5063,8 @@ static int glm53_segment_engine_open(void **engine_impl,
      * resto vorrebbe dire tenere in RAM i pesi che macina un'altra macchina. */
     const int begin = (int)options->layer_begin;
     const int end = options->layer_end ? (int)options->layer_end : -1;
-    model_load_range(&engine->model, options->model_dir, begin, end, 0);
+    /* Public Segment inputs are already embedded text state. */
+    model_load_range_ex(&engine->model, options->model_dir, begin, end, 0, 0);
     if (engine->cuda_stage.lease_live &&
         coli_glm53_cuda_stage_wire_create(&engine->cuda_stage,
             engine->model.c.hc_mult > 0 ? (size_t)engine->model.c.hc_mult : 0,
@@ -5349,7 +5356,8 @@ static int glm53_edge_engine_open(void **engine_impl,
         return coli_edge_adapter_error(error, error_size,
                                        "out of memory opening GLM-5.3 Edge");
     /* Nessun layer: i capi della catena non ne eseguono. */
-    model_load_range(&engine->model, options->model_dir, 0, 0, 1);
+    /* Public Edge provides text boundaries, with no image encoder. */
+    model_load_range_ex(&engine->model, options->model_dir, 0, 0, 1, 0);
     engine->state_width = (uint32_t)(engine->model.c.hc_mult * engine->model.c.hidden);
 
     char path[1024];
